@@ -1,0 +1,17 @@
+# Hermes SafeGuard - Degen Policy Configuration
+# Relaxed amount and approval limits for NFT minting and heavy interactions.
+# Allows unlimited approvals and zero slippage on whitelisted contracts,
+# but strictly enforces simulation, unexpected balance-loss checks, and blocks drains.
+mode: degen
+max_eth_per_tx: 100000000000000000000  # 100.0 ETH in wei
+max_token_per_tx: 115792089237316195423570985008687907853269984665640564039457584007913129639935  # type(uint256).max
+allow_unlimited_approve: true
+require_simulation: true
+block_zero_slippage: false
+recipient_allowlist: []
+recipient_denylist:
+  - "0x000000000000000000000000000000000000BAD1"
+contract_allowlist:
+  - "0x000000000000000000000000000000000000BEEF"
+  - "0x000000000000000000000000000000000000C001"
+

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+env/
+venv/
+
+# Foundry / Solidity compilation artifacts
+out/
+cache/
+contracts/cache/
+foundry.lock
+
+# Keep precompiled SafeGuardPolicy artifact for environments without forge
+!contracts/out/
+!contracts/out/SafeGuardPolicy.sol/
+!contracts/out/SafeGuardPolicy.sol/SafeGuardPolicy.json
+
+# Local environment / secrets / editor
+.env
+.env.*
+*.log
+.vscode/
+.idea/

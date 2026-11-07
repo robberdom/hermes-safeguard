@@ -1,0 +1,13 @@
+# Hermes SafeGuard - Balanced Policy Configuration
+# Higher value limits (5.0 ETH) and capped approvals, but still blocks obvious
+# drains (unbounded approvals, drain selectors, slippage = 0) and requires simulation.
+mode: balanced
+max_eth_per_tx: 5000000000000000000  # 5.0 ETH in wei
+max_token_per_tx: 50000000000000000000  # 50 tokens
+allow_unlimited_approve: false
+require_simulation: true
+block_zero_slippage: true
+recipient_allowlist: []
+recipient_denylist: []
+contract_allowlist: []
+

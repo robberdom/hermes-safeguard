@@ -1,0 +1,14 @@
+# Hermes SafeGuard - Strict Policy Configuration
+# Aggressive blocking: strict value cap (0.5 ETH), unbounded approvals blocked,
+# zero-slippage swap protection, strict whitelist required.
+mode: strict
+max_eth_per_tx: 500000000000000000  # 0.5 ETH in wei
+max_token_per_tx: 500000000000000000
+allow_unlimited_approve: false
+require_simulation: true
+block_zero_slippage: true
+recipient_allowlist:
+  - "0x000000000000000000000000000000000000BEEF"
+recipient_denylist: []
+contract_allowlist: []
+
