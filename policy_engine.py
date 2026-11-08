@@ -17,12 +17,18 @@ Supports configuration via Python dict and YAML format.
 from __future__ import annotations
 
 import base64
+import json
+import logging
 import os
 import re
+import threading
+import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, TextIO
+
+logger = logging.getLogger("hermes_safeguard")
 
 try:
     import yaml
@@ -98,6 +104,12 @@ def is_financial_tool(tool_name: str) -> bool:
     Check if a tool name corresponds to a financial, transfer, approval, or transaction action.
     """
     name = str(tool_name).strip().lower()
+    if name in (
+        "safeguard_approve_address",
+        "safeguard_list_approved_addresses",
+        "safeguard_revoke_address",
+    ):
+        return False
     if name in FINANCIAL_TOOLS:
         return True
     financial_keywords = ("transfer", "swap", "approve", "send_tx", "sendtransaction", "wallet", "payout")
@@ -449,7 +461,8 @@ class VerificationResult(tuple):
     Result object representing policy or simulation verification.
     Behaves as a 2-tuple (allowed, reason), 3-tuple (allowed, reason, risk_score),
     or 4-tuple (allowed, reason, risk_score, requires_confirmation) when unpacked,
-    and provides attribute access (.allowed, .reason, .risk_score, .warning, .requires_confirmation, .injection_detected).
+    and provides attribute access (.allowed, .reason, .risk_score, .warning, .requires_confirmation,
+    .injection_detected, .is_new_recipient, .flagged_addresses).
     """
     allowed: bool
     reason: str
@@ -457,6 +470,8 @@ class VerificationResult(tuple):
     warning: str
     requires_confirmation: bool
     injection_detected: bool
+    is_new_recipient: bool
+    flagged_addresses: list[str]
 
     def __new__(
         cls,
@@ -466,6 +481,8 @@ class VerificationResult(tuple):
         warning: str = "",
         requires_confirmation: bool = False,
         injection_detected: bool = False,
+        is_new_recipient: bool = False,
+        flagged_addresses: list[str] | None = None,
     ):
         risk_val = risk_score.value if isinstance(risk_score, RiskScore) else str(risk_score)
         inst = super().__new__(cls, (bool(allowed), str(reason), risk_val))
@@ -476,6 +493,8 @@ class VerificationResult(tuple):
         inst.warning = str(warning)
         inst.requires_confirmation = bool(requires_confirmation)
         inst.injection_detected = bool(injection_detected)
+        inst.is_new_recipient = bool(is_new_recipient)
+        inst.flagged_addresses = list(flagged_addresses or [])
         return inst
 
     def __iter__(self):
@@ -490,6 +509,8 @@ class VerificationResult(tuple):
                         return iter((self.allowed, self.reason, self.risk_score))
                     elif instr.arg == 4:
                         return iter((self.allowed, self.reason, self.risk_score, self.requires_confirmation))
+                    elif instr.arg == 5:
+                        return iter((self.allowed, self.reason, self.risk_score, self.requires_confirmation, self.is_new_recipient))
         except Exception:
             pass
         return super().__iter__()
@@ -503,6 +524,366 @@ def normalize_address(address: str) -> str:
     if len(addr) > 40:
         addr = addr[-40:]
     return addr.rjust(40, "0").lower()
+
+
+# Well-known protocol & marketplace addresses
+OPENSEA_SEAPORT_1_5 = normalize_address("0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC")
+OPENSEA_SEAPORT_1_6 = normalize_address("0x0000000000000068F116a894984e2DB1123eB395")
+OPENSEA_SEADROP = normalize_address("0x00005EA00Ac477B1030CE78506496e8C2dE24bf5")
+UNISWAP_V2_ROUTER = normalize_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
+UNISWAP_V3_ROUTER = normalize_address("0xE592427A0AEce92De3Edee1F18E0157C05861564")
+UNISWAP_UNIVERSAL_ROUTER = normalize_address("0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD")
+
+KNOWN_VERIFIED_PROTOCOLS: set[str] = {
+    OPENSEA_SEAPORT_1_5,
+    OPENSEA_SEAPORT_1_6,
+    OPENSEA_SEADROP,
+    UNISWAP_V2_ROUTER,
+    UNISWAP_V3_ROUTER,
+    UNISWAP_UNIVERSAL_ROUTER,
+    normalize_address(DEFAULT_ALLOWED_TARGET),
+}
+
+NFT_MINT_SELECTORS: set[str] = {
+    "a0712d68",  # mint(uint256)
+    "1249c58b",  # mint()
+    "755edd17",  # mintTo(address,uint256)
+    "84bb1e42",  # claim(address,uint256,...)
+    "e7acab24",  # fulfillAdvancedOrder
+    "b3a34220",  # fulfillOrder
+    "ed98257a",  # fulfillAvailableOrders
+    "87201b41",  # fulfillAvailableAdvancedOrders
+}
+
+
+# ==============================================================================
+# Address Memory & Context Integrity Protection Store
+# ==============================================================================
+
+@dataclass
+class AddressEntry:
+    """Metadata entry for an approved recipient address or trusted contract."""
+    address: str
+    address_type: str = "recipient"  # "recipient", "contract", "both"
+    label: str = ""
+    source: str = "manual"  # "manual", "config", "confirmation", "tool", "default"
+    added_at: float = field(default_factory=time.time)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "address": self.address,
+            "address_type": self.address_type,
+            "label": self.label,
+            "source": self.source,
+            "added_at": self.added_at,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AddressEntry:
+        addr = data.get("address", "")
+        return cls(
+            address=normalize_address(addr),
+            address_type=str(data.get("address_type", data.get("type", "recipient"))),
+            label=str(data.get("label", "")),
+            source=str(data.get("source", "manual")),
+            added_at=float(data.get("added_at", time.time())),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+class AddressMemoryStore:
+    """
+    Store of previously approved recipient addresses and trusted contracts.
+    Protects autonomous agents against poisoned memory manipulation leading
+    to unauthorized asset transfers or malicious contract interactions.
+
+    Supports:
+      - File or in-memory persistence
+      - Thread-safe updates
+      - Pre-approving addresses via config or tool
+      - Exporting and loading to/from JSON format
+    """
+
+    def __init__(
+        self,
+        filepath: str | Path | None = None,
+        initial_addresses: list[str | dict[str, Any]] | None = None,
+        auto_save: bool = True,
+    ) -> None:
+        self.filepath: Path | None = Path(filepath) if filepath else None
+        self.auto_save: bool = auto_save
+        self._lock = threading.Lock()
+        self._entries: dict[str, AddressEntry] = {}
+
+        if self.filepath and self.filepath.is_file():
+            self.load()
+
+        if initial_addresses:
+            for item in initial_addresses:
+                if isinstance(item, str):
+                    self.approve(item, label="initial", source="config")
+                elif isinstance(item, dict):
+                    addr = item.get("address") or item.get("addr") or ""
+                    if addr:
+                        self.approve(
+                            addr,
+                            label=str(item.get("label", "")),
+                            address_type=str(item.get("address_type", item.get("type", "recipient"))),
+                            source=str(item.get("source", "config")),
+                            metadata=dict(item.get("metadata", {})),
+                        )
+
+    @property
+    def approved_addresses(self) -> set[str]:
+        with self._lock:
+            return set(self._entries.keys())
+
+    def approve(
+        self,
+        address: str,
+        label: str = "",
+        address_type: str = "recipient",
+        source: str = "manual",
+        metadata: dict[str, Any] | None = None,
+    ) -> AddressEntry:
+        """Approve and record a recipient address or trusted contract."""
+        norm = normalize_address(address)
+        entry = AddressEntry(
+            address=norm,
+            address_type=address_type,
+            label=label,
+            source=source,
+            metadata=metadata or {},
+        )
+        with self._lock:
+            self._entries[norm] = entry
+        if self.auto_save and self.filepath:
+            self.save()
+        return entry
+
+    def add(self, *args: Any, **kwargs: Any) -> AddressEntry:
+        """Alias for approve."""
+        return self.approve(*args, **kwargs)
+
+    def is_approved(self, address: str, address_type: str | None = None) -> bool:
+        """Check if an address is approved (and optionally matches expected address_type)."""
+        norm = normalize_address(address)
+        with self._lock:
+            entry = self._entries.get(norm)
+            if not entry:
+                return False
+            if address_type and entry.address_type != "both" and entry.address_type != address_type:
+                return False
+            return True
+
+    def is_known(self, address: str, address_type: str | None = None) -> bool:
+        """Alias for is_approved."""
+        return self.is_approved(address, address_type)
+
+    def get(self, address: str) -> AddressEntry | None:
+        norm = normalize_address(address)
+        with self._lock:
+            return self._entries.get(norm)
+
+    def remove(self, address: str) -> bool:
+        norm = normalize_address(address)
+        with self._lock:
+            existed = norm in self._entries
+            if existed:
+                del self._entries[norm]
+        if existed and self.auto_save and self.filepath:
+            self.save()
+        return existed
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+        if self.auto_save and self.filepath:
+            self.save()
+
+    def list_addresses(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [e.to_dict() for e in self._entries.values()]
+
+    def save(self, path: str | Path | None = None) -> None:
+        target_path = Path(path) if path else self.filepath
+        if not target_path:
+            return
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            data = [e.to_dict() for e in self._entries.values()]
+        temp_path = target_path.with_suffix(".tmp")
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        temp_path.replace(target_path)
+
+    def load(self, path: str | Path | None = None) -> None:
+        target_path = Path(path) if path else self.filepath
+        if not target_path or not target_path.is_file():
+            return
+        with open(target_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        with self._lock:
+            self._entries.clear()
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and "address" in item:
+                        entry = AddressEntry.from_dict(item)
+                        self._entries[entry.address] = entry
+                    elif isinstance(item, str):
+                        norm = normalize_address(item)
+                        self._entries[norm] = AddressEntry(address=norm)
+
+
+_DEFAULT_MEMORY_STORE: AddressMemoryStore | None = None
+
+
+def get_default_memory_store() -> AddressMemoryStore:
+    global _DEFAULT_MEMORY_STORE
+    if _DEFAULT_MEMORY_STORE is None:
+        _DEFAULT_MEMORY_STORE = AddressMemoryStore()
+    return _DEFAULT_MEMORY_STORE
+
+
+def set_default_memory_store(store: AddressMemoryStore | None) -> None:
+    global _DEFAULT_MEMORY_STORE
+    _DEFAULT_MEMORY_STORE = store
+
+
+def reset_default_memory_store() -> None:
+    global _DEFAULT_MEMORY_STORE
+    _DEFAULT_MEMORY_STORE = AddressMemoryStore()
+
+
+def safeguard_approve_address(
+    address: str,
+    label: str = "",
+    address_type: str = "recipient",
+    store: AddressMemoryStore | None = None,
+) -> dict[str, Any]:
+    """
+    User tool/helper to pre-approve common addresses (e.g. secondary wallet, known NFT contracts).
+    """
+    norm = normalize_address(address)
+    st = store or get_default_memory_store()
+    entry = st.approve(norm, label=label, address_type=address_type, source="tool")
+    logger.info("Hermes SafeGuard: Pre-approved address 0x%s (%s: %s)", norm, address_type, label)
+    return {
+        "status": "approved",
+        "address": f"0x{norm}",
+        "label": label,
+        "type": address_type,
+    }
+
+
+def safeguard_list_approved_addresses(store: AddressMemoryStore | None = None) -> list[dict[str, Any]]:
+    """List all currently approved addresses from the memory store."""
+    st = store or get_default_memory_store()
+    return st.list_addresses()
+
+
+def safeguard_revoke_address(address: str, store: AddressMemoryStore | None = None) -> bool:
+    """Revoke approval for an address."""
+    norm = normalize_address(address)
+    st = store or get_default_memory_store()
+    return st.remove(norm)
+
+
+def extract_action_addresses(
+    to_address: str,
+    data_hex: str = "",
+    value_wei: int = 0,
+) -> dict[str, Any]:
+    """
+    Extract action type ('transfer', 'approve', 'mint', 'other') and relevant addresses:
+    - 'target_contract': the contract address being called (if contract call)
+    - 'recipients': recipient addresses receiving funds or assets
+    - 'spenders': addresses being granted approval
+    - 'all_addresses': list of all involved external addresses to verify
+    """
+    norm_to = normalize_address(to_address) if to_address else ""
+    raw = data_hex.strip() if data_hex else ""
+    if raw.startswith(("0x", "0X")):
+        raw = raw[2:]
+    sel = raw[:8].lower() if len(raw) >= 8 else ""
+
+    result: dict[str, Any] = {
+        "action": "other",
+        "target_contract": norm_to,
+        "recipients": [],
+        "spenders": [],
+        "all_addresses": [norm_to] if norm_to else [],
+    }
+
+    # 1. ERC-20 transfer(address to, uint256 amount) - 0xa9059cbb
+    if sel == "a9059cbb" and len(raw) >= 72:
+        result["action"] = "transfer"
+        recip = normalize_address(raw[8:72])
+        result["recipients"].append(recip)
+        if recip not in result["all_addresses"]:
+            result["all_addresses"].append(recip)
+
+    # 2. transferFrom / safeTransferFrom - 0x23b872dd, 0x42842e0e, 0xb88d4fde, 0xf242432a
+    elif sel in ("23b872dd", "42842e0e", "b88d4fde", "f242432a") and len(raw) >= 136:
+        result["action"] = "transfer"
+        recip = normalize_address(raw[72:136])
+        result["recipients"].append(recip)
+        if recip not in result["all_addresses"]:
+            result["all_addresses"].append(recip)
+
+    # 3. ERC-20 approve(address spender, uint256 amount) - 0x095ea7b3
+    elif sel == APPROVE_SELECTOR and len(raw) >= 72:
+        result["action"] = "approve"
+        spender = normalize_address(raw[8:72])
+        result["spenders"].append(spender)
+        if spender not in result["all_addresses"]:
+            result["all_addresses"].append(spender)
+
+    # 4. setApprovalForAll(address operator, bool approved) - 0xa22cb465
+    elif sel == SET_APPROVAL_FOR_ALL_SELECTOR and len(raw) >= 72:
+        result["action"] = "approve"
+        operator = normalize_address(raw[8:72])
+        result["spenders"].append(operator)
+        if operator not in result["all_addresses"]:
+            result["all_addresses"].append(operator)
+
+    # 5. Permit2 approve(address token, address spender, ...) - 0x87517c45
+    elif sel == PERMIT2_APPROVE_SELECTOR and len(raw) >= 136:
+        result["action"] = "approve"
+        tok = normalize_address(raw[8:72])
+        spender = normalize_address(raw[72:136])
+        result["spenders"].append(spender)
+        for a in (tok, spender):
+            if a not in result["all_addresses"]:
+                result["all_addresses"].append(a)
+
+    # 6. NFT Mint
+    elif (
+        sel in NFT_MINT_SELECTORS
+        or norm_to in (OPENSEA_SEAPORT_1_5, OPENSEA_SEAPORT_1_6, OPENSEA_SEADROP)
+        or "mint" in raw.lower()
+    ):
+        result["action"] = "mint"
+        if sel == "755edd17" and len(raw) >= 72:  # mintTo(address,uint256)
+            recip = normalize_address(raw[8:72])
+            result["recipients"].append(recip)
+            if recip not in result["all_addresses"]:
+                result["all_addresses"].append(recip)
+
+    # 7. Native ETH transfer
+    elif value_wei > 0 and (not raw or len(raw) < 8):
+        result["action"] = "transfer"
+        if norm_to:
+            result["recipients"].append(norm_to)
+
+    else:
+        # Generic tool call or transaction
+        if norm_to:
+            result["recipients"].append(norm_to)
+
+    return result
 
 
 def _parse_wei_value(val: int | float | str | None, default: int) -> int:
@@ -605,6 +986,9 @@ class PolicyConfig:
     contract_allowlist: list[str] = field(default_factory=list)
     block_prompt_injection: bool = True
     scan_context_messages: int = 10
+    pre_approved_addresses: list[str | dict[str, Any]] = field(default_factory=list)
+    store_path: str | Path | None = None
+    memory_store: Any | None = None
 
     def __post_init__(self) -> None:
         # Normalize mode string
@@ -613,6 +997,11 @@ class PolicyConfig:
             raise ValueError(
                 f"Invalid policy mode: '{self.mode}'. Must be one of: 'strict', 'balanced', 'degen'."
             )
+
+        if self.pre_approved_addresses is None:
+            self.pre_approved_addresses = []
+        if self.store_path is not None:
+            self.store_path = str(self.store_path)
 
         # Mode-specific defaults
         if self.mode == "strict":
@@ -680,12 +1069,16 @@ class PolicyConfig:
         recipient_denylist: list[str] | None = None,
         block_prompt_injection: bool = True,
         scan_context_messages: int = 10,
+        pre_approved_addresses: list[str | dict[str, Any]] | None = None,
+        store_path: str | Path | None = None,
+        memory_store: Any | None = None,
     ) -> PolicyConfig:
         """Create a strict mode PolicyConfig (aggressive blocking, default for most users)."""
         eth_cap = _parse_wei_value(max_eth_per_tx, 500_000_000_000_000_000)  # 0.5 ETH
         token_cap = _parse_token_value(max_token_per_tx, 500_000_000_000_000_000)
         allowlist = recipient_allowlist if recipient_allowlist is not None else [DEFAULT_ALLOWED_TARGET]
         denylist = recipient_denylist if recipient_denylist is not None else []
+        pre_approved = list(pre_approved_addresses or [])
         return cls(
             mode="strict",
             max_eth_per_tx=eth_cap,
@@ -698,6 +1091,9 @@ class PolicyConfig:
             contract_allowlist=[],
             block_prompt_injection=block_prompt_injection,
             scan_context_messages=scan_context_messages,
+            pre_approved_addresses=pre_approved,
+            store_path=store_path,
+            memory_store=memory_store,
         )
 
     @classmethod
@@ -709,12 +1105,16 @@ class PolicyConfig:
         recipient_denylist: list[str] | None = None,
         block_prompt_injection: bool = True,
         scan_context_messages: int = 10,
+        pre_approved_addresses: list[str | dict[str, Any]] | None = None,
+        store_path: str | Path | None = None,
+        memory_store: Any | None = None,
     ) -> PolicyConfig:
         """Create a balanced mode PolicyConfig (higher amounts, capped approvals, blocks drains)."""
         eth_cap = _parse_wei_value(max_eth_per_tx, 5_000_000_000_000_000_000)  # 5.0 ETH
         token_cap = _parse_token_value(max_token_per_tx, 50_000_000_000_000_000_000)  # 50 ETH equiv
         allowlist = recipient_allowlist if recipient_allowlist is not None else []
         denylist = recipient_denylist if recipient_denylist is not None else []
+        pre_approved = list(pre_approved_addresses or [])
         return cls(
             mode="balanced",
             max_eth_per_tx=eth_cap,
@@ -727,6 +1127,9 @@ class PolicyConfig:
             contract_allowlist=[],
             block_prompt_injection=block_prompt_injection,
             scan_context_messages=scan_context_messages,
+            pre_approved_addresses=pre_approved,
+            store_path=store_path,
+            memory_store=memory_store,
         )
 
     @classmethod
@@ -741,6 +1144,9 @@ class PolicyConfig:
         recipient_denylist: list[str] | None = None,
         block_prompt_injection: bool = True,
         scan_context_messages: int = 10,
+        pre_approved_addresses: list[str | dict[str, Any]] | None = None,
+        store_path: str | Path | None = None,
+        memory_store: Any | None = None,
     ) -> PolicyConfig:
         """Create a degen mode PolicyConfig (relaxed amount & approvals for NFT/heavy interaction)."""
         eth_cap = _parse_wei_value(max_eth_per_tx, 100_000_000_000_000_000_000)  # 100.0 ETH
@@ -748,6 +1154,7 @@ class PolicyConfig:
         contracts = contract_allowlist if contract_allowlist is not None else []
         allowlist = recipient_allowlist if recipient_allowlist is not None else []
         denylist = recipient_denylist if recipient_denylist is not None else []
+        pre_approved = list(pre_approved_addresses or [])
         return cls(
             mode="degen",
             max_eth_per_tx=eth_cap,
@@ -760,6 +1167,9 @@ class PolicyConfig:
             contract_allowlist=contracts,
             block_prompt_injection=block_prompt_injection,
             scan_context_messages=scan_context_messages,
+            pre_approved_addresses=pre_approved,
+            store_path=store_path,
+            memory_store=memory_store,
         )
 
     @classmethod
@@ -771,6 +1181,12 @@ class PolicyConfig:
         rec_allowlist = data.get("recipient_allowlist", data.get("allowlist", data.get("whitelist")))
         rec_denylist = data.get("recipient_denylist", data.get("denylist", []))
         contracts = data.get("contract_allowlist", data.get("contracts", []))
+        pre_approved = data.get(
+            "pre_approved_addresses",
+            data.get("trusted_addresses", data.get("approved_recipients", data.get("trusted_contracts", []))),
+        )
+        store_path = data.get("store_path", data.get("memory_store_path"))
+        mem_store = data.get("memory_store")
 
         if mode == "strict":
             default_eth = 500_000_000_000_000_000
@@ -810,6 +1226,9 @@ class PolicyConfig:
             contract_allowlist=list(contracts),
             block_prompt_injection=block_injection,
             scan_context_messages=scan_msgs,
+            pre_approved_addresses=list(pre_approved) if pre_approved else [],
+            store_path=store_path,
+            memory_store=mem_store,
         )
 
     @classmethod
@@ -842,7 +1261,10 @@ class PolicyConfig:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert PolicyConfig to a Python dictionary."""
-        return asdict(self)
+        d = asdict(self)
+        if "memory_store" in d:
+            del d["memory_store"]
+        return d
 
     def to_yaml(self) -> str:
         """Serialize PolicyConfig to a YAML string."""
@@ -882,6 +1304,52 @@ class PolicyEngine:
 
         # Prompt injection detector instance
         self.detector = PromptInjectionDetector()
+
+        # Initialize Memory Store for address & context integrity protection
+        if getattr(self.config, "memory_store", None) is not None:
+            self.memory_store = self.config.memory_store
+        elif self.config.store_path or self.config.pre_approved_addresses:
+            self.memory_store = AddressMemoryStore(
+                filepath=self.config.store_path,
+                initial_addresses=self.config.pre_approved_addresses,
+            )
+        else:
+            self.memory_store = get_default_memory_store()
+
+        # Seed allowlist targets as pre-approved
+        for a in self.recipient_allowlist:
+            if a and a != normalize_address(DEFAULT_ALLOWED_TARGET):
+                self.memory_store.approve(a, label="recipient_allowlist", source="config")
+        for a in self.contract_allowlist:
+            if a:
+                self.memory_store.approve(a, label="contract_allowlist", address_type="contract", source="config")
+        if self.config.pre_approved_addresses:
+            for item in self.config.pre_approved_addresses:
+                if isinstance(item, str):
+                    self.memory_store.approve(item, label="config_pre_approved", source="config")
+                elif isinstance(item, dict):
+                    addr = item.get("address") or item.get("addr") or ""
+                    if addr:
+                        self.memory_store.approve(
+                            addr,
+                            label=str(item.get("label", "")),
+                            address_type=str(item.get("address_type", item.get("type", "recipient"))),
+                            source=str(item.get("source", "config")),
+                            metadata=dict(item.get("metadata", {})),
+                        )
+
+    def is_address_approved(self, addr: str) -> bool:
+        """Check if an address is approved in memory store, allowlists, or known protocols."""
+        norm = normalize_address(addr)
+        if not norm or norm == "0" * 40:
+            return True
+        if norm in self.recipient_allowlist or norm in self.contract_allowlist:
+            return True
+        if norm in KNOWN_VERIFIED_PROTOCOLS:
+            return True
+        if self.memory_store.is_approved(norm):
+            return True
+        return False
 
     def evaluate_context_injection(
         self,
@@ -934,40 +1402,6 @@ class PolicyEngine:
         if not is_financial_tool(tool_name):
             return VerificationResult(True, "", RiskScore.LOW)
 
-        # Evaluate prompt injection if enabled and context is present
-        injection_signal = InjectionSignal()
-        if self.config.block_prompt_injection and context:
-            injection_signal = self.evaluate_context_injection(context, scan_n=scan_n)
-            if injection_signal.is_strong:
-                if self.config.mode == "strict":
-                    return VerificationResult(
-                        False,
-                        f"SG: prompt injection detected in untrusted context ({injection_signal.category})",
-                        RiskScore.CRITICAL,
-                        requires_confirmation=False,
-                        injection_detected=True,
-                    )
-                elif self.config.mode == "balanced":
-                    if not confirmed:
-                        return VerificationResult(
-                            False,
-                            f"SG: prompt injection detected in untrusted context (human confirmation required: {injection_signal.category})",
-                            RiskScore.HIGH,
-                            requires_confirmation=True,
-                            injection_detected=True,
-                        )
-                elif self.config.mode == "degen":
-                    # In degen mode, still raise the risk score and require confirmation
-                    # for injection-flagged financial actions rather than silently allowing them.
-                    if not confirmed:
-                        return VerificationResult(
-                            False,
-                            f"SG: prompt injection detected in untrusted context (human confirmation required in degen mode: {injection_signal.category})",
-                            RiskScore.HIGH,
-                            requires_confirmation=True,
-                            injection_detected=True,
-                        )
-
         # Extract target address, value, and calldata from tool arguments
         to_address = str(
             tool_args.get("to")
@@ -986,30 +1420,48 @@ class PolicyEngine:
             or ""
         ).strip()
 
+        # If a target address is specified, evaluate complete transaction policy
         if to_address:
-            res = self.evaluate_transaction_policy(to_address, value_wei, data_hex, context=None, confirmed=confirmed)
-            if injection_signal.is_strong and confirmed and res.allowed:
-                # Preserve elevated risk score from injection detection under human confirmation
-                return VerificationResult(
-                    True,
-                    res.reason,
-                    RiskScore.HIGH,
-                    warning=f"Warning: Financial action executed after human confirmation despite flagged injection: {injection_signal.category}",
-                    requires_confirmation=False,
-                    injection_detected=True,
-                )
-            return res
+            return self.evaluate_transaction_policy(
+                to_address, value_wei, data_hex, context=context, confirmed=confirmed, scan_n=scan_n
+            )
 
         # Financial action with no specific transaction target (e.g. key export/management)
-        if injection_signal.is_strong and confirmed:
-            return VerificationResult(
-                True,
-                "",
-                RiskScore.HIGH,
-                warning=f"Warning: Financial action executed after human confirmation despite flagged injection: {injection_signal.category}",
-                requires_confirmation=False,
-                injection_detected=True,
-            )
+        injection_signal = InjectionSignal()
+        if self.config.block_prompt_injection and context:
+            injection_signal = self.evaluate_context_injection(context, scan_n=scan_n)
+            if injection_signal.is_strong or injection_signal.detected:
+                if self.config.mode == "strict":
+                    return VerificationResult(
+                        False,
+                        f"SG: prompt injection detected in untrusted context ({injection_signal.category})",
+                        RiskScore.CRITICAL,
+                        requires_confirmation=False,
+                        injection_detected=True,
+                    )
+                elif self.config.mode in ("balanced", "degen"):
+                    if not confirmed:
+                        reason = (
+                            f"SG: prompt injection detected in untrusted context (human confirmation required in degen mode: {injection_signal.category})"
+                            if self.config.mode == "degen"
+                            else f"SG: prompt injection detected in untrusted context (human confirmation required: {injection_signal.category})"
+                        )
+                        return VerificationResult(
+                            False,
+                            reason,
+                            RiskScore.HIGH,
+                            requires_confirmation=True,
+                            injection_detected=True,
+                        )
+                    else:
+                        return VerificationResult(
+                            True,
+                            "",
+                            RiskScore.HIGH,
+                            warning=f"Warning: Financial action executed after human confirmation despite flagged injection: {injection_signal.category}",
+                            requires_confirmation=False,
+                            injection_detected=True,
+                        )
 
         return VerificationResult(True, "", RiskScore.LOW)
 
@@ -1116,63 +1568,38 @@ class PolicyEngine:
         injection_signal = InjectionSignal()
         if self.config.block_prompt_injection and context:
             injection_signal = self.evaluate_context_injection(context, scan_n=scan_n)
-            if injection_signal.is_strong:
-                if self.config.mode == "strict":
-                    return VerificationResult(
-                        False,
-                        f"SG: prompt injection detected in untrusted context ({injection_signal.category})",
-                        RiskScore.CRITICAL,
-                        requires_confirmation=False,
-                        injection_detected=True,
-                    )
-                elif self.config.mode == "balanced":
-                    if not confirmed:
-                        return VerificationResult(
-                            False,
-                            f"SG: prompt injection detected in untrusted context (human confirmation required: {injection_signal.category})",
-                            RiskScore.HIGH,
-                            requires_confirmation=True,
-                            injection_detected=True,
-                        )
-                elif self.config.mode == "degen":
-                    # In degen mode, still raise the risk score and require confirmation
-                    # for injection-flagged financial actions rather than silently allowing them.
-                    if not confirmed:
-                        return VerificationResult(
-                            False,
-                            f"SG: prompt injection detected in untrusted context (human confirmation required in degen mode: {injection_signal.category})",
-                            RiskScore.HIGH,
-                            requires_confirmation=True,
-                            injection_detected=True,
-                        )
 
         target_norm = normalize_address(to_address)
 
-        # 1. Recipient Denylist (enforced in all modes: strict, balanced, degen)
-        if target_norm in self.denylist:
-            return VerificationResult(False, "SG: recipient is denylisted", RiskScore.CRITICAL)
+        # Step 0.5: Extract action addresses and identify any new/unapproved recipients or contracts
+        action_info = extract_action_addresses(to_address, data_hex, value_wei)
+        new_addresses: list[str] = []
+        for a in action_info["all_addresses"]:
+            if a and not self.is_address_approved(a):
+                new_addresses.append(a)
+        is_new_recipient = len(new_addresses) > 0
 
-        # 2. Allowlist checks
-        if self.config.mode == "strict":
-            if self.recipient_allowlist and target_norm not in self.recipient_allowlist:
-                return VerificationResult(False, "SG: target not whitelisted", RiskScore.MEDIUM)
-        elif self.config.mode == "balanced":
-            if self.recipient_allowlist and target_norm not in self.recipient_allowlist:
-                return VerificationResult(False, "SG: target not whitelisted", RiskScore.MEDIUM)
-        elif self.config.mode == "degen":
-            # In degen mode, if a contract_allowlist is configured, verify contract interactions
-            if self.contract_allowlist:
-                if (target_norm not in self.contract_allowlist) and (target_norm not in self.recipient_allowlist):
-                    return VerificationResult(False, "SG: target not in degen contract allowlist", RiskScore.MEDIUM)
-            elif self.recipient_allowlist:
-                if target_norm not in self.recipient_allowlist:
-                    return VerificationResult(False, "SG: target not whitelisted", RiskScore.MEDIUM)
+        # Step 1: Recipient Denylist (enforced in all modes: strict, balanced, degen)
+        if target_norm in self.denylist or any(a in self.denylist for a in new_addresses):
+            return VerificationResult(
+                False,
+                "SG: recipient is denylisted",
+                RiskScore.CRITICAL,
+                is_new_recipient=is_new_recipient,
+                flagged_addresses=new_addresses,
+            )
 
-        # 3. Value Cap check
+        # Step 2: Value Cap check
         if value_wei > self.config.max_eth_per_tx:
-            return VerificationResult(False, "SG: value exceeds max per tx", RiskScore.HIGH)
+            return VerificationResult(
+                False,
+                "SG: value exceeds max per tx",
+                RiskScore.HIGH,
+                is_new_recipient=is_new_recipient,
+                flagged_addresses=new_addresses,
+            )
 
-        # 4. Calldata security evaluation
+        # Step 3: Calldata security evaluation
         raw_data = data_hex.strip() if data_hex else ""
         if raw_data.startswith(("0x", "0X")):
             raw_data = raw_data[2:]
@@ -1185,11 +1612,105 @@ class PolicyEngine:
                     risk = RiskScore.CRITICAL
                 elif "exceeds" in calldata_err:
                     risk = RiskScore.MEDIUM
-                return VerificationResult(False, calldata_err, risk)
+                return VerificationResult(
+                    False,
+                    calldata_err,
+                    risk,
+                    is_new_recipient=is_new_recipient,
+                    flagged_addresses=new_addresses,
+                )
 
-        # If injection was detected but action was confirmed by human in balanced/degen mode:
-        # Raise risk score to HIGH and attach warning rather than silently allowing with LOW risk.
-        if injection_signal.is_strong and confirmed:
+        # Step 4: Defense against prompt injection & poisoned memory
+        if injection_signal.is_strong or injection_signal.detected:
+            if self.config.mode == "strict":
+                return VerificationResult(
+                    False,
+                    f"SG: prompt injection detected in untrusted context ({injection_signal.category})",
+                    RiskScore.CRITICAL,
+                    requires_confirmation=False,
+                    injection_detected=True,
+                    is_new_recipient=is_new_recipient,
+                    flagged_addresses=new_addresses,
+                )
+            elif self.config.mode == "balanced":
+                if not confirmed:
+                    return VerificationResult(
+                        False,
+                        f"SG: prompt injection detected in untrusted context (human confirmation required: {injection_signal.category})",
+                        RiskScore.HIGH,
+                        requires_confirmation=True,
+                        injection_detected=True,
+                        is_new_recipient=is_new_recipient,
+                        flagged_addresses=new_addresses,
+                    )
+            elif self.config.mode == "degen":
+                if not confirmed:
+                    return VerificationResult(
+                        False,
+                        f"SG: prompt injection detected in untrusted context (human confirmation required in degen mode: {injection_signal.category})",
+                        RiskScore.HIGH,
+                        requires_confirmation=True,
+                        injection_detected=True,
+                        is_new_recipient=is_new_recipient,
+                        flagged_addresses=new_addresses,
+                    )
+
+        # Step 5: Memory and context integrity protection for new recipient addresses
+        if is_new_recipient:
+            flagged_addr = new_addresses[0]
+
+            # Requirement 3: In strict mode, require explicit confirmation for new recipients
+            if self.config.mode == "strict":
+                if not confirmed:
+                    logger.info("Hermes SafeGuard: Strict mode requires explicit confirmation for new recipient 0x%s", flagged_addr)
+                    return VerificationResult(
+                        False,
+                        f"SG: new recipient address requires human confirmation (strict mode): 0x{flagged_addr}",
+                        RiskScore.HIGH,
+                        requires_confirmation=True,
+                        is_new_recipient=True,
+                        flagged_addresses=new_addresses,
+                    )
+                else:
+                    logger.info("Hermes SafeGuard: New recipient 0x%s confirmed by human in strict mode", flagged_addr)
+                    for a in new_addresses:
+                        self.memory_store.approve(a, label="User confirmed", source="confirmation")
+            else:
+                # Requirement 4: In balanced and degen modes, allow it but log it and raise risk score
+                logger.warning(
+                    "Hermes SafeGuard: New recipient/contract address detected in %s mode: 0x%s",
+                    self.config.mode, flagged_addr,
+                )
+
+        # Step 6: Allowlist checks (for addresses not pre-approved or confirmed)
+        if self.config.mode == "strict":
+            if self.recipient_allowlist and target_norm not in self.recipient_allowlist and not self.memory_store.is_approved(target_norm):
+                return VerificationResult(
+                    False, "SG: target not whitelisted", RiskScore.MEDIUM,
+                    is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
+                )
+        elif self.config.mode == "balanced":
+            if self.recipient_allowlist and target_norm not in self.recipient_allowlist and not self.memory_store.is_approved(target_norm):
+                return VerificationResult(
+                    False, "SG: target not whitelisted", RiskScore.MEDIUM,
+                    is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
+                )
+        elif self.config.mode == "degen":
+            if self.contract_allowlist:
+                if (target_norm not in self.contract_allowlist) and (target_norm not in self.recipient_allowlist) and not self.memory_store.is_approved(target_norm):
+                    return VerificationResult(
+                        False, "SG: target not in degen contract allowlist", RiskScore.MEDIUM,
+                        is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
+                    )
+            elif self.recipient_allowlist:
+                if target_norm not in self.recipient_allowlist and not self.memory_store.is_approved(target_norm):
+                    return VerificationResult(
+                        False, "SG: target not whitelisted", RiskScore.MEDIUM,
+                        is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
+                    )
+
+        # Step 7: Allowed execution return with appropriate risk scoring & warnings
+        if (injection_signal.is_strong or injection_signal.detected) and confirmed:
             return VerificationResult(
                 True,
                 "",
@@ -1197,6 +1718,23 @@ class PolicyEngine:
                 warning=f"Warning: Transaction executed under human confirmation despite flagged injection: {injection_signal.category}",
                 requires_confirmation=False,
                 injection_detected=True,
+                is_new_recipient=is_new_recipient,
+                flagged_addresses=new_addresses,
+            )
+
+        if is_new_recipient:
+            flagged_addr = new_addresses[0]
+            raised_risk = RiskScore.HIGH if (confirmed and self.config.mode == "strict") else RiskScore.MEDIUM
+            warn = f"Warning: Transaction to new/unapproved recipient 0x{flagged_addr} ({self.config.mode} mode, risk score raised)"
+            return VerificationResult(
+                True,
+                "",
+                raised_risk,
+                warning=warn,
+                requires_confirmation=False,
+                injection_detected=injection_signal.detected,
+                is_new_recipient=True,
+                flagged_addresses=new_addresses,
             )
 
         return VerificationResult(True, "", RiskScore.LOW)
@@ -1210,12 +1748,13 @@ def check_pre_tool_call(
     config: PolicyConfig | dict | str | None = None,
     confirmed: bool = False,
     scan_n: int = 10,
+    memory_store: AddressMemoryStore | None = None,
 ) -> VerificationResult:
     """
     Pre-tool-call inspection entrypoint for Hermes SafeGuard middleware.
 
     Intercepts tool calls before execution to protect autonomous agents against
-    direct and indirect prompt injection attacks targeting financial operations.
+    direct and indirect prompt injection attacks and poisoned memory manipulation.
     """
     if config is None:
         if mode is not None:
@@ -1231,6 +1770,9 @@ def check_pre_tool_call(
         cfg = PolicyConfig.from_yaml(config)
     else:
         raise TypeError(f"Unsupported config type: {type(config)}")
+
+    if memory_store is not None:
+        cfg.memory_store = memory_store
 
     engine = PolicyEngine(cfg)
     return engine.evaluate_pre_tool_call(

@@ -1,7 +1,7 @@
 # Hermes SafeGuard
 
-[![Tests](https://img.shields.io/badge/tests-18%20passed-brightgreen.svg)]()
-[![Scenarios](https://img.shields.io/badge/verification%20scenarios-12%2F12%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-58%20passed-brightgreen.svg)]()
+[![Scenarios](https://img.shields.io/badge/verification%20scenarios-13%2F13%20passed-brightgreen.svg)]()
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)]()
 [![Foundry](https://img.shields.io/badge/foundry-Solidity%200.8.20-orange.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-informational.svg)]()
@@ -27,6 +27,13 @@ Hermes SafeGuard provides defense-in-depth security middleware for autonomous on
     - **`strict`**: Hard blocks any financial tool call if strong injection signals exist in recent untrusted context (`CRITICAL` risk).
     - **`balanced`**: Forces explicit human confirmation (`HIGH` risk, `requires_confirmation=True`).
     - **`degen`**: Refuses to silently execute injection-flagged financial actions; raises risk score to `HIGH` and requires human confirmation before execution.
+- **Memory & Context Integrity Protection (Poisoned Memory Defense)**:
+  - **Persistent Approved Address Store**: Maintains file-based (`~/.hermes/approved_addresses.json` or custom path) or in-memory thread-safe store of previously approved recipients and trusted contracts.
+  - **New Recipient & Contract Detection**: Automatically extracts and parses destination, recipient, spender, or target contract addresses across transfers, ERC-20/721/1155 operations, approvals, Permit2, and NFT mints, flagging never-before-seen addresses (`is_new_recipient=True`).
+  - **Mode-Specific Gating**:
+    - **`strict`**: Requires explicit confirmation (`HIGH` risk, `requires_confirmation=True`) before executing transactions to any unapproved address; approves the address in memory store on human confirmation.
+    - **`balanced` & `degen`**: Permits transactions to new addresses while logging a warning and raising risk score to `MEDIUM`; strictly blocks (`allowed=False`) if combined with high-risk signals (prompt injection, unexpected balance drain, or exploit).
+  - **Pre-Approval Tools & Config**: Agent tools (`safeguard_approve_address`, `safeguard_list_approved_addresses`, `safeguard_revoke_address`) and declarative YAML/dict config (`pre_approved_addresses`) allow pre-registering secondary wallets and trusted contracts.
 - **Drain & Exploit Prevention**:
   - **Approval + transferFrom Drain Detection**: Blocks transactions granting approval and immediately executing `transferFrom` in the same batch or transaction.
   - **Sweeper Drain Detection**: Identifies and blocks multiple unauthorized transfers out across multiple tokens.
@@ -169,6 +176,12 @@ result = check_pre_tool_call(
 
 if not result.allowed:
     print(f"Action blocked: {result.reason} (Risk: {result.risk_score})")
+
+# 2. Pre-approving trusted recipients and contracts
+from policy_engine import safeguard_approve_address, safeguard_list_approved_addresses
+
+safeguard_approve_address("0x1111111111111111111111111111111111111111", label="Secondary Wallet")
+approved = safeguard_list_approved_addresses()
 ```
 
 The returned `VerificationResult` provides backward-compatible unpacking:

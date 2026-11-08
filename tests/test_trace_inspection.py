@@ -24,6 +24,7 @@ from verifier import (
     encode_v2_swap_calldata,
     inspect_execution_trace,
     is_rpc_available,
+    ensure_test_rpc_server,
     verify_transaction,
     build_test_contract_bytecode,
     rpc_request,
@@ -42,31 +43,7 @@ class TestTraceInspection(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.mock_server = None
-        if not is_rpc_available("127.0.0.1", 8545):
-            cls.mock_server = HTTPServer(("127.0.0.1", 8545), _MockRPCHandler)
-            cls.server_thread = threading.Thread(target=cls.mock_server.serve_forever, daemon=True)
-            cls.server_thread.start()
-            time.sleep(0.1)
-        else:
-            mock_code = build_test_contract_bytecode(
-                from_address="0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
-                target_bad="0x000000000000000000000000000000000000bad1",
-                tok1="0x0000000000000000000000000000000000007001",
-                tok2="0x0000000000000000000000000000000000007002",
-                nft1="0x000000000000000000000000000000000000ee01",
-            )
-            try:
-                rpc_request(DEFAULT_RPC_URL, "anvil_setCode", [DEFAULT_ALLOWED_TARGET, mock_code])
-                rpc_request(DEFAULT_RPC_URL, "anvil_setCode", ["0x000000000000000000000000000000000000C001", mock_code])
-            except Exception:
-                pass
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.mock_server:
-            cls.mock_server.shutdown()
-            cls.mock_server.server_close()
+        ensure_test_rpc_server()
 
     def setUp(self):
         self.degen_contract = "0x000000000000000000000000000000000000C001"

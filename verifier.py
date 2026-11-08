@@ -51,6 +51,15 @@ from policy_engine import (
     FINANCIAL_TOOLS,
     is_financial_tool,
     _parse_wei_value,
+    AddressEntry,
+    AddressMemoryStore,
+    get_default_memory_store,
+    set_default_memory_store,
+    reset_default_memory_store,
+    safeguard_approve_address,
+    safeguard_list_approved_addresses,
+    safeguard_revoke_address,
+    extract_action_addresses,
 )
 
 DEFAULT_RPC_URL = "http://127.0.0.1:8545"
@@ -190,24 +199,27 @@ def build_test_contract_bytecode(
     code_drain_app = _make_call(tok1, approve_call) + _make_call(tok1, transfer_call1) + "00"
     code_multi = _make_call(tok1, transfer_call1) + _make_call(tok2, transfer_call2) + "00"
     code_unexp = _make_call(nft1, transfer_call1) + "00"
+    code_new_deploy = "600060006000f08060006000600060006000855af1505000"
 
     dispatcher_prefix = "60003560e01c"
-    num_checks = 4
+    num_checks = 5
     prefix_len = 6 + num_checks * 11 + 1
 
     off_delegate = prefix_len
     off_drain_app = off_delegate + 1 + len(code_delegate) // 2
     off_multi = off_drain_app + 1 + len(code_drain_app) // 2
     off_unexp = off_multi + 1 + len(code_multi) // 2
+    off_new_deploy = off_unexp + 1 + len(code_unexp) // 2
 
     checks = ""
     checks += f"8063{EXPLOIT_DELEGATECALL_SELECTOR}1461{off_delegate:04x}57"
     checks += f"8063{DRAIN_APPROVAL_SELECTOR}1461{off_drain_app:04x}57"
     checks += f"8063{MULTI_DRAIN_SELECTOR}1461{off_multi:04x}57"
     checks += f"8063{UNEXPECTED_TRANSFER_SELECTOR}1461{off_unexp:04x}57"
+    checks += f"8063{NEW_DEPLOY_SELECTOR}1461{off_new_deploy:04x}57"
     checks += "00"
 
-    return "0x" + dispatcher_prefix + checks + "5b" + code_delegate + "5b" + code_drain_app + "5b" + code_multi + "5b" + code_unexp
+    return "0x" + dispatcher_prefix + checks + "5b" + code_delegate + "5b" + code_drain_app + "5b" + code_multi + "5b" + code_unexp + "5b" + code_new_deploy
 
 
 def encode_address_word(address: str) -> bytes:
@@ -624,6 +636,7 @@ def inspect_execution_trace(
     rpc_url: str = DEFAULT_RPC_URL,
     contract_allowlist: list[str] | None = None,
     mode: str = "strict",
+    memory_store: AddressMemoryStore | None = None,
 ) -> VerificationResult:
     """
     Inspect execution trace and pre/post state diffs via Anvil's debug_traceCall RPC method.
@@ -642,6 +655,8 @@ def inspect_execution_trace(
     if contract_allowlist:
         allowed_targets.update(normalize_address(a) for a in contract_allowlist)
     allowed_targets.update(KNOWN_VERIFIED_PROTOCOLS)
+    if memory_store:
+        allowed_targets.update(memory_store.approved_addresses)
 
     raw_data = data_hex.strip() if data_hex else ""
     if raw_data.startswith(("0x", "0X")):
@@ -944,8 +959,8 @@ def inspect_execution_trace(
     for c in calls:
         c_to = c["to"]
         if c_to and c_to not in allowed_targets and c_to not in KNOWN_VERIFIED_PROTOCOLS:
-            if mode == "degen":
-                warn = f"Warning: CALL to unverified contract 0x{c_to} allowed in degen mode"
+            if mode in ("balanced", "degen"):
+                warn = f"Warning: CALL to unverified contract 0x{c_to} allowed in {mode} mode"
                 return VerificationResult(True, warn, RiskScore.MEDIUM, warning=warn)
             else:
                 return VerificationResult(
@@ -971,10 +986,12 @@ def check_pre_tool_call(
     confirmed: bool = False,
     scan_n: int = 10,
     rpc_url: str = DEFAULT_RPC_URL,
+    memory_store: AddressMemoryStore | None = None,
 ) -> VerificationResult:
     """
     Hook evaluator for pre_tool_call events in Hermes Agent.
-    Protects autonomous agents against prompt / indirect injection targeting financial actions.
+    Protects autonomous agents against prompt / indirect injection targeting financial actions
+    and memory manipulation attempting unauthorized asset transfers.
 
     Parameters:
         tool_name: Name of tool being called (e.g. 'safeguard_execute_tx', 'eth_sendTransaction').
@@ -985,6 +1002,7 @@ def check_pre_tool_call(
         confirmed: Whether human confirmation has been explicitly provided for this action.
         scan_n: Number of recent messages to inspect for untrusted content.
         rpc_url: JSON-RPC endpoint for simulation.
+        memory_store: Optional AddressMemoryStore instance.
 
     Returns:
         VerificationResult with .allowed, .reason, .risk_score, .requires_confirmation.
@@ -1009,11 +1027,51 @@ def check_pre_tool_call(
     else:
         raise TypeError(f"Unsupported config type: {type(config)}")
 
-    # 3. Check prompt injection on untrusted context
+    if memory_store is not None:
+        policy_cfg.memory_store = memory_store
+
+    # 3. Extract transaction parameters
+    to_address = str(
+        tool_args.get("to")
+        or tool_args.get("to_address")
+        or tool_args.get("target")
+        or tool_args.get("recipient")
+        or ""
+    ).strip()
+    value_raw = tool_args.get("value", tool_args.get("value_wei", tool_args.get("amount", 0)))
+    value_wei = _parse_wei_value(value_raw, 0)
+    data_hex = str(
+        tool_args.get("data")
+        or tool_args.get("data_hex")
+        or tool_args.get("calldata")
+        or tool_args.get("input")
+        or ""
+    ).strip()
+
+    # 4. Check prompt injection on untrusted context
     engine = PolicyEngine(policy_cfg)
+    if memory_store is not None:
+        engine.memory_store = memory_store
     injection_signal = InjectionSignal()
     if policy_cfg.block_prompt_injection and context:
         injection_signal = engine.evaluate_context_injection(context, scan_n=scan_n)
+
+        # Defense against poisoned memory manipulating agent to send funds to new recipient
+        if to_address:
+            action_info = extract_action_addresses(to_address, data_hex, value_wei)
+            new_addresses = [a for a in action_info["all_addresses"] if a and not engine.is_address_approved(a)]
+            if new_addresses and injection_signal.detected:
+                flagged_addr = new_addresses[0]
+                return VerificationResult(
+                    False,
+                    f"SG: blocked — new recipient 0x{flagged_addr} combined with untrusted injection ({injection_signal.category})",
+                    RiskScore.CRITICAL,
+                    requires_confirmation=False,
+                    injection_detected=True,
+                    is_new_recipient=True,
+                    flagged_addresses=new_addresses,
+                )
+
         if injection_signal.is_strong:
             if policy_cfg.mode == "strict":
                 return VerificationResult(
@@ -1044,24 +1102,6 @@ def check_pre_tool_call(
                         injection_detected=True,
                     )
 
-    # 4. Extract transaction parameters
-    to_address = str(
-        tool_args.get("to")
-        or tool_args.get("to_address")
-        or tool_args.get("target")
-        or tool_args.get("recipient")
-        or ""
-    ).strip()
-    value_raw = tool_args.get("value", tool_args.get("value_wei", tool_args.get("amount", 0)))
-    value_wei = _parse_wei_value(value_raw, 0)
-    data_hex = str(
-        tool_args.get("data")
-        or tool_args.get("data_hex")
-        or tool_args.get("calldata")
-        or tool_args.get("input")
-        or ""
-    ).strip()
-
     if to_address:
         return verify_transaction(
             to_address=to_address,
@@ -1072,6 +1112,7 @@ def check_pre_tool_call(
             context=context,
             confirmed=confirmed,
             scan_n=scan_n,
+            memory_store=engine.memory_store,
         )
 
     # Financial action without transaction parameters (e.g. key export/management)
@@ -1100,6 +1141,7 @@ def verify_transaction(
     context: list[Any] | None = None,
     confirmed: bool = False,
     scan_n: int = 10,
+    memory_store: AddressMemoryStore | None = None,
 ) -> VerificationResult:
     """
     Verify a transaction against SafeGuardPolicy via eth_call and Anvil trace inspection
@@ -1117,6 +1159,7 @@ def verify_transaction(
         context: Optional list of recent context messages/tool results.
         confirmed: Whether explicit human confirmation has been granted.
         scan_n: Number of recent context messages to scan for injection.
+        memory_store: Optional AddressMemoryStore instance.
 
     Returns:
         VerificationResult(allowed, reason, risk_score)
@@ -1142,8 +1185,13 @@ def verify_transaction(
         else:
             raise TypeError(f"Unsupported config type: {type(config)}")
 
+        if memory_store is not None:
+            policy_cfg.memory_store = memory_store
+
         # Configure active policy engine for local mock RPC and direct evaluation
         engine = PolicyEngine(policy_cfg)
+        if memory_store is not None:
+            engine.memory_store = memory_store
         _MockRPCHandler.active_policy_engine = engine
 
         # Step 1: Policy check & Prompt Injection inspection
@@ -1196,7 +1244,40 @@ def verify_transaction(
             rpc_url=rpc_url,
             contract_allowlist=policy_cfg.contract_allowlist,
             mode=policy_cfg.mode,
+            memory_store=engine.memory_store,
         )
+
+        if not trace_res.allowed:
+            # Preserves failure reason and is_new_recipient flag
+            return VerificationResult(
+                False,
+                trace_res.reason,
+                trace_res.risk_score,
+                warning=trace_res.warning,
+                requires_confirmation=trace_res.requires_confirmation,
+                injection_detected=pre_res.injection_detected,
+                is_new_recipient=pre_res.is_new_recipient,
+                flagged_addresses=pre_res.flagged_addresses,
+            )
+
+        if pre_res.is_new_recipient:
+            # Combine risk scores and warnings for new recipient allowed in balanced/degen or confirmed strict
+            risk = (
+                RiskScore.HIGH.value
+                if (pre_res.risk_score == RiskScore.HIGH.value or trace_res.risk_score == RiskScore.HIGH.value)
+                else RiskScore.MEDIUM.value
+            )
+            combined_warn = "; ".join(filter(None, [pre_res.warning, trace_res.warning]))
+            return VerificationResult(
+                True,
+                trace_res.reason or pre_res.reason,
+                risk,
+                warning=combined_warn,
+                requires_confirmation=False,
+                injection_detected=pre_res.injection_detected,
+                is_new_recipient=True,
+                flagged_addresses=pre_res.flagged_addresses,
+            )
 
         if pre_res.injection_detected and trace_res.allowed:
             # If injection was detected but human confirmed, ensure risk score is elevated to HIGH
@@ -1271,7 +1352,7 @@ class _MockRPCHandler(BaseHTTPRequestHandler):
 
                     engine = getattr(self.__class__, "active_policy_engine", None)
                     if engine is not None:
-                        allowed, err = engine.evaluate_transaction_policy(target_addr, val_wei, inner_data)
+                        allowed, err = engine.evaluate_transaction_policy(target_addr, val_wei, inner_data, confirmed=True)
                         if not allowed:
                             resp = self._make_revert(req_id, err)
                         else:
@@ -1654,6 +1735,38 @@ def is_rpc_available(host: str = "127.0.0.1", port: int = 8545) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
         return s.connect_ex((host, port)) == 0
+
+
+_SHARED_MOCK_SERVER = None
+_SHARED_MOCK_SERVER_LOCK = threading.Lock()
+
+
+class ReusableHTTPServer(HTTPServer):
+    allow_reuse_address = True
+
+
+def ensure_test_rpc_server(host: str = "127.0.0.1", port: int = 8545) -> None:
+    """Ensure a local RPC or mock RPC server is available on port 8545 for testing."""
+    global _SHARED_MOCK_SERVER
+    with _SHARED_MOCK_SERVER_LOCK:
+        if not is_rpc_available(host, port):
+            _SHARED_MOCK_SERVER = ReusableHTTPServer((host, port), _MockRPCHandler)
+            server_thread = threading.Thread(target=_SHARED_MOCK_SERVER.serve_forever, daemon=True)
+            server_thread.start()
+            time.sleep(0.1)
+
+        # On Anvil nodes, configure mock bytecode on test targets to simulate traces
+        anvil_mock_code = build_test_contract_bytecode()
+        for target in (
+            DEFAULT_ALLOWED_TARGET,
+            "0x000000000000000000000000000000000000C001",
+            "0x000000000000000000000000000000000000F001",
+            "0x5555555555555555555555555555555555555555",
+        ):
+            try:
+                rpc_request(f"http://{host}:{port}", "anvil_setCode", [target, anvil_mock_code])
+            except Exception:
+                pass
 
 
 # ==============================================================================
