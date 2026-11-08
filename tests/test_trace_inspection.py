@@ -35,6 +35,9 @@ from verifier import (
     MULTI_DRAIN_SELECTOR,
     UNEXPECTED_TRANSFER_SELECTOR,
     NEW_DEPLOY_SELECTOR,
+    ROBINHOOD_L1_GATEWAY_ROUTER,
+    encode_high_tax_swap_calldata,
+    encode_extortion_tax_swap_calldata,
 )
 
 
@@ -200,6 +203,82 @@ class TestTraceInspection(unittest.TestCase):
         self.assertEqual(res_degen.risk_score, RiskScore.MEDIUM.value)
         self.assertIn("Warning", res_degen.reason)
 
+    def test_normal_high_value_transfer_passes_in_degen(self):
+        """A normal high-value transfer (e.g. 15 ETH) passes trace simulation in degen mode."""
+        high_val = 15 * 10**18  # 15 ETH
+        res = verify_transaction(
+            DEFAULT_ALLOWED_TARGET,
+            high_val,
+            "",
+            config=PolicyConfig.degen(),
+        )
+        self.assertTrue(res.allowed)
+        self.assertFalse(res.requires_confirmation)
+
+    def test_extortionate_token_tax_hard_blocked_in_degen(self):
+        """Tokens with extortionate tax (e.g. 99% honeypot) MUST be hard-blocked even in degen mode."""
+        extortion_calldata = encode_extortion_tax_swap_calldata("0x0000000000000000000000000000000000007001", 1_000_000)
+        res = verify_transaction(
+            self.degen_contract,
+            0,
+            extortion_calldata,
+            config=PolicyConfig.degen(contract_allowlist=[self.degen_contract]),
+        )
+        self.assertFalse(res.allowed)
+        self.assertEqual(res.risk_score, RiskScore.CRITICAL.value)
+        self.assertIn("extortionate token tax", res.reason.lower())
+
+    def test_extortionate_token_tax_hard_blocked_in_balanced(self):
+        """Tokens with 99% honeypot tax must fail in balanced mode."""
+        extortion_calldata = encode_extortion_tax_swap_calldata("0x0000000000000000000000000000000000007001", 1_000_000)
+        res = verify_transaction(
+            DEFAULT_ALLOWED_TARGET,
+            0,
+            extortion_calldata,
+            config=PolicyConfig.balanced(recipient_allowlist=[DEFAULT_ALLOWED_TARGET]),
+        )
+        self.assertFalse(res.allowed)
+        self.assertEqual(res.risk_score, RiskScore.CRITICAL.value)
+        self.assertIn("extortionate token tax", res.reason.lower())
+
+    def test_high_token_tax_warns_in_degen_mode(self):
+        """Tokens with high tax between 25% and 50% (e.g. 30%) should return warning in degen mode."""
+        high_tax_calldata = encode_high_tax_swap_calldata("0x0000000000000000000000000000000000007001", 1_000_000)
+        res = verify_transaction(
+            self.degen_contract,
+            0,
+            high_tax_calldata,
+            config=PolicyConfig.degen(contract_allowlist=[self.degen_contract]),
+        )
+        self.assertTrue(res.allowed)
+        self.assertEqual(res.risk_score, RiskScore.HIGH.value)
+        self.assertIn("warning", res.warning.lower())
+        self.assertIn("high token tax", res.warning.lower())
+
+    def test_high_token_tax_blocks_in_strict_mode(self):
+        """Tokens with high tax (30%) must be blocked in strict mode."""
+        high_tax_calldata = encode_high_tax_swap_calldata("0x0000000000000000000000000000000000007001", 1_000_000)
+        res = verify_transaction(
+            DEFAULT_ALLOWED_TARGET,
+            0,
+            high_tax_calldata,
+            config=PolicyConfig.strict(recipient_allowlist=[DEFAULT_ALLOWED_TARGET]),
+        )
+        self.assertFalse(res.allowed)
+        self.assertEqual(res.risk_score, RiskScore.HIGH.value)
+        self.assertIn("high token tax", res.reason.lower())
+
+    def test_robinhood_gateway_router_recognized(self):
+        """Robinhood L1 Gateway router is recognized as a verified protocol and allowed in degen mode."""
+        res = verify_transaction(
+            ROBINHOOD_L1_GATEWAY_ROUTER,
+            100_000_000_000_000_000,  # 0.1 ETH
+            "",
+            config=PolicyConfig.degen(),
+        )
+        self.assertTrue(res.allowed)
+        self.assertEqual(res.risk_score, RiskScore.LOW.value)
+
     def test_backward_compatible_unpacking(self):
         """VerificationResult should cleanly unpack as 2 items, 3 items, or object attributes."""
         res = VerificationResult(True, "all good", RiskScore.LOW)
@@ -219,6 +298,32 @@ class TestTraceInspection(unittest.TestCase):
         self.assertTrue(res.allowed)
         self.assertEqual(res.reason, "all good")
         self.assertEqual(res.risk_score, "low")
+
+    def test_simulation_realistic_mint_to_allows_in_degen(self):
+        """Realistic mintTo(caller, quantity) NFT mint passes simulation cleanly in degen mode."""
+        mint_to_calldata = "0x755edd17" + encode_address_word(self.agent_wallet).hex() + encode_uint256_word(1).hex()
+        res = verify_transaction(
+            "0x000000000000000000000000000000000000F001",
+            80_000_000_000_000_000,  # 0.08 ETH
+            mint_to_calldata,
+            config=PolicyConfig.degen(),
+        )
+        self.assertTrue(res.allowed)
+        self.assertFalse(res.requires_confirmation)
+        self.assertIn(res.risk_score, (RiskScore.LOW.value, RiskScore.MEDIUM.value))
+
+    def test_simulation_catches_unexpected_token_outflow_during_nft_mint(self):
+        """Simulation catches unexpected NFT/token transfer out during NFT mint and marks CRITICAL risk."""
+        unexpected_calldata = "0x" + UNEXPECTED_TRANSFER_SELECTOR + encode_uint256_word(1).hex()
+        res = verify_transaction(
+            self.degen_contract,
+            50_000_000_000_000_000,
+            unexpected_calldata,
+            config=PolicyConfig.degen(contract_allowlist=[self.degen_contract]),
+        )
+        self.assertFalse(res.allowed)
+        self.assertEqual(res.risk_score, RiskScore.CRITICAL.value)
+        self.assertIn("unexpected erc-20/nft transfer out of wallet during nft mint", res.reason.lower())
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ Supports configuration via Python dict and YAML format.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -108,6 +109,9 @@ def is_financial_tool(tool_name: str) -> bool:
         "safeguard_approve_address",
         "safeguard_list_approved_addresses",
         "safeguard_revoke_address",
+        "safeguard_confirm_action",
+        "safeguard_list_pending_confirmations",
+        "safeguard_get_audit_log",
     ):
         return False
     if name in FINANCIAL_TOOLS:
@@ -462,7 +466,8 @@ class VerificationResult(tuple):
     Behaves as a 2-tuple (allowed, reason), 3-tuple (allowed, reason, risk_score),
     or 4-tuple (allowed, reason, risk_score, requires_confirmation) when unpacked,
     and provides attribute access (.allowed, .reason, .risk_score, .warning, .requires_confirmation,
-    .injection_detected, .is_new_recipient, .flagged_addresses).
+    .injection_detected, .is_new_recipient, .flagged_addresses, .confirmation_id,
+    .confirmation_summary, .summary, .status).
     """
     allowed: bool
     reason: str
@@ -472,6 +477,10 @@ class VerificationResult(tuple):
     injection_detected: bool
     is_new_recipient: bool
     flagged_addresses: list[str]
+    confirmation_id: str
+    confirmation_summary: str
+    summary: str
+    status: str
 
     def __new__(
         cls,
@@ -483,6 +492,9 @@ class VerificationResult(tuple):
         injection_detected: bool = False,
         is_new_recipient: bool = False,
         flagged_addresses: list[str] | None = None,
+        confirmation_id: str = "",
+        confirmation_summary: str = "",
+        summary: str = "",
     ):
         risk_val = risk_score.value if isinstance(risk_score, RiskScore) else str(risk_score)
         inst = super().__new__(cls, (bool(allowed), str(reason), risk_val))
@@ -495,6 +507,11 @@ class VerificationResult(tuple):
         inst.injection_detected = bool(injection_detected)
         inst.is_new_recipient = bool(is_new_recipient)
         inst.flagged_addresses = list(flagged_addresses or [])
+        inst.confirmation_id = str(confirmation_id or "")
+        summary_val = str(confirmation_summary or summary or "")
+        inst.confirmation_summary = summary_val
+        inst.summary = summary_val
+        inst.status = "requires_confirmation" if inst.requires_confirmation else ("allowed" if inst.allowed else "blocked")
         return inst
 
     def __iter__(self):
@@ -511,6 +528,8 @@ class VerificationResult(tuple):
                         return iter((self.allowed, self.reason, self.risk_score, self.requires_confirmation))
                     elif instr.arg == 5:
                         return iter((self.allowed, self.reason, self.risk_score, self.requires_confirmation, self.is_new_recipient))
+                    elif instr.arg == 6:
+                        return iter((self.allowed, self.reason, self.risk_score, self.requires_confirmation, self.confirmation_summary, self.confirmation_id))
         except Exception:
             pass
         return super().__iter__()
@@ -530,9 +549,22 @@ def normalize_address(address: str) -> str:
 OPENSEA_SEAPORT_1_5 = normalize_address("0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC")
 OPENSEA_SEAPORT_1_6 = normalize_address("0x0000000000000068F116a894984e2DB1123eB395")
 OPENSEA_SEADROP = normalize_address("0x00005EA00Ac477B1030CE78506496e8C2dE24bf5")
+
+# Ethereum Mainnet Routers
 UNISWAP_V2_ROUTER = normalize_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
 UNISWAP_V3_ROUTER = normalize_address("0xE592427A0AEce92De3Edee1F18E0157C05861564")
+UNISWAP_SWAP_ROUTER_02 = normalize_address("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45")
 UNISWAP_UNIVERSAL_ROUTER = normalize_address("0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD")
+
+# Base (Chain ID 8453) DEX Routers
+BASE_UNISWAP_ROUTER_02 = normalize_address("0x2626664c2603336E57B271c5C0b26F421741e481")
+BASE_UNISWAP_UNIVERSAL_ROUTER = normalize_address("0x198EF79F1F515F02dFE9e3115e9F8078395e6c76")
+BASE_AERODROME_ROUTER = normalize_address("0xcF77a3Ba9A5CA399B7c97c749545344273801A9B")
+BASE_AERODROME_SLIPSTREAM = normalize_address("0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5")
+
+# Robinhood Gateway & Routers (Ethereum L1 & Arbitrum)
+ROBINHOOD_L1_GATEWAY_ROUTER = normalize_address("0x6a2E3a1e16FC29f27Ce61429746D558d656975bB")
+ROBINHOOD_ARBITRUM_SWAP_ROUTER = normalize_address("0x1E324B9316138CA9a73F960213621AD1aaf01B89")
 
 KNOWN_VERIFIED_PROTOCOLS: set[str] = {
     OPENSEA_SEAPORT_1_5,
@@ -540,8 +572,16 @@ KNOWN_VERIFIED_PROTOCOLS: set[str] = {
     OPENSEA_SEADROP,
     UNISWAP_V2_ROUTER,
     UNISWAP_V3_ROUTER,
+    UNISWAP_SWAP_ROUTER_02,
     UNISWAP_UNIVERSAL_ROUTER,
+    BASE_UNISWAP_ROUTER_02,
+    BASE_UNISWAP_UNIVERSAL_ROUTER,
+    BASE_AERODROME_ROUTER,
+    BASE_AERODROME_SLIPSTREAM,
+    ROBINHOOD_L1_GATEWAY_ROUTER,
+    ROBINHOOD_ARBITRUM_SWAP_ROUTER,
     normalize_address(DEFAULT_ALLOWED_TARGET),
+    normalize_address("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"),
 }
 
 NFT_MINT_SELECTORS: set[str] = {
@@ -553,6 +593,21 @@ NFT_MINT_SELECTORS: set[str] = {
     "b3a34220",  # fulfillOrder
     "ed98257a",  # fulfillAvailableOrders
     "87201b41",  # fulfillAvailableAdvancedOrders
+}
+
+ERC20_TRANSFER_SELECTOR = "a9059cbb"
+
+DEX_SWAP_SELECTORS: set[str] = {
+    V2_SWAP_SELECTOR,
+    V3_SWAP_SELECTOR,
+    "8803dbee",  # swapTokensForExactTokens
+    "7ff36ab5",  # swapExactETHForTokens
+    "18cbafe5",  # swapExactTokensForETH
+    "4a25e94a",  # swapTokensForExactETH
+    "fb3bdb41",  # swapETHForExactTokens
+    "5c11d795",  # exactInput
+    "db3e2198",  # exactOutputSingle
+    "f285a401",  # exactOutput
 }
 
 
@@ -762,11 +817,18 @@ def safeguard_approve_address(
     label: str = "",
     address_type: str = "recipient",
     store: AddressMemoryStore | None = None,
+    threat_feed: ThreatFeed | None = None,
 ) -> dict[str, Any]:
     """
     User tool/helper to pre-approve common addresses (e.g. secondary wallet, known NFT contracts).
     """
     norm = normalize_address(address)
+    tf = threat_feed or get_default_threat_feed()
+    if tf.is_address_blocked(norm):
+        threat = tf.get_address_threat(norm)
+        threat_name = f": {threat.name}" if threat and threat.name else ""
+        raise ValueError(f"Cannot approve address 0x{norm}. Address is blocked by threat feed{threat_name}")
+
     st = store or get_default_memory_store()
     entry = st.approve(norm, label=label, address_type=address_type, source="tool")
     logger.info("Hermes SafeGuard: Pre-approved address 0x%s (%s: %s)", norm, address_type, label)
@@ -789,6 +851,1197 @@ def safeguard_revoke_address(address: str, store: AddressMemoryStore | None = No
     norm = normalize_address(address)
     st = store or get_default_memory_store()
     return st.remove(norm)
+
+
+# ==============================================================================
+# Human Confirmation & Approval Framework (Degen & Elevated Risk Actions)
+# ==============================================================================
+
+@dataclass
+class PendingConfirmation:
+    """Represents a transaction or financial action awaiting explicit human approval."""
+    id: str
+    action: str
+    tool_name: str
+    tool_args: dict[str, Any]
+    to_address: str
+    value_wei: int
+    data_hex: str
+    risk_score: str
+    reason: str
+    summary: str
+    mode: str
+    created_at: float
+    confirmed: bool = False
+    rejected: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "action": self.action,
+            "tool_name": self.tool_name,
+            "to_address": f"0x{self.to_address}" if self.to_address else "",
+            "value_wei": self.value_wei,
+            "value_eth": self.value_wei / 10**18 if self.value_wei else 0.0,
+            "data_hex": self.data_hex,
+            "risk_score": self.risk_score,
+            "reason": self.reason,
+            "summary": self.summary,
+            "mode": self.mode,
+            "status": "confirmed" if self.confirmed else ("rejected" if self.rejected else "pending"),
+            "created_at": self.created_at,
+        }
+
+
+class ConfirmationStore:
+    """Thread-safe store for pending, confirmed, and rejected human approval requests."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending: dict[str, PendingConfirmation] = {}
+        self._confirmed_ids: set[str] = set()
+        self._rejected_ids: set[str] = set()
+
+    def create_confirmation_request(
+        self,
+        action: str,
+        tool_name: str = "",
+        tool_args: dict[str, Any] | None = None,
+        to_address: str = "",
+        value_wei: int = 0,
+        data_hex: str = "",
+        risk_score: str = "high",
+        reason: str = "",
+        summary: str = "",
+        mode: str = "degen",
+        metadata: dict[str, Any] | None = None,
+    ) -> PendingConfirmation:
+        norm_to = normalize_address(to_address) if to_address else ""
+        with self._lock:
+            hash_input = f"{norm_to}:{value_wei}:{data_hex}:{tool_name}:{time.time()}"
+            conf_id = "conf_" + hashlib.sha256(hash_input.encode("utf-8")).hexdigest()[:12]
+            entry = PendingConfirmation(
+                id=conf_id,
+                action=action,
+                tool_name=tool_name,
+                tool_args=dict(tool_args or {}),
+                to_address=norm_to,
+                value_wei=value_wei,
+                data_hex=data_hex,
+                risk_score=risk_score,
+                reason=reason,
+                summary=summary,
+                mode=mode,
+                created_at=time.time(),
+                metadata=dict(metadata or {}),
+            )
+            self._pending[conf_id] = entry
+            return entry
+
+    def confirm(self, confirmation_id: str) -> bool:
+        with self._lock:
+            self._confirmed_ids.add(confirmation_id)
+            if confirmation_id in self._pending:
+                self._pending[confirmation_id].confirmed = True
+                self._pending[confirmation_id].rejected = False
+                return True
+            return True
+
+    def reject(self, confirmation_id: str) -> bool:
+        with self._lock:
+            self._rejected_ids.add(confirmation_id)
+            if confirmation_id in self._pending:
+                self._pending[confirmation_id].rejected = True
+                self._pending[confirmation_id].confirmed = False
+                return True
+            return True
+
+    def is_confirmed(self, confirmation_id: str) -> bool:
+        with self._lock:
+            if confirmation_id in self._confirmed_ids:
+                return True
+            entry = self._pending.get(confirmation_id)
+            return bool(entry and entry.confirmed)
+
+    def is_rejected(self, confirmation_id: str) -> bool:
+        with self._lock:
+            if confirmation_id in self._rejected_ids:
+                return True
+            entry = self._pending.get(confirmation_id)
+            return bool(entry and entry.rejected)
+
+    def get(self, confirmation_id: str) -> PendingConfirmation | None:
+        with self._lock:
+            return self._pending.get(confirmation_id)
+
+    def list_pending(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [p.to_dict() for p in self._pending.values() if not p.confirmed and not p.rejected]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._pending.clear()
+            self._confirmed_ids.clear()
+            self._rejected_ids.clear()
+
+
+_DEFAULT_CONFIRMATION_STORE = ConfirmationStore()
+
+
+def get_default_confirmation_store() -> ConfirmationStore:
+    global _DEFAULT_CONFIRMATION_STORE
+    return _DEFAULT_CONFIRMATION_STORE
+
+
+def reset_default_confirmation_store() -> None:
+    global _DEFAULT_CONFIRMATION_STORE
+    _DEFAULT_CONFIRMATION_STORE = ConfirmationStore()
+
+
+# ==============================================================================
+# Financial Action Audit Logger (Allowed, Blocked, Requires Confirmation)
+# ==============================================================================
+
+@dataclass
+class FinancialActionLogEntry:
+    """Structured audit log entry recording financial transactions and security decisions."""
+    timestamp: float
+    action: str  # e.g. "safeguard_execute_tx", "transfer", "swap", "approve", "mint"
+    status: str  # "allowed", "blocked", "requires_confirmation", "confirmed", "rejected"
+    mode: str    # "strict", "balanced", "degen"
+    target: str
+    value_wei: int
+    data_hex: str
+    risk_score: str
+    reason: str
+    summary: str
+    confirmation_id: str | None = None
+    warning: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "timestamp": self.timestamp,
+            "action": self.action,
+            "status": self.status,
+            "mode": self.mode,
+            "target": f"0x{self.target}" if self.target else "",
+            "value_wei": self.value_wei,
+            "value_eth": self.value_wei / 10**18 if self.value_wei else 0.0,
+            "data_hex": self.data_hex,
+            "risk_score": self.risk_score,
+            "reason": self.reason,
+            "summary": self.summary,
+            "confirmation_id": self.confirmation_id,
+            "warning": self.warning,
+            "metadata": self.metadata,
+        }
+
+
+class ActionAuditLogger:
+    """Thread-safe in-memory and structured logger for all intercepted financial actions."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: list[FinancialActionLogEntry] = []
+
+    def log(
+        self,
+        action: str,
+        status: str,
+        mode: str,
+        target: str = "",
+        value_wei: int = 0,
+        data_hex: str = "",
+        risk_score: str = "low",
+        reason: str = "",
+        summary: str = "",
+        confirmation_id: str | None = None,
+        warning: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> FinancialActionLogEntry:
+        norm_target = normalize_address(target) if target else ""
+        with self._lock:
+            entry = FinancialActionLogEntry(
+                timestamp=time.time(),
+                action=action,
+                status=status,
+                mode=mode,
+                target=norm_target,
+                value_wei=value_wei,
+                data_hex=data_hex,
+                risk_score=risk_score,
+                reason=reason,
+                summary=summary,
+                confirmation_id=confirmation_id,
+                warning=warning,
+                metadata=dict(metadata or {}),
+            )
+            self._entries.append(entry)
+
+            # High-visibility logging
+            target_str = f"0x{norm_target}" if norm_target else "none"
+            val_eth = value_wei / 10**18 if value_wei else 0.0
+            if status == "allowed":
+                logger.info(
+                    "Hermes SafeGuard AUDIT [ALLOWED]: mode=%s action=%s target=%s value=%.4f ETH risk=%s warning='%s'",
+                    mode, action, target_str, val_eth, risk_score, warning or "none",
+                )
+            elif status == "requires_confirmation":
+                logger.warning(
+                    "Hermes SafeGuard AUDIT [REQUIRES_CONFIRMATION]: mode=%s action=%s target=%s value=%.4f ETH risk=%s id=%s reason='%s'",
+                    mode, action, target_str, val_eth, risk_score, confirmation_id, reason,
+                )
+            elif status == "blocked":
+                logger.warning(
+                    "Hermes SafeGuard AUDIT [BLOCKED]: mode=%s action=%s target=%s value=%.4f ETH risk=%s reason='%s'",
+                    mode, action, target_str, val_eth, risk_score, reason,
+                )
+            elif status == "confirmed":
+                logger.info(
+                    "Hermes SafeGuard AUDIT [CONFIRMED]: id=%s action=%s target=%s",
+                    confirmation_id, action, target_str,
+                )
+            elif status == "rejected":
+                logger.info(
+                    "Hermes SafeGuard AUDIT [REJECTED]: id=%s action=%s target=%s",
+                    confirmation_id, action, target_str,
+                )
+
+            return entry
+
+    def get_entries(
+        self,
+        limit: int = 50,
+        status: str | None = None,
+        mode: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            filtered = self._entries
+            if status:
+                filtered = [e for e in filtered if e.status == status]
+            if mode:
+                filtered = [e for e in filtered if e.mode == mode]
+            return [e.to_dict() for e in filtered[-limit:]]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+_DEFAULT_AUDIT_LOGGER = ActionAuditLogger()
+
+
+def get_default_audit_logger() -> ActionAuditLogger:
+    global _DEFAULT_AUDIT_LOGGER
+    return _DEFAULT_AUDIT_LOGGER
+
+
+def reset_default_audit_logger() -> None:
+    global _DEFAULT_AUDIT_LOGGER
+    _DEFAULT_AUDIT_LOGGER = ActionAuditLogger()
+
+
+def log_financial_action(
+    action: str,
+    status: str,
+    mode: str,
+    target: str = "",
+    value_wei: int = 0,
+    data_hex: str = "",
+    risk_score: str = "low",
+    reason: str = "",
+    summary: str = "",
+    confirmation_id: str | None = None,
+    warning: str = "",
+    metadata: dict[str, Any] | None = None,
+    audit_logger: ActionAuditLogger | None = None,
+) -> FinancialActionLogEntry:
+    """Convenience helper to record a financial action in the audit log."""
+    al = audit_logger or get_default_audit_logger()
+    return al.log(
+        action=action,
+        status=status,
+        mode=mode,
+        target=target,
+        value_wei=value_wei,
+        data_hex=data_hex,
+        risk_score=risk_score,
+        reason=reason,
+        summary=summary,
+        confirmation_id=confirmation_id,
+        warning=warning,
+        metadata=metadata,
+    )
+
+
+# ==============================================================================
+# Transaction Human-Readable Summarizer
+# ==============================================================================
+
+def generate_transaction_summary(
+    to_address: str,
+    value_wei: int = 0,
+    data_hex: str = "",
+    risk_reasons: list[str] | None = None,
+    mode: str = "degen",
+    tool_name: str = "",
+) -> str:
+    """
+    Produce a clean, human-readable summary of what an on-chain transaction or tool action
+    will do, highlighting risk factors and financial impact for user confirmation.
+    """
+    norm_to = normalize_address(to_address) if to_address else ""
+    raw = data_hex.strip() if data_hex else ""
+    if raw.startswith(("0x", "0X")):
+        raw = raw[2:]
+    sel = raw[:8].lower() if len(raw) >= 8 else ""
+    val_eth = value_wei / 10**18 if value_wei else 0.0
+
+    lines: list[str] = [
+        f"Transaction Summary ({mode.capitalize()} Mode - Human Confirmation Required):",
+    ]
+
+    target_desc = f"0x{norm_to}" if norm_to else "none"
+    if norm_to in KNOWN_VERIFIED_PROTOCOLS:
+        target_desc += " (Verified Protocol)"
+    lines.append(f"• Target Address: {target_desc}")
+    lines.append(f"• Value: {val_eth:.4f} ETH ({value_wei} wei)")
+
+    if sel == APPROVE_SELECTOR and len(raw) >= 72:
+        spender = normalize_address(raw[8:72])
+        amt = int(raw[72:136], 16) if len(raw) >= 136 else 0
+        amt_str = "Unlimited (type(uint256).max)" if amt == UINT256_MAX else f"{amt / 10**18:.4f} Tokens ({amt})"
+        lines.append("• Action: ERC-20 Token Approval (approve)")
+        lines.append(f"• Spender: 0x{spender}")
+        lines.append(f"• Approved Amount: {amt_str}")
+        lines.append(f"• Impact: Grants 0x{spender} permission to transfer tokens from your wallet.")
+
+    elif sel == SET_APPROVAL_FOR_ALL_SELECTOR and len(raw) >= 72:
+        operator = normalize_address(raw[8:72])
+        approved = int(raw[72:136], 16) != 0 if len(raw) >= 136 else True
+        lines.append("• Action: NFT Collection Approval (setApprovalForAll)")
+        lines.append(f"• Operator: 0x{operator}")
+        lines.append(f"• Approved: {approved}")
+        lines.append(f"• Impact: Grants 0x{operator} full access to transfer ANY token in this NFT collection.")
+
+    elif sel == PERMIT2_APPROVE_SELECTOR and len(raw) >= 136:
+        tok = normalize_address(raw[8:72])
+        spender = normalize_address(raw[72:136])
+        lines.append("• Action: Permit2 Approval")
+        lines.append(f"• Token: 0x{tok}")
+        lines.append(f"• Spender: 0x{spender}")
+
+    elif sel == ERC20_TRANSFER_SELECTOR and len(raw) >= 72:
+        recip = normalize_address(raw[8:72])
+        amt = int(raw[72:136], 16) if len(raw) >= 136 else 0
+        lines.append("• Action: ERC-20 Token Transfer")
+        lines.append(f"• Recipient: 0x{recip}")
+        lines.append(f"• Amount: {amt / 10**18:.4f} Tokens ({amt})")
+        lines.append(f"• Impact: Transfers tokens directly from your wallet.")
+
+    elif sel == V2_SWAP_SELECTOR:
+        amt_out_min = int(raw[72:136], 16) if len(raw) >= 136 else 0
+        lines.append("• Action: Uniswap V2 DEX Swap")
+        if amt_out_min == 0:
+            lines.append("• Slippage Protection: NONE (amountOutMin = 0, 100% MEV slippage exposure)")
+        else:
+            lines.append(f"• Minimum Output: {amt_out_min}")
+        lines.append("• Impact: Swaps input assets on DEX for target tokens.")
+
+    elif sel == V3_SWAP_SELECTOR:
+        amt_out_min = int(raw[392:456], 16) if len(raw) >= 456 else 0
+        lines.append("• Action: Uniswap V3 DEX Swap")
+        if amt_out_min == 0:
+            lines.append("• Slippage Protection: NONE (amountOutMinimum = 0, 100% MEV slippage exposure)")
+        else:
+            lines.append(f"• Minimum Output: {amt_out_min}")
+        lines.append("• Impact: Swaps input assets on Uniswap V3.")
+
+    elif sel == MULTICALL_SELECTOR:
+        try:
+            raw_bytes = bytes.fromhex(raw[8:])
+            sub_calls = decode_bytes_array(raw_bytes)
+            lines.append(f"• Action: Multicall Batch Transaction ({len(sub_calls)} sub-calls)")
+            for i, c in enumerate(sub_calls[:5], start=1):
+                c_hex = c.hex()
+                c_sel = c_hex[:8].lower() if len(c_hex) >= 8 else "0x"
+                desc = "Operation"
+                if c_sel == APPROVE_SELECTOR:
+                    desc = f"ERC-20 approve (spender=0x{c_hex[32:72]}...)"
+                elif c_sel == ERC20_TRANSFER_SELECTOR:
+                    desc = f"ERC-20 transfer (recip=0x{c_hex[32:72]}...)"
+                elif c_sel in (V2_SWAP_SELECTOR, V3_SWAP_SELECTOR):
+                    desc = "DEX swap"
+                elif c_sel == SET_APPROVAL_FOR_ALL_SELECTOR:
+                    desc = "NFT setApprovalForAll"
+                else:
+                    desc = f"contract call (selector=0x{c_sel})"
+                lines.append(f"  {i}. {desc}")
+            if len(sub_calls) > 5:
+                lines.append(f"  ... and {len(sub_calls) - 5} more sub-calls")
+        except Exception:
+            lines.append("• Action: Multicall Batch Transaction (malformed/custom calldata)")
+
+    elif sel in NFT_MINT_SELECTORS or "mint" in raw.lower():
+        lines.append("• Action: NFT Mint")
+        lines.append(f"• Mint Price: {val_eth:.4f} ETH")
+        lines.append("• Impact: Mints NFT to wallet from contract.")
+
+    elif not raw or len(raw) < 8:
+        lines.append("• Action: Native ETH Transfer")
+        lines.append(f"• Recipient: 0x{norm_to}")
+        lines.append(f"• Impact: Transfers {val_eth:.4f} ETH out of wallet.")
+
+    else:
+        lines.append(f"• Action: Contract Interaction (selector: 0x{sel})")
+        lines.append(f"• Target Contract: 0x{norm_to}")
+
+    # Risk reasons
+    if risk_reasons:
+        lines.append("• Risk Assessment: HIGH / REQUIRES CONFIRMATION")
+        lines.append("• Risk Factors:")
+        for r in risk_reasons:
+            lines.append(f"  - {r}")
+    else:
+        lines.append("• Risk Assessment: Elevated transaction parameters require human verification.")
+
+    lines.append("• Confirmation: Use safeguard_confirm_action tool or approve via Hermes/Telegram to proceed.")
+    return "\n".join(lines)
+
+
+# ==============================================================================
+# Agent & User Tools: Confirmation and Audit
+# ==============================================================================
+
+def safeguard_confirm_action(
+    confirmation_id: str,
+    approved: bool = True,
+    confirmation_store: ConfirmationStore | None = None,
+    memory_store: AddressMemoryStore | None = None,
+    audit_logger: ActionAuditLogger | None = None,
+) -> dict[str, Any]:
+    """
+    Human-approval tool to confirm or reject a pending transaction or tool call.
+
+    Parameters:
+        confirmation_id: The confirmation ID returned in VerificationResult.confirmation_id.
+        approved: True to approve and allow execution, False to reject.
+    """
+    cs = confirmation_store or get_default_confirmation_store()
+    ms = memory_store or get_default_memory_store()
+    al = audit_logger or get_default_audit_logger()
+
+    entry = cs.get(confirmation_id)
+    if approved:
+        cs.confirm(confirmation_id)
+        if entry:
+            entry.confirmed = True
+            if entry.to_address:
+                ms.approve(entry.to_address, label="User confirmed action", source="confirmation")
+            al.log(
+                action=entry.action or entry.tool_name or "confirm",
+                status="confirmed",
+                mode=entry.mode,
+                target=entry.to_address,
+                value_wei=entry.value_wei,
+                data_hex=entry.data_hex,
+                risk_score=entry.risk_score,
+                reason="Action confirmed by human approval",
+                summary=entry.summary,
+                confirmation_id=confirmation_id,
+            )
+        logger.info("Hermes SafeGuard: Action confirmed by human approval: %s", confirmation_id)
+        return {
+            "status": "confirmed",
+            "confirmation_id": confirmation_id,
+            "approved": True,
+            "summary": entry.summary if entry else "",
+            "message": "Action has been approved by human operator.",
+        }
+    else:
+        cs.reject(confirmation_id)
+        if entry:
+            entry.rejected = True
+            al.log(
+                action=entry.action or entry.tool_name or "confirm",
+                status="rejected",
+                mode=entry.mode,
+                target=entry.to_address,
+                value_wei=entry.value_wei,
+                data_hex=entry.data_hex,
+                risk_score=entry.risk_score,
+                reason="Action rejected by human operator",
+                summary=entry.summary,
+                confirmation_id=confirmation_id,
+            )
+        logger.info("Hermes SafeGuard: Action rejected by human operator: %s", confirmation_id)
+        return {
+            "status": "rejected",
+            "confirmation_id": confirmation_id,
+            "approved": False,
+            "summary": entry.summary if entry else "",
+            "message": "Action was rejected by human operator.",
+        }
+
+
+def safeguard_list_pending_confirmations(
+    confirmation_store: ConfirmationStore | None = None,
+) -> list[dict[str, Any]]:
+    """List all pending transaction confirmation requests awaiting human approval."""
+    cs = confirmation_store or get_default_confirmation_store()
+    return cs.list_pending()
+
+
+def safeguard_get_audit_log(
+    limit: int = 50,
+    status: str | None = None,
+    mode: str | None = None,
+    audit_logger: ActionAuditLogger | None = None,
+) -> list[dict[str, Any]]:
+    """Retrieve audit history of all allowed, blocked, and confirmed financial actions."""
+    al = audit_logger or get_default_audit_logger()
+    return al.get_entries(limit=limit, status=status, mode=mode)
+
+
+# ==============================================================================
+# Threat Feed & Security Blocklist
+# ==============================================================================
+
+"""
+Hermes SafeGuard Threat Feed & Blocklist Maintenance Guide
+==========================================================
+
+HOW THIS LIST SHOULD BE MAINTAINED:
+
+1. Threat Feed Sources & Intelligence Ingestion:
+   - Web3 Threat Feeds: Continuously ingest verified malicious addresses, drainer
+     proxies, and phishing sweepers from security firms (SlowMist, ScamSniffer,
+     PeckShield, CertiK, Chainabuse).
+   - Agent Incident Reports: Track and document emerging autonomous agent exploit
+     patterns, prompt injection attack vectors, memory poisoning attempts, and
+     calldata smuggling techniques.
+   - On-chain Trace Analysis: Reverse-engineer wallet drainers, sweepers, and
+     fake protocol routers observed in exploit transactions.
+
+2. Ingestion & Update Procedure:
+   - Address Normalization: All addresses MUST be normalized 20-byte EVM addresses
+     (40 lowercase hexadecimal characters; normalize_address() handles 0x prefix and
+     checksum capitalization).
+   - Selector Normalization: All selectors MUST be 4-byte hexadecimal values
+     (8 lowercase hex characters without 0x prefix).
+   - Metadata Standards: Entries must include 'name', 'category', 'description',
+     'severity', and 'date_added'.
+   - Versioning: Increment semantic version and update 'updated_at' timestamp upon
+     modifying the blocklist file (blocklist.json or blocklist.yaml).
+
+3. Security Invariant (Fail-Closed Across All Modes):
+   - Items on this threat feed / blocklist are HARD-BLOCKED in ALL policy modes (strict,
+     balanced, and degen). Even with human confirmation (confirmed=True), interaction
+     is rejected.
+   - Pre-approvals for blocked addresses via safeguard_approve_address are strictly
+     prohibited and rejected.
+
+4. Validation & Regression Testing:
+   - Run 'python3 -m unittest discover tests' and 'python3 verifier.py --test' before
+     merging any updates. Ensure verified protocol routers (e.g. Uniswap, Seaport)
+     are never mistakenly added to the blocklist.
+
+5. Future Integration Roadmap:
+   - Connect to live Twitter/X API search and real-time security APIs with cryptographic
+     feed signature validation.
+"""
+
+
+@dataclass
+class ThreatEntry:
+    target: str  # normalized address (40 hex) or selector (8 hex)
+    threat_type: str  # "malicious_contract", "phishing", "dangerous_selector"
+    name: str = ""
+    signature: str = ""
+    description: str = ""
+    severity: str = "CRITICAL"
+    source: str = "local_blocklist"
+    date_added: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "target": self.target,
+            "type": self.threat_type,
+            "name": self.name,
+            "signature": self.signature,
+            "description": self.description,
+            "severity": self.severity,
+            "source": self.source,
+            "date_added": self.date_added,
+            "metadata": self.metadata,
+        }
+
+
+@dataclass
+class ThreatReport:
+    id: str
+    title: str
+    category: str
+    threat_level: str
+    description: str
+    indicators: list[str] = field(default_factory=list)
+    reported_date: str = ""
+    source: str = "threat_feed"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "type": "agent_attack_pattern",
+            "title": self.title,
+            "category": self.category,
+            "threat_level": self.threat_level,
+            "severity": self.threat_level,
+            "description": self.description,
+            "indicators": self.indicators,
+            "reported_date": self.reported_date,
+            "source": self.source,
+            "metadata": self.metadata,
+        }
+
+
+class ThreatFeed:
+    """
+    Local threat feed and security blocklist manager for Hermes SafeGuard.
+    Loads and updates:
+      - Known malicious contract addresses
+      - Known phishing & wallet drain addresses
+      - Dangerous function selectors
+      - Agent-related attack patterns and incident reports
+    """
+
+    def __init__(
+        self,
+        filepath: str | Path | None = None,
+        auto_load: bool = True,
+    ) -> None:
+        self.filepath: Path | None = Path(filepath) if filepath else None
+        self._lock = threading.Lock()
+        self._blocked_addresses: dict[str, ThreatEntry] = {}
+        self._blocked_selectors: dict[str, ThreatEntry] = {}
+        self._reports: list[dict[str, Any]] = []
+        self.version: str = "1.0.0"
+        self.updated_at: str = ""
+        self.description: str = ""
+
+        # Auto-discover or load if filepath specified or default file exists
+        if self.filepath:
+            if self.filepath.is_file():
+                self.load()
+            else:
+                self._load_fallback_defaults()
+        elif auto_load:
+            found_path = self._find_default_blocklist()
+            if found_path and found_path.is_file():
+                self.filepath = found_path
+                self.load()
+            else:
+                self._load_fallback_defaults()
+        else:
+            self._load_fallback_defaults()
+
+    def _find_default_blocklist(self) -> Path | None:
+        candidates = [
+            Path("blocklist.json"),
+            Path(__file__).parent / "blocklist.json",
+            Path("policies/blocklist.json"),
+            Path(__file__).parent / "policies/blocklist.json",
+            Path.home() / ".hermes/blocklist.json",
+            Path("blocklist.yaml"),
+            Path(__file__).parent / "blocklist.yaml",
+        ]
+        for p in candidates:
+            try:
+                if p.is_file():
+                    return p.resolve()
+            except Exception:
+                pass
+        return None
+
+    def _load_fallback_defaults(self) -> None:
+        """Seed minimal built-in threat items to guarantee fail-closed security even without a disk file."""
+        fallback_contracts = [
+            ("000000000000000000000000000000000000bad1", "Simulated Drain Exploit Contract", "Known test & drain exploit contract"),
+            ("742d35cc6634c0532925a3b844bc454e4438f44e", "Inferno Drainer Proxy", "Multi-chain phishing & wallet drainer contract"),
+            ("000000000001844b20ccf2635d00d36983296204", "Fake Permit2 Router Drainer", "Spoofed Permit2 proxy executing token sweeps"),
+            ("98c23e9d8f34fefb1b7bd6a91b7ee122f4b16f5c", "Angel Drainer Sweep Contract", "Drainer sweeping assets via compromised signatures"),
+            ("1111111254fb6c44bac0bed2854e76f90643097d", "Phishing Token Impersonator", "Malicious clone targeting DEX routers"),
+        ]
+        fallback_phishing = [
+            ("1234567890123456789012345678901234567890", "Known Phishing Drainer EOA", "Phishing campaign sweep address"),
+            ("888888888888888888888888888888888888bad0", "Fake Airdrop Phishing Recipient", "Phishing collector wallet"),
+            ("6b75d8af000000e20b7a7ddf000ba900b4009a80", "Compromised Key Drain Collector", "Drain recipient wallet active in bot attacks"),
+            ("deadbeef11112222333344445555666677778888", "Known Exploit Sweeper EOA", "Sweeper address actively draining ERC20 balances"),
+        ]
+        fallback_selectors = [
+            ("23b872dd", "transferFrom(address,address,uint256)", "Standard ERC-20 transferFrom drain invocation"),
+            ("baa2abde", "sweepTokens(address,address[])", "Unauthorized token sweeping function"),
+            ("39125215", "emergencyDrain(address)", "Emergency drain selector in phishing contracts"),
+            ("42966c68", "burnFrom(address,uint256)", "Destructive token burn execution"),
+            ("41bb3396", "drainEther(address)", "Native balance exfiltration selector"),
+            ("6f307dc3", "destroy(address)", "Contract selfdestruct / balance draining call"),
+            ("83197ef0", "drainToken(address,address)", "Token drain selector targeting approved balances"),
+            ("e946a47b", "sweep(address)", "Direct asset sweep function"),
+        ]
+        with self._lock:
+            for addr, name, desc in fallback_contracts:
+                self._add_address_locked(addr, "malicious_contract", name, desc)
+            for addr, name, desc in fallback_phishing:
+                self._add_address_locked(addr, "phishing", name, desc)
+            for sel, sig, desc in fallback_selectors:
+                self._add_selector_locked(sel, sig, desc)
+
+    def _add_address_locked(
+        self,
+        address: str,
+        category: str = "malicious_contract",
+        name: str = "",
+        description: str = "",
+        severity: str = "CRITICAL",
+        date_added: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> ThreatEntry:
+        norm = normalize_address(address)
+        entry = ThreatEntry(
+            target=norm,
+            threat_type=category,
+            name=name or f"Blocked {category}: 0x{norm[:6]}...{norm[-4:]}",
+            description=description,
+            severity=severity,
+            date_added=date_added or time.strftime("%Y-%m-%d"),
+            metadata=metadata or {},
+        )
+        self._blocked_addresses[norm] = entry
+        report = {
+            "id": f"ADDR-{norm[:8]}",
+            "type": category,
+            "target": f"0x{norm}",
+            "name": entry.name,
+            "title": entry.name,
+            "category": category,
+            "severity": severity,
+            "description": description,
+            "date_reported": entry.date_added,
+            "source": "threat_blocklist",
+        }
+        self._reports.append(report)
+        return entry
+
+    def _add_selector_locked(
+        self,
+        selector: str,
+        signature: str = "",
+        description: str = "",
+        severity: str = "CRITICAL",
+        metadata: dict[str, Any] | None = None,
+    ) -> ThreatEntry:
+        raw = selector.strip()
+        if raw.startswith(("0x", "0X")):
+            raw = raw[2:]
+        raw = raw[:8].lower()
+        entry = ThreatEntry(
+            target=raw,
+            threat_type="dangerous_selector",
+            name=signature or f"Blocked Selector 0x{raw}",
+            signature=signature,
+            description=description,
+            severity=severity,
+            metadata=metadata or {},
+        )
+        self._blocked_selectors[raw] = entry
+        report = {
+            "id": f"SEL-{raw}",
+            "type": "dangerous_selector",
+            "target": f"0x{raw}",
+            "name": entry.name,
+            "title": entry.name,
+            "signature": signature,
+            "category": "dangerous_selector",
+            "severity": severity,
+            "description": description,
+            "source": "threat_blocklist",
+        }
+        self._reports.append(report)
+        return entry
+
+    def load(self, path: str | Path | None = None) -> None:
+        target_path = Path(path) if path else self.filepath
+        if not target_path or not target_path.is_file():
+            self._load_fallback_defaults()
+            return
+
+        with open(target_path, "r", encoding="utf-8") as f:
+            raw_text = f.read()
+
+        data: dict[str, Any] = {}
+        if str(target_path).endswith((".yaml", ".yml")) and _HAVE_YAML:
+            loaded = yaml.safe_load(raw_text)
+            if isinstance(loaded, dict):
+                data = loaded
+        else:
+            try:
+                data = json.loads(raw_text)
+            except Exception:
+                if _HAVE_YAML:
+                    loaded = yaml.safe_load(raw_text)
+                    if isinstance(loaded, dict):
+                        data = loaded
+
+        with self._lock:
+            self._blocked_addresses.clear()
+            self._blocked_selectors.clear()
+            self._reports.clear()
+
+            self.version = str(data.get("version", "1.0.0"))
+            self.updated_at = str(data.get("updated_at", ""))
+            self.description = str(data.get("description", ""))
+
+            # 1. Malicious contracts
+            for item in data.get("malicious_contracts", []):
+                if isinstance(item, dict):
+                    addr = item.get("address") or item.get("addr") or ""
+                    if addr:
+                        self._add_address_locked(
+                            addr,
+                            category=item.get("category", "malicious_contract"),
+                            name=item.get("name", ""),
+                            description=item.get("description", ""),
+                            severity=item.get("severity", "CRITICAL"),
+                            date_added=item.get("date_added", ""),
+                            metadata=item.get("metadata", {}),
+                        )
+                elif isinstance(item, str):
+                    self._add_address_locked(item, category="malicious_contract")
+
+            # 2. Phishing addresses
+            for item in data.get("phishing_addresses", []):
+                if isinstance(item, dict):
+                    addr = item.get("address") or item.get("addr") or ""
+                    if addr:
+                        self._add_address_locked(
+                            addr,
+                            category=item.get("category", "phishing"),
+                            name=item.get("name", ""),
+                            description=item.get("description", ""),
+                            severity=item.get("severity", "CRITICAL"),
+                            date_added=item.get("date_added", ""),
+                            metadata=item.get("metadata", {}),
+                        )
+                elif isinstance(item, str):
+                    self._add_address_locked(item, category="phishing")
+
+            # 3. Generic addresses / denylist / blocklist
+            for key in ("addresses", "denylist", "blocked_addresses", "blocklist"):
+                for item in data.get(key, []):
+                    if isinstance(item, dict):
+                        addr = item.get("address") or item.get("addr") or ""
+                        if addr:
+                            self._add_address_locked(
+                                addr,
+                                category=item.get("category", "malicious_address"),
+                                name=item.get("name", ""),
+                                description=item.get("description", ""),
+                                severity=item.get("severity", "CRITICAL"),
+                            )
+                    elif isinstance(item, str):
+                        self._add_address_locked(item, category="malicious_address")
+
+            # 4. Dangerous selectors
+            for key in ("dangerous_selectors", "selectors", "blocked_selectors"):
+                for item in data.get(key, []):
+                    if isinstance(item, dict):
+                        sel = item.get("selector") or item.get("sel") or ""
+                        if sel:
+                            self._add_selector_locked(
+                                sel,
+                                signature=item.get("signature", ""),
+                                description=item.get("description", ""),
+                                severity=item.get("severity", "CRITICAL"),
+                                metadata=item.get("metadata", {}),
+                            )
+                    elif isinstance(item, str):
+                        self._add_selector_locked(item)
+
+            # 5. Agent attack patterns & threat reports
+            for key in ("agent_attack_patterns", "recent_threat_reports", "reports", "attack_patterns"):
+                for item in data.get(key, []):
+                    if isinstance(item, dict):
+                        report = {
+                            "id": item.get("id", f"RPT-{len(self._reports)+1:03d}"),
+                            "type": item.get("type", "agent_attack_pattern"),
+                            "title": item.get("title", item.get("name", "")),
+                            "name": item.get("name", item.get("title", "")),
+                            "category": item.get("category", "agent_attack_pattern"),
+                            "threat_level": item.get("threat_level", item.get("severity", "CRITICAL")),
+                            "severity": item.get("severity", item.get("threat_level", "CRITICAL")),
+                            "description": item.get("description", ""),
+                            "indicators": list(item.get("indicators", [])),
+                            "reported_date": item.get("reported_date", item.get("date_added", "")),
+                            "source": item.get("source", "local_threat_feed"),
+                            "metadata": dict(item.get("metadata", {})),
+                        }
+                        self._reports.append(report)
+
+            # Ensure TRANSFER_FROM_SELECTOR is always present
+            if TRANSFER_FROM_SELECTOR not in self._blocked_selectors:
+                self._add_selector_locked(
+                    TRANSFER_FROM_SELECTOR,
+                    signature="transferFrom(address,address,uint256)",
+                    description="Standard ERC-20 transferFrom drain selector",
+                )
+
+    def save(self, path: str | Path | None = None) -> None:
+        target_path = Path(path) if path else self.filepath
+        if not target_path:
+            return
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            contracts = []
+            phishing = []
+            for entry in self._blocked_addresses.values():
+                d = {
+                    "address": f"0x{entry.target}",
+                    "name": entry.name,
+                    "category": entry.threat_type,
+                    "description": entry.description,
+                    "severity": entry.severity,
+                    "date_added": entry.date_added,
+                }
+                if entry.threat_type == "phishing":
+                    phishing.append(d)
+                else:
+                    contracts.append(d)
+
+            selectors = []
+            for entry in self._blocked_selectors.values():
+                selectors.append({
+                    "selector": entry.target,
+                    "signature": entry.signature,
+                    "description": entry.description,
+                    "severity": entry.severity,
+                })
+
+            patterns = [r for r in self._reports if r.get("type") == "agent_attack_pattern"]
+
+            doc = {
+                "version": self.version,
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "description": self.description or "Hermes SafeGuard threat feed blocklist",
+                "malicious_contracts": contracts,
+                "phishing_addresses": phishing,
+                "dangerous_selectors": selectors,
+                "agent_attack_patterns": patterns,
+            }
+
+        temp_path = target_path.with_suffix(".tmp")
+        if str(target_path).endswith((".yaml", ".yml")) and _HAVE_YAML:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(doc, f, sort_keys=False)
+        else:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(doc, f, indent=2)
+        temp_path.replace(target_path)
+
+    def is_address_blocked(self, address: str) -> bool:
+        if not address:
+            return False
+        try:
+            norm = normalize_address(address)
+        except Exception:
+            return False
+        with self._lock:
+            return norm in self._blocked_addresses
+
+    def get_address_threat(self, address: str) -> ThreatEntry | None:
+        if not address:
+            return None
+        try:
+            norm = normalize_address(address)
+        except Exception:
+            return None
+        with self._lock:
+            return self._blocked_addresses.get(norm)
+
+    def is_selector_blocked(self, selector: str) -> bool:
+        if not selector:
+            return False
+        raw = selector.strip()
+        if raw.startswith(("0x", "0X")):
+            raw = raw[2:]
+        raw = raw[:8].lower()
+        with self._lock:
+            return raw in self._blocked_selectors
+
+    def get_selector_threat(self, selector: str) -> ThreatEntry | None:
+        if not selector:
+            return None
+        raw = selector.strip()
+        if raw.startswith(("0x", "0X")):
+            raw = raw[2:]
+        raw = raw[:8].lower()
+        with self._lock:
+            return self._blocked_selectors.get(raw)
+
+    def add_address(
+        self,
+        address: str,
+        category: str = "malicious_contract",
+        name: str = "",
+        description: str = "",
+        severity: str = "CRITICAL",
+        date_added: str = "",
+    ) -> ThreatEntry:
+        with self._lock:
+            return self._add_address_locked(
+                address, category=category, name=name, description=description,
+                severity=severity, date_added=date_added
+            )
+
+    def remove_address(self, address: str) -> bool:
+        try:
+            norm = normalize_address(address)
+        except Exception:
+            return False
+        with self._lock:
+            if norm in self._blocked_addresses:
+                del self._blocked_addresses[norm]
+                return True
+            return False
+
+    def add_selector(
+        self,
+        selector: str,
+        signature: str = "",
+        description: str = "",
+        severity: str = "CRITICAL",
+    ) -> ThreatEntry:
+        with self._lock:
+            return self._add_selector_locked(selector, signature=signature, description=description, severity=severity)
+
+    def remove_selector(self, selector: str) -> bool:
+        raw = selector.strip()
+        if raw.startswith(("0x", "0X")):
+            raw = raw[2:]
+        raw = raw[:8].lower()
+        with self._lock:
+            if raw in self._blocked_selectors:
+                del self._blocked_selectors[raw]
+                return True
+            return False
+
+    def add_report(self, report: dict[str, Any]) -> None:
+        with self._lock:
+            self._reports.append(report)
+
+    @property
+    def blocked_addresses(self) -> dict[str, ThreatEntry]:
+        with self._lock:
+            return dict(self._blocked_addresses)
+
+    @property
+    def blocked_selectors(self) -> dict[str, ThreatEntry]:
+        with self._lock:
+            return dict(self._blocked_selectors)
+
+    def search_reports(self, query: str = "", limit: int = 10) -> list[dict[str, Any]]:
+        """
+        Search threat intelligence reports, attack patterns, and blocked targets.
+        In production, can be connected to live external intelligence feeds (e.g. Twitter/X security alerts, ScamSniffer APIs).
+        """
+        q = query.strip().lower() if query else ""
+        with self._lock:
+            if not q or q in ("*", "all"):
+                return [dict(r) for r in self._reports[:limit]]
+
+            q_norm = ""
+            if len(q) >= 4:
+                try:
+                    q_norm = normalize_address(q)
+                except Exception:
+                    q_norm = ""
+
+            matches: list[dict[str, Any]] = []
+            for r in self._reports:
+                title = str(r.get("title", "")).lower()
+                desc = str(r.get("description", "")).lower()
+                cat = str(r.get("category", "")).lower()
+                name = str(r.get("name", "")).lower()
+                target = str(r.get("target", "")).lower()
+                sig = str(r.get("signature", "")).lower()
+                indicators = [str(ind).lower() for ind in r.get("indicators", [])]
+                rpt_id = str(r.get("id", "")).lower()
+
+                match = (
+                    q in title
+                    or q in desc
+                    or q in cat
+                    or q in name
+                    or q in target
+                    or q in sig
+                    or q in rpt_id
+                    or any(q in ind for ind in indicators)
+                    or (q_norm and q_norm in target)
+                )
+                if match:
+                    matches.append(dict(r))
+                    if len(matches) >= limit:
+                        break
+
+            return matches
+
+
+_DEFAULT_THREAT_FEED: ThreatFeed | None = None
+
+
+def get_default_threat_feed() -> ThreatFeed:
+    global _DEFAULT_THREAT_FEED
+    if _DEFAULT_THREAT_FEED is None:
+        _DEFAULT_THREAT_FEED = ThreatFeed()
+    return _DEFAULT_THREAT_FEED
+
+
+def set_default_threat_feed(feed: ThreatFeed | None) -> None:
+    global _DEFAULT_THREAT_FEED
+    _DEFAULT_THREAT_FEED = feed
+
+
+def reset_default_threat_feed() -> None:
+    global _DEFAULT_THREAT_FEED
+    _DEFAULT_THREAT_FEED = ThreatFeed()
+
+
+def safeguard_search_threat_reports(
+    query: str = "",
+    limit: int = 10,
+    threat_feed: ThreatFeed | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Search recent threat reports and attack patterns from the Hermes Safeguard threat feed.
+    Can be called by autonomous agents or users to check whether an address, selector,
+    protocol, or attack pattern has been flagged.
+
+    Parameters:
+        query: Search query (address, selector, name, attack pattern, or indicator).
+               If empty or '*', returns recent threat reports up to `limit`.
+        limit: Max number of reports to return (default: 10).
+        threat_feed: Optional ThreatFeed instance (uses default feed if omitted).
+
+    Returns:
+        List of matching threat intelligence report dictionaries.
+    """
+    feed = threat_feed or get_default_threat_feed()
+    return feed.search_reports(query=query, limit=limit)
+
+
+search_threat_reports = safeguard_search_threat_reports
 
 
 def extract_action_addresses(
@@ -899,17 +2152,22 @@ def _parse_wei_value(val: int | float | str | None, default: int) -> int:
         return val
     if isinstance(val, str):
         s = val.strip().lower()
-        if s.endswith("ether"):
-            num = float(s[:-5].strip())
-            return int(num * 10**18)
-        if s.endswith("eth"):
-            num = float(s[:-3].strip())
-            return int(num * 10**18)
-        if s.startswith("0x"):
-            return int(s, 16)
-        if "." in s:
-            return int(float(s) * 10**18)
-        return int(s)
+        if not s:
+            return default
+        try:
+            if s.endswith("ether"):
+                num = float(s[:-5].strip())
+                return int(num * 10**18)
+            if s.endswith("eth"):
+                num = float(s[:-3].strip())
+                return int(num * 10**18)
+            if s.startswith("0x"):
+                return int(s, 16)
+            if "." in s:
+                return int(float(s) * 10**18)
+            return int(s)
+        except (ValueError, TypeError):
+            return default
     return default
 
 
@@ -921,11 +2179,16 @@ def _parse_token_value(val: int | float | str | None, default: int) -> int:
         return int(val)
     if isinstance(val, str):
         s = val.strip().lower()
-        if s.startswith("0x"):
-            return int(s, 16)
-        if "." in s:
-            return int(float(s))
-        return int(s)
+        if not s:
+            return default
+        try:
+            if s.startswith("0x"):
+                return int(s, 16)
+            if "." in s:
+                return int(float(s))
+            return int(s)
+        except (ValueError, TypeError):
+            return default
     return default
 
 
@@ -986,9 +2249,13 @@ class PolicyConfig:
     contract_allowlist: list[str] = field(default_factory=list)
     block_prompt_injection: bool = True
     scan_context_messages: int = 10
+    tax_warning_threshold: float = 25.0
+    tax_block_threshold: float = 50.0
     pre_approved_addresses: list[str | dict[str, Any]] = field(default_factory=list)
     store_path: str | Path | None = None
     memory_store: Any | None = None
+    blocklist_path: str | Path | None = None
+    threat_feed: Any | None = None
 
     def __post_init__(self) -> None:
         # Normalize mode string
@@ -1072,6 +2339,8 @@ class PolicyConfig:
         pre_approved_addresses: list[str | dict[str, Any]] | None = None,
         store_path: str | Path | None = None,
         memory_store: Any | None = None,
+        blocklist_path: str | Path | None = None,
+        threat_feed: Any | None = None,
     ) -> PolicyConfig:
         """Create a strict mode PolicyConfig (aggressive blocking, default for most users)."""
         eth_cap = _parse_wei_value(max_eth_per_tx, 500_000_000_000_000_000)  # 0.5 ETH
@@ -1094,6 +2363,8 @@ class PolicyConfig:
             pre_approved_addresses=pre_approved,
             store_path=store_path,
             memory_store=memory_store,
+            blocklist_path=blocklist_path,
+            threat_feed=threat_feed,
         )
 
     @classmethod
@@ -1108,6 +2379,8 @@ class PolicyConfig:
         pre_approved_addresses: list[str | dict[str, Any]] | None = None,
         store_path: str | Path | None = None,
         memory_store: Any | None = None,
+        blocklist_path: str | Path | None = None,
+        threat_feed: Any | None = None,
     ) -> PolicyConfig:
         """Create a balanced mode PolicyConfig (higher amounts, capped approvals, blocks drains)."""
         eth_cap = _parse_wei_value(max_eth_per_tx, 5_000_000_000_000_000_000)  # 5.0 ETH
@@ -1130,6 +2403,8 @@ class PolicyConfig:
             pre_approved_addresses=pre_approved,
             store_path=store_path,
             memory_store=memory_store,
+            blocklist_path=blocklist_path,
+            threat_feed=threat_feed,
         )
 
     @classmethod
@@ -1147,6 +2422,8 @@ class PolicyConfig:
         pre_approved_addresses: list[str | dict[str, Any]] | None = None,
         store_path: str | Path | None = None,
         memory_store: Any | None = None,
+        blocklist_path: str | Path | None = None,
+        threat_feed: Any | None = None,
     ) -> PolicyConfig:
         """Create a degen mode PolicyConfig (relaxed amount & approvals for NFT/heavy interaction)."""
         eth_cap = _parse_wei_value(max_eth_per_tx, 100_000_000_000_000_000_000)  # 100.0 ETH
@@ -1170,6 +2447,8 @@ class PolicyConfig:
             pre_approved_addresses=pre_approved,
             store_path=store_path,
             memory_store=memory_store,
+            blocklist_path=blocklist_path,
+            threat_feed=threat_feed,
         )
 
     @classmethod
@@ -1187,6 +2466,8 @@ class PolicyConfig:
         )
         store_path = data.get("store_path", data.get("memory_store_path"))
         mem_store = data.get("memory_store")
+        blocklist_path = data.get("blocklist_path", data.get("threat_feed_path", data.get("blocklist")))
+        threat_feed = data.get("threat_feed")
 
         if mode == "strict":
             default_eth = 500_000_000_000_000_000
@@ -1213,6 +2494,8 @@ class PolicyConfig:
         zero_slip = bool(data.get("block_zero_slippage", default_slip))
         block_injection = bool(data.get("block_prompt_injection", True))
         scan_msgs = int(data.get("scan_context_messages", 10))
+        tax_warn = float(data.get("tax_warning_threshold", 25.0))
+        tax_block = float(data.get("tax_block_threshold", 50.0))
 
         return cls(
             mode=mode,
@@ -1226,9 +2509,13 @@ class PolicyConfig:
             contract_allowlist=list(contracts),
             block_prompt_injection=block_injection,
             scan_context_messages=scan_msgs,
+            tax_warning_threshold=tax_warn,
+            tax_block_threshold=tax_block,
             pre_approved_addresses=list(pre_approved) if pre_approved else [],
             store_path=store_path,
             memory_store=mem_store,
+            blocklist_path=blocklist_path,
+            threat_feed=threat_feed,
         )
 
     @classmethod
@@ -1264,6 +2551,8 @@ class PolicyConfig:
         d = asdict(self)
         if "memory_store" in d:
             del d["memory_store"]
+        if "threat_feed" in d:
+            del d["threat_feed"]
         return d
 
     def to_yaml(self) -> str:
@@ -1316,6 +2605,14 @@ class PolicyEngine:
         else:
             self.memory_store = get_default_memory_store()
 
+        # Initialize Threat Feed / Security Blocklist
+        if getattr(self.config, "threat_feed", None) is not None:
+            self.threat_feed = self.config.threat_feed
+        elif getattr(self.config, "blocklist_path", None):
+            self.threat_feed = ThreatFeed(self.config.blocklist_path)
+        else:
+            self.threat_feed = get_default_threat_feed()
+
         # Seed allowlist targets as pre-approved
         for a in self.recipient_allowlist:
             if a and a != normalize_address(DEFAULT_ALLOWED_TARGET):
@@ -1343,6 +2640,11 @@ class PolicyEngine:
         norm = normalize_address(addr)
         if not norm or norm == "0" * 40:
             return True
+        # Hard security check: threat feed and denylist strictly override any approval
+        if self.threat_feed and self.threat_feed.is_address_blocked(norm):
+            return False
+        if norm in self.denylist:
+            return False
         if norm in self.recipient_allowlist or norm in self.contract_allowlist:
             return True
         if norm in KNOWN_VERIFIED_PROTOCOLS:
@@ -1376,6 +2678,50 @@ class PolicyEngine:
                 return sig
         return InjectionSignal()
 
+    def check_multicall_risk(self, raw_data: str) -> tuple[bool, str, list[str]]:
+        """
+        Inspect multicall calldata for unusual or elevated-risk batch compositions.
+        Returns: (is_unusual, reason, risk_reasons)
+        """
+        raw = raw_data.strip()
+        if raw.startswith(("0x", "0X")):
+            raw = raw[2:]
+        if len(raw) < 8 or raw[:8].lower() != MULTICALL_SELECTOR:
+            return (False, "", [])
+
+        try:
+            raw_bytes = bytes.fromhex(raw[8:])
+            sub_calls = decode_bytes_array(raw_bytes)
+        except Exception:
+            return (True, "malformed multicall calldata", ["Malformed multicall calldata"])
+
+        has_approval = False
+        has_transfer = False
+        has_swap = False
+        sub_selectors: list[str] = []
+        for call_b in sub_calls:
+            c_hex = call_b.hex()
+            if len(c_hex) >= 8:
+                c_sel = c_hex[:8].lower()
+                sub_selectors.append(c_sel)
+                if c_sel in (APPROVE_SELECTOR, SET_APPROVAL_FOR_ALL_SELECTOR, PERMIT2_APPROVE_SELECTOR):
+                    has_approval = True
+                elif c_sel in (ERC20_TRANSFER_SELECTOR, TRANSFER_FROM_SELECTOR):
+                    has_transfer = True
+                elif c_sel in (V2_SWAP_SELECTOR, V3_SWAP_SELECTOR):
+                    has_swap = True
+
+        risk_reasons: list[str] = []
+        # Approval combined with transfer, swap, or other execution in same multicall
+        if has_approval and (has_transfer or has_swap or len(sub_calls) > 1):
+            risk_reasons.append("Multicall combines token/NFT approval with subsequent execution in the same batch")
+        if len(sub_calls) >= 4:
+            risk_reasons.append(f"Unusually large multicall batch ({len(sub_calls)} operations)")
+
+        if risk_reasons:
+            return (True, "; ".join(risk_reasons), risk_reasons)
+        return (False, "", [])
+
     def evaluate_pre_tool_call(
         self,
         tool_name: str,
@@ -1383,6 +2729,7 @@ class PolicyEngine:
         context: list[Any] | None = None,
         confirmed: bool = False,
         scan_n: int | None = None,
+        confirmation_id: str | None = None,
     ) -> VerificationResult:
         """
         Hook evaluator for pre_tool_call events.
@@ -1408,6 +2755,7 @@ class PolicyEngine:
             or tool_args.get("to_address")
             or tool_args.get("target")
             or tool_args.get("recipient")
+            or tool_args.get("address")
             or ""
         ).strip()
         value_raw = tool_args.get("value", tool_args.get("value_wei", tool_args.get("amount", 0)))
@@ -1420,10 +2768,52 @@ class PolicyEngine:
             or ""
         ).strip()
 
+        # Resolve confirmed flag from direct parameter, tool_args, or confirmation_id store
+        active_conf_id = confirmation_id or tool_args.get("confirmation_id")
+        if active_conf_id and get_default_confirmation_store().is_confirmed(str(active_conf_id)):
+            confirmed = True
+        elif tool_args.get("confirmed"):
+            confirmed = bool(tool_args.get("confirmed"))
+
+        # Check all address arguments (including nested structures) against threat feed and denylist
+        def _extract_all_strings(obj: Any) -> list[str]:
+            extracted: list[str] = []
+            if isinstance(obj, str):
+                extracted.append(obj)
+            elif isinstance(obj, dict):
+                for val in obj.values():
+                    extracted.extend(_extract_all_strings(val))
+            elif isinstance(obj, (list, tuple, set)):
+                for item in obj:
+                    extracted.extend(_extract_all_strings(item))
+            return extracted
+
+        for s_val in _extract_all_strings(tool_args):
+            s_clean = s_val.strip()
+            if len(s_clean) in (40, 42) and (s_clean.startswith(("0x", "0X")) or len(s_clean) == 40):
+                try:
+                    norm_v = normalize_address(s_clean)
+                    if (self.threat_feed and self.threat_feed.is_address_blocked(norm_v)) or norm_v in self.denylist:
+                        threat_info = self.threat_feed.get_address_threat(norm_v) if self.threat_feed else None
+                        threat_desc = f" (threat feed: {threat_info.name})" if threat_info and threat_info.name else ""
+                        res = VerificationResult(
+                            False,
+                            f"SG: recipient is denylisted{threat_desc}",
+                            RiskScore.CRITICAL,
+                        )
+                        log_financial_action(
+                            action=tool_name, status="blocked", mode=self.config.mode,
+                            target=norm_v, value_wei=value_wei, data_hex=data_hex,
+                            risk_score="critical", reason=res.reason,
+                        )
+                        return res
+                except Exception:
+                    pass
+
         # If a target address is specified, evaluate complete transaction policy
         if to_address:
             return self.evaluate_transaction_policy(
-                to_address, value_wei, data_hex, context=context, confirmed=confirmed, scan_n=scan_n
+                to_address, value_wei, data_hex, context=context, confirmed=confirmed, scan_n=scan_n, confirmation_id=active_conf_id
             )
 
         # Financial action with no specific transaction target (e.g. key export/management)
@@ -1432,13 +2822,15 @@ class PolicyEngine:
             injection_signal = self.evaluate_context_injection(context, scan_n=scan_n)
             if injection_signal.is_strong or injection_signal.detected:
                 if self.config.mode == "strict":
-                    return VerificationResult(
+                    res = VerificationResult(
                         False,
                         f"SG: prompt injection detected in untrusted context ({injection_signal.category})",
                         RiskScore.CRITICAL,
                         requires_confirmation=False,
                         injection_detected=True,
                     )
+                    log_financial_action(action=tool_name, status="blocked", mode="strict", target="", value_wei=value_wei, data_hex=data_hex, risk_score="critical", reason=res.reason)
+                    return res
                 elif self.config.mode in ("balanced", "degen"):
                     if not confirmed:
                         reason = (
@@ -1446,24 +2838,43 @@ class PolicyEngine:
                             if self.config.mode == "degen"
                             else f"SG: prompt injection detected in untrusted context (human confirmation required: {injection_signal.category})"
                         )
-                        return VerificationResult(
+                        summary = generate_transaction_summary(
+                            "", value_wei, data_hex,
+                            risk_reasons=[f"Prompt injection detected in untrusted context ({injection_signal.category})"],
+                            mode=self.config.mode, tool_name=tool_name,
+                        )
+                        conf = get_default_confirmation_store().create_confirmation_request(
+                            action=tool_name, tool_name=tool_name, tool_args=tool_args,
+                            to_address="", value_wei=value_wei, data_hex=data_hex,
+                            risk_score="high", reason=reason, summary=summary, mode=self.config.mode,
+                        )
+                        res = VerificationResult(
                             False,
                             reason,
                             RiskScore.HIGH,
                             requires_confirmation=True,
                             injection_detected=True,
+                            confirmation_id=conf.id,
+                            confirmation_summary=summary,
                         )
+                        log_financial_action(action=tool_name, status="requires_confirmation", mode=self.config.mode, target="", value_wei=value_wei, data_hex=data_hex, risk_score="high", reason=reason, summary=summary, confirmation_id=conf.id)
+                        return res
                     else:
-                        return VerificationResult(
+                        warn = f"Warning: Financial action executed after human confirmation despite flagged injection: {injection_signal.category}"
+                        res = VerificationResult(
                             True,
                             "",
                             RiskScore.HIGH,
-                            warning=f"Warning: Financial action executed after human confirmation despite flagged injection: {injection_signal.category}",
+                            warning=warn,
                             requires_confirmation=False,
                             injection_detected=True,
                         )
+                        log_financial_action(action=tool_name, status="allowed", mode=self.config.mode, target="", value_wei=value_wei, data_hex=data_hex, risk_score="high", warning=warn)
+                        return res
 
-        return VerificationResult(True, "", RiskScore.LOW)
+        res = VerificationResult(True, "", RiskScore.LOW)
+        log_financial_action(action=tool_name, status="allowed", mode=self.config.mode, target="", value_wei=value_wei, data_hex=data_hex, risk_score="low")
+        return res
 
     def evaluate_calldata_security(self, inner_data_hex: str) -> str | None:
         """
@@ -1478,8 +2889,11 @@ class PolicyEngine:
 
         sel = raw[:8].lower()
 
-        # 1. Blocked drain selectors: transferFrom is blocked across all modes (strict, balanced, degen)
-        if sel == TRANSFER_FROM_SELECTOR:
+        # 1. Blocked drain selectors: transferFrom and threat feed selectors are blocked across all modes (strict, balanced, degen)
+        if sel == TRANSFER_FROM_SELECTOR or (self.threat_feed and self.threat_feed.is_selector_blocked(sel)):
+            threat = self.threat_feed.get_selector_threat(sel) if self.threat_feed else None
+            if threat and sel != TRANSFER_FROM_SELECTOR:
+                return f"SG: selector blocked (0x{sel})"
             return "SG: selector blocked"
 
         # 2. ERC-20 approve(address,uint256)
@@ -1549,6 +2963,7 @@ class PolicyEngine:
         context: list[Any] | None = None,
         confirmed: bool = False,
         scan_n: int | None = None,
+        confirmation_id: str | None = None,
     ) -> VerificationResult:
         """
         Verify transaction parameters against all policy rules for the configured mode.
@@ -1560,10 +2975,15 @@ class PolicyEngine:
             context: Optional list of recent context messages/tool results.
             confirmed: Whether explicit human confirmation has been granted.
             scan_n: Optional max number of recent messages to scan for injection.
+            confirmation_id: Optional confirmation ID from a prior confirmation request.
 
         Returns:
             VerificationResult(allowed: bool, reason: str, risk_score: str)
         """
+        # Resolve confirmation ID if provided
+        if confirmation_id and get_default_confirmation_store().is_confirmed(str(confirmation_id)):
+            confirmed = True
+
         # Step 0: Prompt / indirect injection check on untrusted context
         injection_signal = InjectionSignal()
         if self.config.block_prompt_injection and context:
@@ -1579,30 +2999,70 @@ class PolicyEngine:
                 new_addresses.append(a)
         is_new_recipient = len(new_addresses) > 0
 
-        # Step 1: Recipient Denylist (enforced in all modes: strict, balanced, degen)
-        if target_norm in self.denylist or any(a in self.denylist for a in new_addresses):
-            return VerificationResult(
-                False,
-                "SG: recipient is denylisted",
-                RiskScore.CRITICAL,
-                is_new_recipient=is_new_recipient,
-                flagged_addresses=new_addresses,
-            )
+        # Step 1: Threat Feed Blocklist & Recipient Denylist (hard-blocked in all modes: strict, balanced, degen)
+        all_action_addresses = action_info.get("all_addresses", [])
+        all_to_check = [target_norm] + new_addresses + all_action_addresses
+        for a in all_to_check:
+            if not a:
+                continue
+            is_threat = bool(self.threat_feed and self.threat_feed.is_address_blocked(a))
+            is_deny = a in self.denylist
+            if is_threat or is_deny:
+                threat_info = self.threat_feed.get_address_threat(a) if (self.threat_feed and is_threat) else None
+                threat_desc = f" (threat feed: {threat_info.name})" if threat_info and threat_info.name else ""
+                logger.warning(
+                    "Hermes SafeGuard: Interaction with denylisted/blocked threat address blocked in %s mode: 0x%s%s",
+                    self.config.mode, a, threat_desc,
+                )
+                res = VerificationResult(
+                    False,
+                    f"SG: recipient is denylisted{threat_desc}",
+                    RiskScore.CRITICAL,
+                    is_new_recipient=is_new_recipient,
+                    flagged_addresses=new_addresses,
+                )
+                log_financial_action(action="transaction", status="blocked", mode=self.config.mode, target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="critical", reason=res.reason)
+                return res
 
         # Step 2: Value Cap check
         if value_wei > self.config.max_eth_per_tx:
-            return VerificationResult(
-                False,
-                "SG: value exceeds max per tx",
-                RiskScore.HIGH,
-                is_new_recipient=is_new_recipient,
-                flagged_addresses=new_addresses,
-            )
+            if self.config.mode == "degen":
+                if not confirmed:
+                    val_eth = value_wei / 10**18
+                    cap_eth = self.config.max_eth_per_tx / 10**18
+                    summary = generate_transaction_summary(
+                        to_address, value_wei, data_hex,
+                        risk_reasons=[f"Transfer value ({val_eth:.2f} ETH) exceeds degen threshold ({cap_eth:.2f} ETH)"],
+                        mode="degen",
+                    )
+                    conf = get_default_confirmation_store().create_confirmation_request(
+                        action="transfer", to_address=to_address, value_wei=value_wei, data_hex=data_hex,
+                        risk_score="high", reason=f"SG: high-value transfer ({val_eth:.2f} ETH) exceeds threshold, requires human confirmation",
+                        summary=summary, mode="degen",
+                    )
+                    log_financial_action(action="transfer", status="requires_confirmation", mode="degen", target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="high", reason=conf.reason, summary=summary, confirmation_id=conf.id)
+                    return VerificationResult(
+                        False, conf.reason, RiskScore.HIGH, requires_confirmation=True,
+                        is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
+                        confirmation_id=conf.id, confirmation_summary=summary,
+                    )
+            else:
+                res = VerificationResult(
+                    False,
+                    "SG: value exceeds max per tx",
+                    RiskScore.HIGH,
+                    is_new_recipient=is_new_recipient,
+                    flagged_addresses=new_addresses,
+                )
+                log_financial_action(action="transfer", status="blocked", mode=self.config.mode, target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="high", reason=res.reason)
+                return res
 
         # Step 3: Calldata security evaluation
         raw_data = data_hex.strip() if data_hex else ""
         if raw_data.startswith(("0x", "0X")):
             raw_data = raw_data[2:]
+
+        sel = raw_data[:8].lower() if len(raw_data) >= 8 else ""
 
         if len(raw_data) >= 8:
             calldata_err = self.evaluate_calldata_security(raw_data)
@@ -1612,18 +3072,70 @@ class PolicyEngine:
                     risk = RiskScore.CRITICAL
                 elif "exceeds" in calldata_err:
                     risk = RiskScore.MEDIUM
-                return VerificationResult(
+                res = VerificationResult(
                     False,
                     calldata_err,
                     risk,
                     is_new_recipient=is_new_recipient,
                     flagged_addresses=new_addresses,
                 )
+                log_financial_action(action="transaction", status="blocked", mode=self.config.mode, target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score=risk.value if isinstance(risk, RiskScore) else str(risk), reason=calldata_err)
+                return res
+
+        # Step 3.5: Multicall inspection in Degen Mode
+        if sel == MULTICALL_SELECTOR and self.config.mode == "degen":
+            is_unusual_mc, mc_reason, mc_risks = self.check_multicall_risk(raw_data)
+            if is_unusual_mc and not confirmed:
+                summary = generate_transaction_summary(
+                    to_address, value_wei, data_hex,
+                    risk_reasons=mc_risks,
+                    mode="degen",
+                )
+                conf = get_default_confirmation_store().create_confirmation_request(
+                    action="multicall", to_address=to_address, value_wei=value_wei, data_hex=data_hex,
+                    risk_score="high", reason=f"SG: unusual multicall requires confirmation ({mc_reason})",
+                    summary=summary, mode="degen",
+                )
+                log_financial_action(action="multicall", status="requires_confirmation", mode="degen", target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="high", reason=conf.reason, summary=summary, confirmation_id=conf.id)
+                return VerificationResult(
+                    False, conf.reason, RiskScore.HIGH, requires_confirmation=True,
+                    is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
+                    confirmation_id=conf.id, confirmation_summary=summary,
+                )
+
+        # Step 3.6: Zero-slippage swap on high-value trade in Degen Mode
+        if self.config.mode == "degen" and sel in (V2_SWAP_SELECTOR, V3_SWAP_SELECTOR):
+            is_zero_slip = False
+            amount_in_val = value_wei
+            if sel == V2_SWAP_SELECTOR and len(raw_data) >= 136:
+                amount_in_val = int(raw_data[8:72], 16) if value_wei == 0 else value_wei
+                is_zero_slip = int(raw_data[72:136], 16) == 0
+            elif sel == V3_SWAP_SELECTOR and len(raw_data) >= 456:
+                is_zero_slip = int(raw_data[392:456], 16) == 0
+
+            if is_zero_slip and (value_wei >= 1_000_000_000_000_000_000 or amount_in_val >= 1_000_000_000_000_000_000):
+                if not confirmed:
+                    summary = generate_transaction_summary(
+                        to_address, value_wei, data_hex,
+                        risk_reasons=["Zero-slippage swap on high-value trade exposes transaction to 100% MEV sandwich extraction"],
+                        mode="degen",
+                    )
+                    conf = get_default_confirmation_store().create_confirmation_request(
+                        action="swap", to_address=to_address, value_wei=value_wei, data_hex=data_hex,
+                        risk_score="high", reason="SG: zero-slippage swap on high-value trade requires human confirmation",
+                        summary=summary, mode="degen",
+                    )
+                    log_financial_action(action="swap", status="requires_confirmation", mode="degen", target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="high", reason=conf.reason, summary=summary, confirmation_id=conf.id)
+                    return VerificationResult(
+                        False, conf.reason, RiskScore.HIGH, requires_confirmation=True,
+                        is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
+                        confirmation_id=conf.id, confirmation_summary=summary,
+                    )
 
         # Step 4: Defense against prompt injection & poisoned memory
         if injection_signal.is_strong or injection_signal.detected:
             if self.config.mode == "strict":
-                return VerificationResult(
+                res = VerificationResult(
                     False,
                     f"SG: prompt injection detected in untrusted context ({injection_signal.category})",
                     RiskScore.CRITICAL,
@@ -1632,27 +3144,35 @@ class PolicyEngine:
                     is_new_recipient=is_new_recipient,
                     flagged_addresses=new_addresses,
                 )
-            elif self.config.mode == "balanced":
+                log_financial_action(action="transaction", status="blocked", mode="strict", target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="critical", reason=res.reason)
+                return res
+            elif self.config.mode in ("balanced", "degen"):
                 if not confirmed:
-                    return VerificationResult(
-                        False,
-                        f"SG: prompt injection detected in untrusted context (human confirmation required: {injection_signal.category})",
-                        RiskScore.HIGH,
-                        requires_confirmation=True,
-                        injection_detected=True,
-                        is_new_recipient=is_new_recipient,
-                        flagged_addresses=new_addresses,
+                    reason = (
+                        f"SG: prompt injection detected in untrusted context (human confirmation required in degen mode: {injection_signal.category})"
+                        if self.config.mode == "degen"
+                        else f"SG: prompt injection detected in untrusted context (human confirmation required: {injection_signal.category})"
                     )
-            elif self.config.mode == "degen":
-                if not confirmed:
+                    summary = generate_transaction_summary(
+                        to_address, value_wei, data_hex,
+                        risk_reasons=[f"Prompt injection signal detected in untrusted context ({injection_signal.category})"],
+                        mode=self.config.mode,
+                    )
+                    conf = get_default_confirmation_store().create_confirmation_request(
+                        action="transaction", to_address=to_address, value_wei=value_wei, data_hex=data_hex,
+                        risk_score="high", reason=reason, summary=summary, mode=self.config.mode,
+                    )
+                    log_financial_action(action="transaction", status="requires_confirmation", mode=self.config.mode, target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="high", reason=reason, summary=summary, confirmation_id=conf.id)
                     return VerificationResult(
                         False,
-                        f"SG: prompt injection detected in untrusted context (human confirmation required in degen mode: {injection_signal.category})",
+                        reason,
                         RiskScore.HIGH,
                         requires_confirmation=True,
                         injection_detected=True,
                         is_new_recipient=is_new_recipient,
                         flagged_addresses=new_addresses,
+                        confirmation_id=conf.id,
+                        confirmation_summary=summary,
                     )
 
         # Step 5: Memory and context integrity protection for new recipient addresses
@@ -1663,13 +3183,26 @@ class PolicyEngine:
             if self.config.mode == "strict":
                 if not confirmed:
                     logger.info("Hermes SafeGuard: Strict mode requires explicit confirmation for new recipient 0x%s", flagged_addr)
+                    summary = generate_transaction_summary(
+                        to_address, value_wei, data_hex,
+                        risk_reasons=[f"New recipient address 0x{flagged_addr} requires explicit human confirmation in strict mode"],
+                        mode="strict",
+                    )
+                    conf = get_default_confirmation_store().create_confirmation_request(
+                        action="transaction", to_address=to_address, value_wei=value_wei, data_hex=data_hex,
+                        risk_score="high", reason=f"SG: new recipient address requires human confirmation (strict mode): 0x{flagged_addr}",
+                        summary=summary, mode="strict",
+                    )
+                    log_financial_action(action="transaction", status="requires_confirmation", mode="strict", target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="high", reason=conf.reason, summary=summary, confirmation_id=conf.id)
                     return VerificationResult(
                         False,
-                        f"SG: new recipient address requires human confirmation (strict mode): 0x{flagged_addr}",
+                        conf.reason,
                         RiskScore.HIGH,
                         requires_confirmation=True,
                         is_new_recipient=True,
                         flagged_addresses=new_addresses,
+                        confirmation_id=conf.id,
+                        confirmation_summary=summary,
                     )
                 else:
                     logger.info("Hermes SafeGuard: New recipient 0x%s confirmed by human in strict mode", flagged_addr)
@@ -1685,33 +3218,65 @@ class PolicyEngine:
         # Step 6: Allowlist checks (for addresses not pre-approved or confirmed)
         if self.config.mode == "strict":
             if self.recipient_allowlist and target_norm not in self.recipient_allowlist and not self.memory_store.is_approved(target_norm):
-                return VerificationResult(
+                res = VerificationResult(
                     False, "SG: target not whitelisted", RiskScore.MEDIUM,
                     is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
                 )
+                log_financial_action(action="transaction", status="blocked", mode="strict", target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="medium", reason=res.reason)
+                return res
         elif self.config.mode == "balanced":
             if self.recipient_allowlist and target_norm not in self.recipient_allowlist and not self.memory_store.is_approved(target_norm):
-                return VerificationResult(
+                res = VerificationResult(
                     False, "SG: target not whitelisted", RiskScore.MEDIUM,
                     is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
                 )
+                log_financial_action(action="transaction", status="blocked", mode="balanced", target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="medium", reason=res.reason)
+                return res
         elif self.config.mode == "degen":
             if self.contract_allowlist:
                 if (target_norm not in self.contract_allowlist) and (target_norm not in self.recipient_allowlist) and not self.memory_store.is_approved(target_norm):
-                    return VerificationResult(
-                        False, "SG: target not in degen contract allowlist", RiskScore.MEDIUM,
-                        is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
-                    )
+                    if not confirmed:
+                        summary = generate_transaction_summary(
+                            to_address, value_wei, data_hex,
+                            risk_reasons=[f"Target 0x{target_norm} is not in degen contract allowlist"],
+                            mode="degen",
+                        )
+                        conf = get_default_confirmation_store().create_confirmation_request(
+                            action="contract_call", to_address=to_address, value_wei=value_wei, data_hex=data_hex,
+                            risk_score="medium", reason="SG: target not in degen contract allowlist",
+                            summary=summary, mode="degen",
+                        )
+                        log_financial_action(action="contract_call", status="requires_confirmation", mode="degen", target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="medium", reason=conf.reason, summary=summary, confirmation_id=conf.id)
+                        return VerificationResult(
+                            False, "SG: target not in degen contract allowlist", RiskScore.MEDIUM,
+                            requires_confirmation=True,
+                            is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
+                            confirmation_id=conf.id, confirmation_summary=summary,
+                        )
             elif self.recipient_allowlist:
                 if target_norm not in self.recipient_allowlist and not self.memory_store.is_approved(target_norm):
-                    return VerificationResult(
-                        False, "SG: target not whitelisted", RiskScore.MEDIUM,
-                        is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
-                    )
+                    if not confirmed:
+                        summary = generate_transaction_summary(
+                            to_address, value_wei, data_hex,
+                            risk_reasons=[f"Target 0x{target_norm} is not in recipient allowlist"],
+                            mode="degen",
+                        )
+                        conf = get_default_confirmation_store().create_confirmation_request(
+                            action="transaction", to_address=to_address, value_wei=value_wei, data_hex=data_hex,
+                            risk_score="medium", reason="SG: target not whitelisted",
+                            summary=summary, mode="degen",
+                        )
+                        log_financial_action(action="transaction", status="requires_confirmation", mode="degen", target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="medium", reason=conf.reason, summary=summary, confirmation_id=conf.id)
+                        return VerificationResult(
+                            False, "SG: target not whitelisted", RiskScore.MEDIUM,
+                            requires_confirmation=True,
+                            is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
+                            confirmation_id=conf.id, confirmation_summary=summary,
+                        )
 
         # Step 7: Allowed execution return with appropriate risk scoring & warnings
         if (injection_signal.is_strong or injection_signal.detected) and confirmed:
-            return VerificationResult(
+            res = VerificationResult(
                 True,
                 "",
                 RiskScore.HIGH,
@@ -1721,12 +3286,14 @@ class PolicyEngine:
                 is_new_recipient=is_new_recipient,
                 flagged_addresses=new_addresses,
             )
+            log_financial_action(action="transaction", status="allowed", mode=self.config.mode, target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="high", warning=res.warning)
+            return res
 
         if is_new_recipient:
             flagged_addr = new_addresses[0]
             raised_risk = RiskScore.HIGH if (confirmed and self.config.mode == "strict") else RiskScore.MEDIUM
             warn = f"Warning: Transaction to new/unapproved recipient 0x{flagged_addr} ({self.config.mode} mode, risk score raised)"
-            return VerificationResult(
+            res = VerificationResult(
                 True,
                 "",
                 raised_risk,
@@ -1736,8 +3303,12 @@ class PolicyEngine:
                 is_new_recipient=True,
                 flagged_addresses=new_addresses,
             )
+            log_financial_action(action="transaction", status="allowed", mode=self.config.mode, target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score=raised_risk.value, warning=warn)
+            return res
 
-        return VerificationResult(True, "", RiskScore.LOW)
+        res = VerificationResult(True, "", RiskScore.LOW)
+        log_financial_action(action="transaction", status="allowed", mode=self.config.mode, target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="low")
+        return res
 
 
 def check_pre_tool_call(
@@ -1749,12 +3320,15 @@ def check_pre_tool_call(
     confirmed: bool = False,
     scan_n: int = 10,
     memory_store: AddressMemoryStore | None = None,
+    threat_feed: ThreatFeed | None = None,
+    confirmation_id: str | None = None,
 ) -> VerificationResult:
     """
     Pre-tool-call inspection entrypoint for Hermes SafeGuard middleware.
 
     Intercepts tool calls before execution to protect autonomous agents against
-    direct and indirect prompt injection attacks and poisoned memory manipulation.
+    direct and indirect prompt injection attacks, poisoned memory manipulation,
+    and interaction with known malicious/phishing threat blocklist entries.
     """
     if config is None:
         if mode is not None:
@@ -1773,6 +3347,8 @@ def check_pre_tool_call(
 
     if memory_store is not None:
         cfg.memory_store = memory_store
+    if threat_feed is not None:
+        cfg.threat_feed = threat_feed
 
     engine = PolicyEngine(cfg)
     return engine.evaluate_pre_tool_call(
@@ -1781,4 +3357,5 @@ def check_pre_tool_call(
         context=context,
         confirmed=confirmed,
         scan_n=scan_n,
+        confirmation_id=confirmation_id,
     )

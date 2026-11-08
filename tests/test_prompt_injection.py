@@ -26,6 +26,7 @@ from policy_engine import (
 from verifier import (
     DEFAULT_ALLOWED_TARGET,
     verify_transaction,
+    ensure_test_rpc_server,
 )
 
 
@@ -201,6 +202,10 @@ class TestPromptInjectionDetector(unittest.TestCase):
 class TestPreToolCallPolicyDefense(unittest.TestCase):
     """Test policy reactions across strict, balanced, and degen modes."""
 
+    @classmethod
+    def setUpClass(cls):
+        ensure_test_rpc_server()
+
     def setUp(self):
         self.target = DEFAULT_ALLOWED_TARGET
         self.value = 100_000_000_000_000_000  # 0.1 ETH
@@ -327,6 +332,95 @@ class TestPreToolCallPolicyDefense(unittest.TestCase):
         self.assertFalse(res.allowed)
         self.assertEqual(res.risk_score, RiskScore.CRITICAL.value)
         self.assertIn("obfuscated_morse_injection", res.reason)
+
+    def test_injection_flagged_transfer_lifecycle_across_all_modes(self):
+        """
+        Verify end-to-end injection lifecycle in verify_transaction:
+          - Strict: blocked immediately with critical risk
+          - Balanced: unconfirmed requires confirmation, confirmed executes with high risk + warning
+          - Degen: unconfirmed requires confirmation, confirmed executes with high risk + warning
+          - Rejection: rejected confirmation prevents execution
+        """
+        from policy_engine import safeguard_confirm_action, reset_default_confirmation_store
+        reset_default_confirmation_store()
+
+        # 1. Strict mode: hard block
+        res_strict = verify_transaction(
+            to_address=self.target,
+            value_wei=self.value,
+            data_hex="",
+            config=PolicyConfig.strict(),
+            context=[self.attack_msg],
+        )
+        self.assertFalse(res_strict.allowed)
+        self.assertEqual(res_strict.risk_score, RiskScore.CRITICAL.value)
+        self.assertFalse(res_strict.requires_confirmation)
+
+        # 2. Balanced mode: requires confirmation
+        res_bal = verify_transaction(
+            to_address=self.target,
+            value_wei=self.value,
+            data_hex="",
+            config=PolicyConfig.balanced(recipient_allowlist=[self.target]),
+            context=[self.attack_msg],
+            confirmed=False,
+        )
+        self.assertFalse(res_bal.allowed)
+        self.assertTrue(res_bal.requires_confirmation)
+        self.assertEqual(res_bal.risk_score, RiskScore.HIGH.value)
+        self.assertTrue(bool(res_bal.confirmation_id))
+
+        # 3. Degen mode: requires confirmation
+        res_degen = verify_transaction(
+            to_address=self.target,
+            value_wei=self.value,
+            data_hex="",
+            config=PolicyConfig.degen(contract_allowlist=[self.target]),
+            context=[self.attack_msg],
+            confirmed=False,
+        )
+        self.assertFalse(res_degen.allowed)
+        self.assertTrue(res_degen.requires_confirmation)
+        self.assertEqual(res_degen.risk_score, RiskScore.HIGH.value)
+
+        # 4. Confirmation rejection
+        conf_id = res_degen.confirmation_id
+        safeguard_confirm_action(conf_id, approved=False)
+        res_rejected = verify_transaction(
+            to_address=self.target,
+            value_wei=self.value,
+            data_hex="",
+            config=PolicyConfig.degen(contract_allowlist=[self.target]),
+            context=[self.attack_msg],
+            confirmed=False,
+            confirmation_id=conf_id,
+        )
+        self.assertFalse(res_rejected.allowed)
+
+        # 5. Confirmation approval in degen mode allows with HIGH risk + warning
+        res_degen_req = verify_transaction(
+            to_address=self.target,
+            value_wei=self.value,
+            data_hex="",
+            config=PolicyConfig.degen(contract_allowlist=[self.target]),
+            context=[self.attack_msg],
+            confirmed=False,
+        )
+        new_conf_id = res_degen_req.confirmation_id
+        safeguard_confirm_action(new_conf_id, approved=True)
+
+        res_approved = verify_transaction(
+            to_address=self.target,
+            value_wei=self.value,
+            data_hex="",
+            config=PolicyConfig.degen(contract_allowlist=[self.target]),
+            context=[self.attack_msg],
+            confirmed=True,
+            confirmation_id=new_conf_id,
+        )
+        self.assertTrue(res_approved.allowed)
+        self.assertEqual(res_approved.risk_score, RiskScore.HIGH.value)
+        self.assertTrue(bool(res_approved.warning))
 
 
 if __name__ == "__main__":
