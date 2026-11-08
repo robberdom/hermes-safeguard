@@ -11,6 +11,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ from policy_engine import (
     _parse_wei_value,
     is_financial_tool,
     log_financial_action,
+    safeguard_confirm_action,
 )
 from verifier import (
     DEFAULT_RPC_URL,
@@ -49,11 +51,83 @@ SAFEGUARD_INTERNAL_TOOLS: set[str] = {
     "safeguard_list_approved_addresses",
     "safeguard_approve_address",
     "safeguard_revoke_address",
-    "safeguard_confirm_action",
     "safeguard_list_pending_confirmations",
     "safeguard_get_audit_log",
     "safeguard_search_threat_reports",
 }
+
+# Critical security files that agents must NEVER be allowed to modify
+PROTECTED_BASENAMES: frozenset[str] = frozenset({
+    "policy_engine.py",
+    "verifier.py",
+    "blocklist.json",
+    "__init__.py",
+    "plugin.yaml",
+    "safeguardpolicy.sol",
+})
+
+# Tool-name verbs that can mutate a file or run arbitrary commands.
+# Matched as whole tokens, so benign tools such as "run_tests" or "push_notification"
+# are not caught by a substring like "run" or "sh".
+_MUTATING_VERBS: frozenset[str] = frozenset({
+    "write", "edit", "patch", "replace", "delete", "remove", "save", "modify",
+    "create", "append", "touch", "update", "overwrite", "truncate", "put",
+    "move", "copy", "rename", "chmod", "chown", "mkdir", "rmdir",
+})
+_COMMAND_VERBS: frozenset[str] = frozenset({
+    "bash", "shell", "sh", "zsh", "cmd", "powershell", "terminal",
+    "exec", "eval", "python", "python3", "perl", "ruby", "node", "subprocess",
+})
+
+
+def _iter_strings(obj: Any, depth: int = 0):
+    """Yield every string nested inside a tool-argument structure."""
+    if depth > 8:
+        return
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_strings(v, depth + 1)
+    elif isinstance(obj, (list, tuple, set)):
+        for v in obj:
+            yield from _iter_strings(v, depth + 1)
+
+
+def _references_protected_path(value: str) -> bool:
+    """True if a string names a protected SafeGuard file or the policies directory."""
+    raw = value.strip()
+    if not raw or len(raw) > 4096:
+        return False
+    lowered = raw.replace("\\", "/").lower()
+    # Match "policies" as a whole path word, so it is caught inside shell commands and
+    # patch headers ("cd policies && ...", "Update File: policies/x.yaml") while not
+    # matching unrelated identifiers such as "test_policies_fixtures".
+    if re.search(r"(?<![a-z0-9_-])policies(?![a-z0-9_-])", lowered):
+        return True
+    parts = [p for p in lowered.split("/") if p not in ("", ".")]
+    if parts and parts[-1] in PROTECTED_BASENAMES:
+        return True
+    # Catch protected filenames embedded in a larger string (e.g. shell/python one-liners)
+    # without matching them as a substring of a longer identifier.
+    if re.search(
+        r"(?<![a-z0-9_])(?:policy_engine\.py|verifier\.py|blocklist\.json|__init__\.py|plugin\.yaml|safeguardpolicy\.sol)(?![a-z0-9_])",
+        lowered,
+    ):
+        return True
+    return False
+
+
+def _is_policy_tampering_attempt(tool_name: str, tool_args: dict[str, Any]) -> bool:
+    """Detect if an agent tool call is attempting to alter SafeGuard policies or security code."""
+    tokens = {t for t in re.split(r"[^a-z0-9]+", str(tool_name or "").lower()) if t}
+    if not (tokens & _MUTATING_VERBS or tokens & _COMMAND_VERBS):
+        return False
+
+    for val in _iter_strings(tool_args if isinstance(tool_args, dict) else {}):
+        if _references_protected_path(val):
+            return True
+    return False
 
 # Keywords that indicate financial or on-chain execution intent in tool names
 FINANCIAL_NAME_KEYWORDS: tuple[str, ...] = (
@@ -74,17 +148,30 @@ FINANCIAL_NAME_KEYWORDS: tuple[str, ...] = (
     "deposit",
     "withdraw",
     "call_contract",
+    "pay",
+    "bridge",
+    "stake",
+    "unstake",
+    "lend",
+    "borrow",
+    "trade",
+    "multicall",
+    "eth_sendtransaction",
 )
 
 
-def _get_policy_config(mode: str | None = None) -> tuple[PolicyConfig, str]:
+def _get_policy_config(mode: str | None = None, config: PolicyConfig | None = None) -> tuple[PolicyConfig, str]:
     """
     Resolve active PolicyConfig and mode string.
     Priority:
-      1. Explicit mode argument ('strict', 'balanced', 'degen')
-      2. SAFEGUARD_POLICY_PATH environment variable (if mode not explicit)
-      3. SAFEGUARD_MODE environment variable (default: 'balanced')
+      1. Explicit config instance (if provided via host/kwargs)
+      2. Explicit mode argument ('strict', 'balanced', 'degen')
+      3. SAFEGUARD_POLICY_PATH environment variable (if mode not explicit)
+      4. SAFEGUARD_MODE environment variable (default: 'balanced')
     """
+    if config is not None:
+        mode_str = config.mode.value if isinstance(config.mode, PolicyMode) else str(config.mode).lower()
+        return config, mode_str
     if mode and str(mode).strip():
         mode_str = str(mode).strip().lower()
         if mode_str == "strict":
@@ -117,10 +204,14 @@ def _extract_tx_params(args: dict[str, Any], tool_name: str = "") -> tuple[str, 
     Supports flat arguments, nested structures (e.g. params[0], tx, transaction),
     and synthesizes standard calldata for high-level tool calls (approve, mint, transfer)
     if raw calldata was not explicitly provided.
+    Fails closed on ambiguous multiple-transaction payloads.
     """
     target: dict[str, Any] = args
-    if "params" in args and isinstance(args["params"], list) and args["params"] and isinstance(args["params"][0], dict):
-        target = args["params"][0]
+    if "params" in args and isinstance(args["params"], list):
+        if len(args["params"]) > 1:
+            raise ValueError("Ambiguous payload: multiple transaction entries in params")
+        if args["params"] and isinstance(args["params"][0], dict):
+            target = args["params"][0]
     elif "transaction" in args and isinstance(args["transaction"], dict):
         target = args["transaction"]
     elif "tx" in args and isinstance(args["tx"], dict):
@@ -138,8 +229,14 @@ def _extract_tx_params(args: dict[str, Any], tool_name: str = "") -> tuple[str, 
         or ""
     ).strip()
 
-    val_raw = target.get("value", target.get("value_wei", target.get("amount", 0)))
-    val_wei = _parse_wei_value(val_raw, 0)
+    val_raw = target.get("value", target.get("value_wei", target.get("amount")))
+    if val_raw is not None and val_raw != "":
+        try:
+            val_wei = _parse_wei_value(val_raw, 0)
+        except (ValueError, TypeError):
+            val_wei = -1
+    else:
+        val_wei = 0
 
     data_val = str(
         target.get("data")
@@ -151,20 +248,26 @@ def _extract_tx_params(args: dict[str, Any], tool_name: str = "") -> tuple[str, 
 
     t_lower = tool_name.lower()
 
-    # Synthesize standard calldata if absent and parameters indicate specific action
+    # Synthesize standard calldata if absent and parameters indicate specific action.
+    # A failed synthesis raises rather than substituting "0x": verifying a benign empty
+    # payload while the real tool call executes something else would be a silent bypass.
     if not data_val or data_val in ("0x", "0X"):
         if "approve" in t_lower:
             spender = str(target.get("spender") or target.get("operator") or "").strip()
-            if spender:
-                amt_raw = target.get("amount") or target.get("value")
-                if str(amt_raw).lower() in ("unlimited", "max", "type(uint256).max"):
-                    amt_num = UINT256_MAX
-                else:
-                    amt_num = _parse_wei_value(amt_raw, 0)
+            if not spender:
+                raise ValueError("approve call is missing a 'spender'/'operator' address")
+            amt_raw = target.get("amount") or target.get("value")
+            if str(amt_raw).lower() in ("unlimited", "max", "type(uint256).max"):
+                amt_num = UINT256_MAX
+            else:
                 try:
-                    data_val = "0x" + APPROVE_SELECTOR + encode_address_word(spender).hex() + encode_uint256_word(amt_num).hex()
-                except Exception:
-                    data_val = "0x"
+                    amt_num = _parse_wei_value(amt_raw, 0)
+                except (ValueError, TypeError):
+                    amt_num = -1
+            try:
+                data_val = "0x" + APPROVE_SELECTOR + encode_address_word(spender).hex() + encode_uint256_word(amt_num).hex()
+            except Exception as e:
+                raise ValueError(f"unable to encode approve calldata: {e}") from e
         elif "mint" in t_lower:
             qty_raw = target.get("quantity") or target.get("amount") or 1
             try:
@@ -173,20 +276,26 @@ def _extract_tx_params(args: dict[str, Any], tool_name: str = "") -> tuple[str, 
                 qty_int = 1
             try:
                 data_val = encode_nft_mint_calldata(qty_int)
-            except Exception:
-                data_val = "0x"
+            except Exception as e:
+                raise ValueError(f"unable to encode mint calldata: {e}") from e
         elif "transfer" in t_lower and (target.get("token") or target.get("token_address")):
             # ERC-20 transfer: destination is the token contract, calldata encodes recipient + amount
             token_addr = str(target.get("token") or target.get("token_address") or "").strip()
             recipient = str(target.get("to") or target.get("recipient") or target.get("to_address") or "").strip()
-            if token_addr and recipient:
-                to_addr = token_addr
+            if not token_addr:
+                raise ValueError("ERC-20 transfer is missing a token address")
+            if not recipient:
+                raise ValueError("ERC-20 transfer is missing a recipient address")
+            to_addr = token_addr
+            try:
                 amt_num = _parse_wei_value(target.get("amount") or target.get("value"), 0)
-                try:
-                    data_val = "0x" + ERC20_TRANSFER_SELECTOR + encode_address_word(recipient).hex() + encode_uint256_word(amt_num).hex()
-                    val_wei = 0  # Native ETH value is 0 for ERC-20 transfer
-                except Exception:
-                    data_val = "0x"
+            except (ValueError, TypeError):
+                amt_num = -1
+            try:
+                data_val = "0x" + ERC20_TRANSFER_SELECTOR + encode_address_word(recipient).hex() + encode_uint256_word(amt_num).hex()
+                val_wei = 0  # Native ETH value is 0 for ERC-20 transfer
+            except Exception as e:
+                raise ValueError(f"unable to encode ERC-20 transfer calldata: {e}") from e
 
     if not data_val:
         data_val = "0x"
@@ -208,29 +317,36 @@ def _is_financial_tool_call(tool_name: str, tool_args: dict[str, Any]) -> bool:
     if is_financial_tool(name_clean) or any(kw in name_clean for kw in FINANCIAL_NAME_KEYWORDS):
         return True
 
-    # Check argument pattern: EVM address in destination accompanied by value/data/gas
-    to_val = str(
-        tool_args.get("to")
-        or tool_args.get("to_address")
-        or tool_args.get("target")
-        or tool_args.get("recipient")
-        or tool_args.get("contract")
-        or tool_args.get("token")
-        or ""
-    ).strip()
+    # Check argument pattern across flat arguments and nested tx/transaction/params structures
+    candidates: list[dict[str, Any]] = [tool_args]
+    if isinstance(tool_args.get("tx"), dict):
+        candidates.append(tool_args["tx"])
+    if isinstance(tool_args.get("transaction"), dict):
+        candidates.append(tool_args["transaction"])
+    if isinstance(tool_args.get("params"), list):
+        for p in tool_args["params"]:
+            if isinstance(p, dict):
+                candidates.append(p)
 
-    # Check nested params (e.g. eth_sendTransaction RPC style: {"params": [{"to": "..."}]})
-    if not to_val and "params" in tool_args and isinstance(tool_args["params"], list) and tool_args["params"] and isinstance(tool_args["params"][0], dict):
-        p0 = tool_args["params"][0]
-        to_val = str(p0.get("to") or p0.get("to_address") or p0.get("target") or "").strip()
+    for c in candidates:
+        to_val = str(
+            c.get("to")
+            or c.get("to_address")
+            or c.get("target")
+            or c.get("recipient")
+            or c.get("contract")
+            or c.get("token")
+            or ""
+        ).strip()
+        has_eth_target = to_val.startswith("0x") and len(to_val) == 42
+        has_tx_keys = any(
+            k in c
+            for k in ("value", "value_wei", "data", "data_hex", "calldata", "gas", "gas_price", "input", "amount")
+        )
+        if has_eth_target and has_tx_keys:
+            return True
 
-    has_eth_target = to_val.startswith("0x") and len(to_val) == 42
-    has_tx_keys = any(
-        k in tool_args or (isinstance(tool_args.get("params"), list) and tool_args["params"] and isinstance(tool_args["params"][0], dict) and k in tool_args["params"][0])
-        for k in ("value", "value_wei", "data", "data_hex", "calldata", "gas", "gas_price", "input")
-    )
-
-    return has_eth_target and has_tx_keys
+    return False
 
 
 # ==============================================================================
@@ -264,9 +380,10 @@ def safeguard_check_policy_handler(*args: Any, **kwargs: Any) -> str:
     to_addr = str(call_args.get("to") or call_args.get("to_address") or "").strip()
     val_raw = call_args.get("value", 0)
     data_raw = str(call_args.get("data") or call_args.get("data_hex") or "0x").strip()
-    mode_arg = call_args.get("mode")
 
-    config, resolved_mode = _get_policy_config(mode_arg)
+    # Read-only dry run: mode is operator-controlled. An agent-supplied mode would let it
+    # obtain a self-served "allowed" verdict under a more permissive tier.
+    config, resolved_mode = _get_policy_config()
     rpc_url = os.getenv("SAFEGUARD_RPC_URL", os.getenv("RPC_URL", DEFAULT_RPC_URL))
 
     if not to_addr:
@@ -335,9 +452,7 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
     to_addr = str(call_args.get("to") or call_args.get("to_address") or "").strip()
     val_raw = call_args.get("value", 0)
     data_raw = str(call_args.get("data") or call_args.get("data_hex") or "0x").strip()
-    mode_arg = call_args.get("mode")
-
-    config, resolved_mode = _get_policy_config(mode_arg)
+    config, resolved_mode = _get_policy_config()
     rpc_url = os.getenv("SAFEGUARD_RPC_URL", os.getenv("RPC_URL", DEFAULT_RPC_URL))
 
     if not to_addr:
@@ -376,12 +491,15 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
                 "mode": resolved_mode,
             })
 
-        # Transaction passed all policy checks and EVM trace simulation
+        # Transaction passed all policy checks and EVM trace simulation.
+        # Nothing is signed or broadcast here: the runtime signer owns that step.
         return json.dumps({
             "status": "success",
-            "executed": True,
+            "verified": True,
+            "executed": False,
+            "broadcast": False,
             "allowed": True,
-            "message": "Transaction passed SafeGuard verification and is approved for execution",
+            "message": "Transaction verified and approved for execution; broadcast payload prepared for runtime signer",
             "risk_score": risk_str,
             "warning": res.warning if res.warning else None,
             "mode": resolved_mode,
@@ -392,7 +510,7 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
                 "gas": call_args.get("gas"),
                 "gas_price": call_args.get("gas_price"),
             },
-            "note": "TODO: Ephemeral keystore signing and on-chain broadcast handled by runtime signer.",
+            "note": "Transaction simulation passed SafeGuard policies. Broadcast payload prepared for runtime signer.",
         })
     except Exception as e:
         return json.dumps({
@@ -404,6 +522,34 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
             "warning": None,
             "mode": resolved_mode,
         })
+
+
+def safeguard_confirm_action_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    Python handler for programmatic confirmation (kept for test harness and direct calls).
+    Not exposed as an agent tool to prevent agent self-approval.
+    """
+    call_args: dict[str, Any] = {}
+    if args:
+        if isinstance(args[0], dict):
+            call_args.update(args[0])
+        elif isinstance(args[0], str):
+            call_args["confirmation_id"] = args[0]
+            if len(args) > 1:
+                call_args["approved"] = bool(args[1])
+    call_args.update(kwargs)
+    if "params" in call_args and isinstance(call_args["params"], dict):
+        call_args.update(call_args["params"])
+
+    conf_id = str(call_args.get("confirmation_id") or "").strip()
+    approved = bool(call_args.get("approved", False))
+    if not conf_id:
+        return json.dumps({
+            "status": "error",
+            "message": "Missing required parameter 'confirmation_id'",
+        })
+    result = safeguard_confirm_action(confirmation_id=conf_id, approved=approved)
+    return json.dumps(result, indent=2)
 
 
 # ==============================================================================
@@ -453,14 +599,54 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
             except Exception:
                 tool_args = {}
 
-        mode_arg = tool_args.get("mode") if isinstance(tool_args, dict) else None
-        config, mode = _get_policy_config(mode_arg)
+        # Mode is strictly operator-controlled via config or env; ignore agent-supplied mode arguments
+        mode_override = kwargs.get("mode")
+        config_override = kwargs.get("config")
+        config, mode = _get_policy_config(mode_override, config=config_override)
+
+        # Security barrier: Block any agent attempt to overwrite policy files or tamper with code
+        if _is_policy_tampering_attempt(tool_name, tool_args):
+            err_msg = "SafeGuard Security: Agent is strictly forbidden from modifying SafeGuard policy configuration, limits, or code."
+            log_financial_action(
+                action=tool_name, status="blocked", mode=mode,
+                target="local_policy_file", value_wei=0, data_hex="",
+                risk_score="critical", reason=err_msg
+            )
+            print(f"SafeGuard [{mode.upper()}]: Intercepted '{tool_name}' -> BLOCKED: Policy tampering attempt")
+            return {
+                "action": "block",
+                "message": err_msg,
+                "reason": err_msg,
+                "risk_score": "critical",
+                "mode": mode,
+            }
 
         # Conservative interception: only trigger on tools that appear to be financial
         if not _is_financial_tool_call(tool_name, tool_args):
-            return {"action": "allow", "message": "Non-financial tool permitted", "mode": mode}
+            return {"action": "approve", "allowed": True, "message": "Non-financial tool permitted", "mode": mode}
 
-        to_addr, val_wei, data_hex = _extract_tx_params(tool_args, tool_name)
+        try:
+            to_addr, val_wei, data_hex = _extract_tx_params(tool_args, tool_name)
+        except ValueError as e:
+            err_msg = f"SafeGuard: Rejected ambiguous or malformed transaction: {e}"
+            return {
+                "action": "block",
+                "message": err_msg,
+                "reason": err_msg,
+                "risk_score": "critical",
+                "mode": mode,
+            }
+
+        if val_wei < 0:
+            err_msg = "SafeGuard: Malformed or unparseable transaction amount."
+            return {
+                "action": "block",
+                "message": err_msg,
+                "reason": err_msg,
+                "risk_score": "high",
+                "mode": mode,
+            }
+
         rpc_url = os.getenv("SAFEGUARD_RPC_URL", os.getenv("RPC_URL", DEFAULT_RPC_URL))
 
         # Destination address is mandatory for intercepted on-chain transactions
@@ -479,15 +665,44 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
                 "mode": mode,
             }
 
+        # Extract recent conversation or tool context strictly from host/system kwargs (never untrusted agent args)
+        context = kwargs.get("context") or kwargs.get("messages") or []
+
+        # Consume confirmation_id if supplied in retry
+        active_conf_id = tool_args.get("confirmation_id") if isinstance(tool_args, dict) else None
+
         res = verify_transaction(
             to_address=to_addr,
             value_wei=val_wei,
             data_hex=data_hex,
             config=config,
             rpc_url=rpc_url,
+            context=context,
+            confirmation_id=active_conf_id,
         )
 
         risk_str = res.risk_score.value if hasattr(res.risk_score, "value") else str(res.risk_score).lower()
+
+        # Handle pending human confirmation workflows
+        if getattr(res, "requires_confirmation", False):
+            conf_id = getattr(res, "confirmation_id", "")
+            summary = getattr(res, "confirmation_summary", "") or res.reason
+            msg = (
+                f"SafeGuard [{mode.upper()}] REQUIRES OPERATOR CONFIRMATION (ID: {conf_id}):\n"
+                f"{summary}\n\n"
+                f"Action is held for operator approval. Operator must run /safeguard-confirm {conf_id} in chat to approve, or /safeguard-reject {conf_id} to reject."
+            )
+            print(f"SafeGuard [{mode.upper()}]: Intercepted '{tool_name}' -> REQUIRES CONFIRMATION: ID {conf_id}")
+            return {
+                "action": "block",
+                "message": msg,
+                "reason": res.reason,
+                "risk_score": risk_str,
+                "requires_confirmation": True,
+                "confirmation_id": conf_id,
+                "confirmation_summary": summary,
+                "mode": mode,
+            }
 
         # Check for unambiguous fund drains
         is_drain = (
@@ -495,11 +710,11 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
             or any(kw in res.reason.lower() for kw in ("drain", "extortionate", "balance loss", "threat feed", "denylist", "blocklist", "sweeper"))
         )
 
-        # Degen mode logic: allow medium-risk actions with warning unless it is a clear drain
+        # Degen mode logic: check disallowed actions first before medium-risk warnings
         if mode == "degen":
-            if is_drain or risk_str == "critical":
+            if not res.allowed or is_drain or risk_str == "critical":
                 msg = f"SafeGuard [degen] BLOCKED: {res.reason}"
-                print(f"SafeGuard [DEGEN]: Intercepted '{tool_name}' -> BLOCKED drain: {res.reason}")
+                print(f"SafeGuard [DEGEN]: Intercepted '{tool_name}' -> BLOCKED: {res.reason}")
                 return {
                     "action": "block",
                     "message": msg,
@@ -512,20 +727,11 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
                 msg = f"SafeGuard [degen] WARNING: {warn_text}"
                 print(f"SafeGuard [DEGEN]: Intercepted '{tool_name}' -> ALLOWED with warning: {warn_text}")
                 return {
-                    "action": "allow",
+                    "action": "approve",
+                    "allowed": True,
                     "message": msg,
                     "warning": warn_text,
                     "risk_score": "medium",
-                    "mode": mode,
-                }
-            elif not res.allowed:
-                msg = f"SafeGuard [degen] BLOCKED: {res.reason}"
-                print(f"SafeGuard [DEGEN]: Intercepted '{tool_name}' -> BLOCKED: {res.reason}")
-                return {
-                    "action": "block",
-                    "message": msg,
-                    "reason": res.reason,
-                    "risk_score": risk_str,
                     "mode": mode,
                 }
             else:
@@ -533,7 +739,8 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
                 msg = f"SafeGuard [degen]: Transaction verified successfully.{warn_msg}"
                 print(f"SafeGuard [DEGEN]: Intercepted '{tool_name}' -> ALLOWED")
                 return {
-                    "action": "allow",
+                    "action": "approve",
+                    "allowed": True,
                     "message": msg,
                     "warning": res.warning or None,
                     "risk_score": risk_str,
@@ -556,7 +763,8 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
         msg = f"SafeGuard [{mode}]: Transaction verified successfully.{warn_msg}"
         print(f"SafeGuard [{mode.upper()}]: Intercepted '{tool_name}' -> ALLOWED")
         return {
-            "action": "allow",
+            "action": "approve",
+            "allowed": True,
             "message": msg,
             "warning": res.warning or None,
             "risk_score": risk_str,
@@ -584,7 +792,26 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
 def safeguard_status_handler(*args: Any, **kwargs: Any) -> str:
     """
     Return a summary of SafeGuard status, current policy limits, and RPC connectivity.
+    Optionally switch active policy mode if a mode argument ('strict', 'balanced', 'degen')
+    is supplied (e.g., /safeguard-status degen or /safeguard-mode strict).
     """
+    # Check for requested mode change
+    arg_text = ""
+    if args:
+        if isinstance(args[0], str):
+            arg_text = args[0].strip().lower()
+        elif isinstance(args[0], dict):
+            arg_text = str(args[0].get("mode") or args[0].get("args") or "").strip().lower()
+    if not arg_text and kwargs:
+        arg_text = str(kwargs.get("mode") or kwargs.get("args") or kwargs.get("raw_args") or "").strip().lower()
+
+    mode_switched = False
+    tokens = [t for t in arg_text.split() if t in ("strict", "balanced", "degen")]
+    if tokens:
+        target_mode = tokens[-1]
+        os.environ["SAFEGUARD_MODE"] = target_mode
+        mode_switched = True
+
     config, mode = _get_policy_config()
     rpc_url = os.getenv("SAFEGUARD_RPC_URL", os.getenv("RPC_URL", DEFAULT_RPC_URL))
 
@@ -604,18 +831,71 @@ def safeguard_status_handler(*args: Any, **kwargs: Any) -> str:
     zero_slippage_blocked = getattr(config, "block_zero_slippage", True)
     simulation_required = getattr(config, "require_simulation", True)
 
+    mode_header = f"Mode: {mode} (Switched!)" if mode_switched else f"Mode: {mode}"
+
     status_lines = [
         "================ SafeGuard Status ================",
-        f"Mode: {mode}",
+        mode_header,
         "Policy Limits:",
         f"  - Max ETH per Tx: {max_eth_display}",
         f"  - Unlimited Approvals Allowed: {unlimited_approve}",
         f"  - Zero-Slippage DEX Swaps Blocked: {zero_slippage_blocked}",
         f"  - EVM Trace Simulation Required: {simulation_required}",
         f"Anvil/RPC Connectivity: {conn_str}",
+        "Toggle mode: /safeguard-mode <strict|balanced|degen>",
         "==================================================",
     ]
     return "\n".join(status_lines)
+
+
+def safeguard_confirm_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    Operator slash command to approve a held action by its confirmation_id.
+    Usage: /safeguard-confirm <confirmation_id>
+    """
+    arg_text = ""
+    if args:
+        if isinstance(args[0], str):
+            arg_text = args[0].strip()
+        elif isinstance(args[0], dict):
+            arg_text = str(args[0].get("id") or args[0].get("args") or "").strip()
+    if not arg_text and kwargs:
+        arg_text = str(kwargs.get("id") or kwargs.get("args") or kwargs.get("raw_args") or "").strip()
+
+    tokens = arg_text.split()
+    conf_id = tokens[0] if tokens else ""
+    if not conf_id:
+        return "Usage: /safeguard-confirm <confirmation_id>"
+
+    result = safeguard_confirm_action(confirmation_id=conf_id, approved=True)
+    if result.get("status") == "confirmed":
+        return f"SafeGuard: Action {conf_id} has been CONFIRMED by operator."
+    return f"SafeGuard: Failed to confirm {conf_id}: {result.get('message', 'Unknown error')}"
+
+
+def safeguard_reject_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    Operator slash command to reject a held action by its confirmation_id.
+    Usage: /safeguard-reject <confirmation_id>
+    """
+    arg_text = ""
+    if args:
+        if isinstance(args[0], str):
+            arg_text = args[0].strip()
+        elif isinstance(args[0], dict):
+            arg_text = str(args[0].get("id") or args[0].get("args") or "").strip()
+    if not arg_text and kwargs:
+        arg_text = str(kwargs.get("id") or kwargs.get("args") or kwargs.get("raw_args") or "").strip()
+
+    tokens = arg_text.split()
+    conf_id = tokens[0] if tokens else ""
+    if not conf_id:
+        return "Usage: /safeguard-reject <confirmation_id>"
+
+    result = safeguard_confirm_action(confirmation_id=conf_id, approved=False)
+    if result.get("status") == "rejected":
+        return f"SafeGuard: Action {conf_id} has been REJECTED by operator."
+    return f"SafeGuard: Failed to reject {conf_id}: {result.get('message', 'Unknown error')}"
 
 
 # ==============================================================================
@@ -766,12 +1046,6 @@ def register(ctx: Any) -> None:
                 "description": "Hex-encoded transaction calldata (default '0x')",
                 "default": "0x",
             },
-            "mode": {
-                "type": "string",
-                "description": "Policy mode: 'strict', 'balanced', or 'degen' (default: balanced)",
-                "enum": ["strict", "balanced", "degen"],
-                "default": "balanced",
-            },
         },
         "required": ["to"],
     }
@@ -804,9 +1078,8 @@ def register(ctx: Any) -> None:
             },
             "mode": {
                 "type": "string",
-                "description": "Policy mode: 'strict', 'balanced', or 'degen' (default: balanced)",
+                "description": "Deprecated and ignored. Policy mode is operator-controlled.",
                 "enum": ["strict", "balanced", "degen"],
-                "default": "balanced",
             },
             "gas": {
                 "type": ["string", "integer"],
@@ -831,36 +1104,51 @@ def register(ctx: Any) -> None:
     # 3. Register hook: pre_tool_call
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
 
-    # 4. Register slash command: /safeguard-status
-    # In Hermes Agent, commands are registered by base name ("safeguard-status")
-    # and automatically invoked by users in chat sessions as /safeguard-status.
-    registered_cmd = False
+    # 4. Register slash commands: /safeguard-status, /safeguard-mode, /safeguard-confirm, /safeguard-reject
+    # In Hermes Agent, commands are registered by base name and invoked by users in chat sessions.
+    # The confirmation and rejection commands are operator-only and not callable as model tools.
+    cmd_handlers = {
+        "safeguard-status": safeguard_status_handler,
+        "safeguard-mode": safeguard_status_handler,
+        "safeguard-confirm": safeguard_confirm_command_handler,
+        "safeguard-reject": safeguard_reject_command_handler,
+    }
+    cmd_descriptions = {
+        "safeguard-status": "Inspect or switch SafeGuard policy mode.",
+        "safeguard-mode": "Switch SafeGuard policy mode (strict, balanced, degen).",
+        "safeguard-confirm": "Approve a held SafeGuard transaction by its confirmation ID.",
+        "safeguard-reject": "Reject a held SafeGuard transaction by its confirmation ID.",
+    }
+
+    registered_cmds: set[str] = set()
     for reg_method_name in ("register_command", "register_slash_command"):
         reg_fn = getattr(ctx, reg_method_name, None)
         if callable(reg_fn):
-            for cmd_name in ("safeguard-status", "/safeguard-status"):
-                try:
-                    reg_fn(
-                        name=cmd_name,
-                        handler=safeguard_status_handler,
-                        description="Display current SafeGuard policy mode, limits, and RPC connectivity.",
-                    )
-                    registered_cmd = True
-                    break
-                except TypeError:
+            for cmd_base, handler in cmd_handlers.items():
+                for cmd_name in (cmd_base, f"/{cmd_base}"):
+                    if cmd_base in registered_cmds:
+                        continue
                     try:
-                        reg_fn(cmd_name, safeguard_status_handler)
-                        registered_cmd = True
+                        reg_fn(
+                            name=cmd_name,
+                            handler=handler,
+                            description=cmd_descriptions.get(cmd_base, ""),
+                        )
+                        registered_cmds.add(cmd_base)
                         break
+                    except TypeError:
+                        try:
+                            reg_fn(cmd_name, handler)
+                            registered_cmds.add(cmd_base)
+                            break
+                        except Exception:
+                            pass
                     except Exception:
                         pass
-                except Exception:
-                    pass
-            if registered_cmd:
-                break
 
     for dict_attr in ("slash_commands", "commands"):
         d = getattr(ctx, dict_attr, None)
         if isinstance(d, dict):
-            d["safeguard-status"] = safeguard_status_handler
-            d["/safeguard-status"] = safeguard_status_handler
+            for cmd_base, handler in cmd_handlers.items():
+                d[cmd_base] = handler
+                d[f"/{cmd_base}"] = handler

@@ -14,6 +14,7 @@ Verifies that all security layers connect through the plugin interface:
 import json
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import __init__ as safeguard
@@ -38,6 +39,23 @@ from verifier import (
 )
 
 
+@contextmanager
+def operator_mode(mode: str):
+    """
+    Set the policy mode the way an operator does (environment), not through tool arguments.
+    Agent-supplied mode arguments are intentionally ignored by the plugin.
+    """
+    previous = os.environ.get("SAFEGUARD_MODE")
+    os.environ["SAFEGUARD_MODE"] = mode
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("SAFEGUARD_MODE", None)
+        else:
+            os.environ["SAFEGUARD_MODE"] = previous
+
+
 def run_comprehensive_tests():
     print("=================================================================")
     print("     Hermes SafeGuard — Comprehensive Plugin Integration Tests    ")
@@ -52,24 +70,35 @@ def run_comprehensive_tests():
     print("--- 1. Testing safeguard_check_policy Tool ---")
 
     # 1a. Safe transaction in balanced mode
-    res_safe = json.loads(safeguard.safeguard_check_policy_handler(
-        to=DEFAULT_ALLOWED_TARGET,
-        value="0.1 ether",
-        mode="balanced"
-    ))
+    with operator_mode("balanced"):
+        res_safe = json.loads(safeguard.safeguard_check_policy_handler(
+            to=DEFAULT_ALLOWED_TARGET,
+            value="0.1 ether",
+        ))
     assert res_safe["allowed"] is True, f"Failed safe tx: {res_safe}"
     assert res_safe["mode"] == "balanced"
     print("[PASS] 1a: Safe 0.1 ETH transaction passes policy check.")
 
     # 1b. Value exceeds cap in strict mode (cap is 0.5 ETH, attempting 1.0 ETH)
-    res_strict_val = json.loads(safeguard.safeguard_check_policy_handler(
-        to=DEFAULT_ALLOWED_TARGET,
-        value="1.0 ether",
-        mode="strict"
-    ))
+    with operator_mode("strict"):
+        res_strict_val = json.loads(safeguard.safeguard_check_policy_handler(
+            to=DEFAULT_ALLOWED_TARGET,
+            value="1.0 ether",
+        ))
     assert res_strict_val["allowed"] is False
     assert "exceeds max per tx" in res_strict_val["reason"]
     print("[PASS] 1b: Strict mode caps value (1.0 ETH rejected, cap 0.5 ETH).")
+
+    # 1b2. A mode supplied inside tool arguments must NOT change the policy tier
+    with operator_mode("strict"):
+        res_mode_escalation = json.loads(safeguard.safeguard_check_policy_handler(
+            to=DEFAULT_ALLOWED_TARGET,
+            value="1.0 ether",
+            mode="degen",
+        ))
+    assert res_mode_escalation["allowed"] is False, res_mode_escalation
+    assert res_mode_escalation["mode"] == "strict"
+    print("[PASS] 1b2: Agent-supplied mode argument is ignored (no policy escalation).")
 
     # 1c. Zero-slippage DEX swap blocked in balanced mode
     zero_slip_data = encode_v2_swap_calldata(
@@ -79,11 +108,11 @@ def run_comprehensive_tests():
         to="0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
         deadline=1893456000,
     )
-    res_zero_slip = json.loads(safeguard.safeguard_check_policy_handler(
-        to=DEFAULT_ALLOWED_TARGET,
-        data=zero_slip_data,
-        mode="balanced"
-    ))
+    with operator_mode("balanced"):
+        res_zero_slip = json.loads(safeguard.safeguard_check_policy_handler(
+            to=DEFAULT_ALLOWED_TARGET,
+            data=zero_slip_data,
+        ))
     assert res_zero_slip["allowed"] is False
     assert "zero slippage swap blocked" in res_zero_slip["reason"]
     print("[PASS] 1c: Zero-slippage swap blocked by policy.")
@@ -117,7 +146,9 @@ def run_comprehensive_tests():
         mode="balanced",
         gas=21000
     ))
-    assert res_exec_ok["executed"] is True
+    assert res_exec_ok["verified"] is True
+    assert res_exec_ok["executed"] is False  # nothing is signed or broadcast by this handler
+    assert res_exec_ok["broadcast"] is False
     assert res_exec_ok["status"] == "success"
     assert res_exec_ok["tx"]["to"] == DEFAULT_ALLOWED_TARGET
     assert res_exec_ok["tx"]["gas"] == 21000
@@ -158,7 +189,7 @@ def run_comprehensive_tests():
         "uniswap_swap",
         {"to": "0x000000000000000000000000000000000000c001", "data": high_tax_calldata, "mode": "degen"}
     )
-    assert hook_tax_high["action"] == "allow"
+    assert hook_tax_high["action"] in ("allow", "approve")
     assert "High token tax" in hook_tax_high["message"]
     print("[PASS] 3c: High 30% token tax permitted in degen mode with warning.")
 
@@ -168,7 +199,7 @@ def run_comprehensive_tests():
         "mint_nft",
         {"contract": "0x000000000000000000000000000000000000f001", "data": mint_calldata, "mode": "degen"}
     )
-    assert hook_mint["action"] == "allow"
+    assert hook_mint["action"] in ("allow", "approve")
     print("[PASS] 3d: NFT mint transaction permitted in degen mode.")
 
     # 3e. High-level ERC-20 transfer synthesis & novel recipient detection
@@ -181,7 +212,7 @@ def run_comprehensive_tests():
             "mode": "degen",
         }
     )
-    assert hook_erc20["action"] == "allow"
+    assert hook_erc20["action"] in ("allow", "approve")
     print("[PASS] 3e: High-level ERC-20 transfer parameters synthesized and verified.")
 
     # --------------------------------------------------------------------------

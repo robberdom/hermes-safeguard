@@ -264,8 +264,9 @@ approved = safeguard_list_approved_addresses()
 Hermes SafeGuard maintains a complete zero-dependency test suite covering contract invariants, policy engine logic, trace simulations, injection attacks, threat feeds, and memory integrity.
 
 ### Current Test Status
-- **95 Unit Tests**: 100% passing (`Ran 95 tests in ~0.25s - OK`).
+- **140 Unit Tests**: 100% passing across 7 test suites (`python3 -m unittest discover tests -v`).
 - **38 Verification Scenarios**: 100% passing across 18 scenario test suites (`verifier.py --test`).
+- **Plugin Integration Tests**: 100% passing across `test_plugin.py` and `test_plugin_comprehensive.py`.
 
 ### Running the Test Suites
 
@@ -279,6 +280,8 @@ Test suite breakdown:
 - `tests/test_prompt_injection.py`: Context trust tagging, Morse/Base64/Hex decoders, injection flags.
 - `tests/test_threat_feed.py`: Blocklist parsing, malicious contract blocking, threat search tool.
 - `tests/test_memory_integrity.py`: Persistent address store, new recipient gating, poisoned memory attacks.
+- `tests/test_security_audit_fixes.py`: C1-C15 audit remediation tests (tool scoping, digest bindings, injection boundaries).
+- `tests/test_security_patches.py`: Single-use confirmations, parameter tamper resistance, drain sender resolution, calldata synthesis.
 
 #### 2. Run the Verification Scenarios Runner
 ```bash
@@ -301,20 +304,20 @@ python3 verifier.py --to 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D --value 1.0 
 ## 8. Human Confirmation Workflow
 
 When an action is flagged with `requires_confirmation=True`:
-1. SafeGuard generates a unique `confirmation_id` (e.g., `conf_5eb5ac435442`) and registers the request in `ConfirmationStore`.
+1. SafeGuard generates a unique `confirmation_id` (e.g., `conf_5eb5ac435442`) and registers the request in `ConfirmationStore` bound to the transaction digest (`sha256(to:value:data)`).
 2. A structured summary (`confirmation_summary`) is generated detailing the target, value, action type, risk score, and reason.
-3. The host application or chat adapter prompts the human operator.
-4. The human confirms or rejects via `safeguard_confirm_action(confirmation_id, approved=True|False)`.
-5. On confirmation, re-evaluating the transaction with `confirmation_id` unlocks execution.
+3. The transaction is held. The human operator is prompted via chat to approve or reject. To prevent agent self-approval, confirmations are strictly operator commands (`/safeguard-confirm` / `/safeguard-reject`), not tools callable by the agent.
+4. The operator confirms via `/safeguard-confirm <id>` or rejects via `/safeguard-reject <id>` (or programmatically via `safeguard_confirm_action(confirmation_id, approved=True|False)`).
+5. On confirmation, re-evaluating the transaction with `confirmation_id` unlocks execution (enforcing single-use and parameter digest matching).
 
 ```python
 from policy_engine import safeguard_confirm_action
 from verifier import verify_transaction
 
-# Human approves pending action
+# Operator approves pending action
 safeguard_confirm_action(confirmation_id="conf_5eb5ac435442", approved=True)
 
-# Transaction re-evaluation passes
+# Transaction re-evaluation passes with matching parameters
 result = verify_transaction(
     to_address="0x...",
     value_wei=10**18,
@@ -323,6 +326,13 @@ result = verify_transaction(
 )
 assert result.allowed is True
 ```
+
+### New Recipient Confirmations as "Add Contact" (Standing Trust)
+In `strict` mode, confirming a transaction to an unknown recipient functions as an intentional "add contact" action:
+- Upon operator approval of a new recipient transaction (`confirmed=True` with matching confirmation ID), the destination address is recorded into `AddressMemoryStore` with label `"User confirmed"` and source `"confirmation"`.
+- Subsequent transactions to this address bypass the new-recipient confirmation gate, eliminating repeated confirmation prompts for trusted contacts.
+- **Security Boundaries Preserved**: While standing trust is granted for recipient novelty, all transactions remain bound to invariant rules: per-transaction ETH limits (`max_eth_per_tx`), token limits, blocked selectors, blocklist feeds, and EVM trace outflow simulation.
+- **Revocation**: To revoke standing trust for a previously confirmed address, operators can remove the address via `AddressMemoryStore.remove(address)` or clear the persistent memory store file (`SAFEGUARD_MEMORY_PATH`).
 
 ---
 

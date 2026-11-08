@@ -146,7 +146,7 @@ def run_tests():
             "mode": "balanced",
         },
     )
-    assert safe_res["action"] == "allow", f"Expected allow, got: {safe_res}"
+    assert safe_res["action"] in ("allow", "approve"), f"Expected allow/approve, got: {safe_res}"
     print("[PASS] Test 3: Legitimate transaction allowed.")
 
     # 6. Test 4: Slash command status output

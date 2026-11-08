@@ -537,12 +537,33 @@ class VerificationResult(tuple):
 
 def normalize_address(address: str) -> str:
     """Normalize hex address string to 40 lowercase hex characters without prefix."""
+    if not address:
+        raise ValueError("Address cannot be empty")
     addr = str(address).strip()
     if addr.startswith(("0x", "0X")):
         addr = addr[2:]
+    if not addr:
+        raise ValueError("Address cannot be empty")
+    if len(addr) == 64 and addr.startswith("0" * 24):
+        addr = addr[24:]
     if len(addr) > 40:
-        addr = addr[-40:]
+        raise ValueError(f"Invalid Ethereum address length ({len(addr)}): {address}")
+    if not all(c in "0123456789abcdefABCDEF" for c in addr):
+        raise ValueError(f"Invalid Ethereum address non-hex characters: {address}")
     return addr.rjust(40, "0").lower()
+
+
+def _canonical_data_hex(data_hex: Any) -> str:
+    """
+    Canonicalize calldata for confirmation binding.
+
+    An omitted calldata argument may arrive as None, "", or "0x"; all three mean the
+    same empty payload, so treating them as distinct would silently invalidate an
+    operator's confirmation. Only these trivial equivalences are normalized —
+    differing byte content is deliberately kept distinct so a mismatch fails closed.
+    """
+    raw = str(data_hex or "").strip().lower()
+    return raw if raw else "0x"
 
 
 # Well-known protocol & marketplace addresses
@@ -798,7 +819,8 @@ _DEFAULT_MEMORY_STORE: AddressMemoryStore | None = None
 def get_default_memory_store() -> AddressMemoryStore:
     global _DEFAULT_MEMORY_STORE
     if _DEFAULT_MEMORY_STORE is None:
-        _DEFAULT_MEMORY_STORE = AddressMemoryStore()
+        mem_path = os.getenv("SAFEGUARD_MEMORY_PATH")
+        _DEFAULT_MEMORY_STORE = AddressMemoryStore(filepath=mem_path)
     return _DEFAULT_MEMORY_STORE
 
 
@@ -872,8 +894,10 @@ class PendingConfirmation:
     summary: str
     mode: str
     created_at: float
+    tx_digest: str = ""
     confirmed: bool = False
     rejected: bool = False
+    consumed: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -897,11 +921,21 @@ class PendingConfirmation:
 class ConfirmationStore:
     """Thread-safe store for pending, confirmed, and rejected human approval requests."""
 
-    def __init__(self) -> None:
+    def __init__(self, ttl: float = 300.0) -> None:
         self._lock = threading.Lock()
         self._pending: dict[str, PendingConfirmation] = {}
         self._confirmed_ids: set[str] = set()
         self._rejected_ids: set[str] = set()
+        self.ttl: float = ttl
+
+    def compute_tx_digest(self, to_address: str, value_wei: int, data_hex: str) -> str:
+        try:
+            norm_to = normalize_address(to_address) if to_address else ""
+        except Exception:
+            norm_to = str(to_address).strip().lower()
+        clean_data = _canonical_data_hex(data_hex)
+        hash_input = f"{norm_to}:{int(value_wei)}:{clean_data}"
+        return hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
 
     def create_confirmation_request(
         self,
@@ -917,9 +951,26 @@ class ConfirmationStore:
         mode: str = "degen",
         metadata: dict[str, Any] | None = None,
     ) -> PendingConfirmation:
-        norm_to = normalize_address(to_address) if to_address else ""
+        try:
+            norm_to = normalize_address(to_address) if to_address else ""
+        except Exception:
+            norm_to = str(to_address).strip().lower()
+        clean_data = _canonical_data_hex(data_hex)
+        tx_digest = self.compute_tx_digest(norm_to, value_wei, clean_data)
+
         with self._lock:
-            hash_input = f"{norm_to}:{value_wei}:{data_hex}:{tool_name}:{time.time()}"
+            now = time.time()
+            # If an identical unconsumed and unexpired confirmation request exists, reuse it
+            for existing in self._pending.values():
+                if (
+                    existing.tx_digest == tx_digest
+                    and not existing.consumed
+                    and not existing.rejected
+                    and (now - existing.created_at) < self.ttl
+                ):
+                    return existing
+
+            hash_input = f"{norm_to}:{value_wei}:{clean_data}:{tool_name}:{now}"
             conf_id = "conf_" + hashlib.sha256(hash_input.encode("utf-8")).hexdigest()[:12]
             entry = PendingConfirmation(
                 id=conf_id,
@@ -928,12 +979,13 @@ class ConfirmationStore:
                 tool_args=dict(tool_args or {}),
                 to_address=norm_to,
                 value_wei=value_wei,
-                data_hex=data_hex,
+                data_hex=clean_data,
                 risk_score=risk_score,
                 reason=reason,
                 summary=summary,
                 mode=mode,
-                created_at=time.time(),
+                created_at=now,
+                tx_digest=tx_digest,
                 metadata=dict(metadata or {}),
             )
             self._pending[conf_id] = entry
@@ -941,28 +993,62 @@ class ConfirmationStore:
 
     def confirm(self, confirmation_id: str) -> bool:
         with self._lock:
+            if confirmation_id not in self._pending:
+                return False
+            entry = self._pending[confirmation_id]
+            if (time.time() - entry.created_at) > self.ttl:
+                return False
+            entry.confirmed = True
+            entry.rejected = False
             self._confirmed_ids.add(confirmation_id)
-            if confirmation_id in self._pending:
-                self._pending[confirmation_id].confirmed = True
-                self._pending[confirmation_id].rejected = False
-                return True
+            self._rejected_ids.discard(confirmation_id)
             return True
 
     def reject(self, confirmation_id: str) -> bool:
         with self._lock:
+            if confirmation_id not in self._pending:
+                return False
+            entry = self._pending[confirmation_id]
+            entry.rejected = True
+            entry.confirmed = False
             self._rejected_ids.add(confirmation_id)
-            if confirmation_id in self._pending:
-                self._pending[confirmation_id].rejected = True
-                self._pending[confirmation_id].confirmed = False
-                return True
+            self._confirmed_ids.discard(confirmation_id)
             return True
 
-    def is_confirmed(self, confirmation_id: str) -> bool:
+    def is_confirmed(
+        self,
+        confirmation_id: str,
+        to_address: str | None = None,
+        value_wei: int | None = None,
+        data_hex: str | None = None,
+        consume: bool = False,
+    ) -> bool:
         with self._lock:
-            if confirmation_id in self._confirmed_ids:
-                return True
+            if confirmation_id in self._rejected_ids:
+                return False
             entry = self._pending.get(confirmation_id)
-            return bool(entry and entry.confirmed)
+            if not entry or not entry.confirmed or entry.rejected or entry.consumed:
+                return False
+            if (time.time() - entry.created_at) > self.ttl:
+                return False
+            # Verify parameter binding against stored transaction digest
+            if to_address is not None:
+                try:
+                    norm_to = normalize_address(to_address)
+                except Exception:
+                    norm_to = str(to_address).strip().lower()
+                if entry.to_address != norm_to:
+                    return False
+            if value_wei is not None and entry.value_wei != int(value_wei):
+                return False
+            if data_hex is not None:
+                clean_data = _canonical_data_hex(data_hex)
+                if entry.data_hex != clean_data:
+                    return False
+            if consume:
+                entry.consumed = True
+                self._confirmed_ids.discard(confirmation_id)
+            return True
 
     def is_rejected(self, confirmation_id: str) -> bool:
         with self._lock:
@@ -1042,9 +1128,24 @@ class FinancialActionLogEntry:
 class ActionAuditLogger:
     """Thread-safe in-memory and structured logger for all intercepted financial actions."""
 
-    def __init__(self) -> None:
+    def __init__(self, log_path: str | Path | None = None) -> None:
         self._lock = threading.Lock()
         self._entries: list[FinancialActionLogEntry] = []
+        # Optional JSONL persistence. SAFEGUARD_AUDIT_LOG_PATH enables it; None keeps in-memory only.
+        env_path = os.getenv("SAFEGUARD_AUDIT_LOG_PATH") if log_path is None else None
+        resolved = log_path or env_path
+        self.log_path: Path | None = Path(resolved).expanduser() if resolved else None
+
+    def _persist(self, entry: FinancialActionLogEntry) -> None:
+        """Append one JSON line to the audit file. Never raise: logging must not break enforcement."""
+        if not self.log_path:
+            return
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry.to_dict(), default=str) + "\n")
+        except Exception:
+            pass
 
     def log(
         self,
@@ -1061,7 +1162,10 @@ class ActionAuditLogger:
         warning: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> FinancialActionLogEntry:
-        norm_target = normalize_address(target) if target else ""
+        try:
+            norm_target = normalize_address(target) if target else ""
+        except Exception:
+            norm_target = str(target or "")
         with self._lock:
             entry = FinancialActionLogEntry(
                 timestamp=time.time(),
@@ -1079,6 +1183,7 @@ class ActionAuditLogger:
                 metadata=dict(metadata or {}),
             )
             self._entries.append(entry)
+            self._persist(entry)
 
             # High-visibility logging
             target_str = f"0x{norm_target}" if norm_target else "none"
@@ -1334,55 +1439,64 @@ def safeguard_confirm_action(
     al = audit_logger or get_default_audit_logger()
 
     entry = cs.get(confirmation_id)
+    if not entry:
+        return {
+            "status": "error",
+            "confirmation_id": confirmation_id,
+            "approved": False,
+            "message": f"Confirmation ID '{confirmation_id}' not found in pending store",
+        }
+
     if approved:
-        cs.confirm(confirmation_id)
-        if entry:
-            entry.confirmed = True
-            if entry.to_address:
-                ms.approve(entry.to_address, label="User confirmed action", source="confirmation")
-            al.log(
-                action=entry.action or entry.tool_name or "confirm",
-                status="confirmed",
-                mode=entry.mode,
-                target=entry.to_address,
-                value_wei=entry.value_wei,
-                data_hex=entry.data_hex,
-                risk_score=entry.risk_score,
-                reason="Action confirmed by human approval",
-                summary=entry.summary,
-                confirmation_id=confirmation_id,
-            )
-        logger.info("Hermes SafeGuard: Action confirmed by human approval: %s", confirmation_id)
+        success = cs.confirm(confirmation_id)
+        if not success:
+            return {
+                "status": "error",
+                "confirmation_id": confirmation_id,
+                "approved": False,
+                "message": f"Confirmation ID '{confirmation_id}' is expired or invalid",
+            }
+        al.log(
+            action=entry.action or entry.tool_name or "confirm",
+            status="confirmed",
+            mode=entry.mode,
+            target=entry.to_address,
+            value_wei=entry.value_wei,
+            data_hex=entry.data_hex,
+            risk_score=entry.risk_score,
+            reason="Action confirmed by human approval",
+            summary=entry.summary,
+            confirmation_id=confirmation_id,
+        )
+        logger.info("Hermes SafeGuard: Action confirmed by operator approval: %s", confirmation_id)
         return {
             "status": "confirmed",
             "confirmation_id": confirmation_id,
             "approved": True,
-            "summary": entry.summary if entry else "",
-            "message": "Action has been approved by human operator.",
+            "summary": entry.summary,
+            "message": "Action has been approved by operator.",
         }
     else:
         cs.reject(confirmation_id)
-        if entry:
-            entry.rejected = True
-            al.log(
-                action=entry.action or entry.tool_name or "confirm",
-                status="rejected",
-                mode=entry.mode,
-                target=entry.to_address,
-                value_wei=entry.value_wei,
-                data_hex=entry.data_hex,
-                risk_score=entry.risk_score,
-                reason="Action rejected by human operator",
-                summary=entry.summary,
-                confirmation_id=confirmation_id,
-            )
-        logger.info("Hermes SafeGuard: Action rejected by human operator: %s", confirmation_id)
+        al.log(
+            action=entry.action or entry.tool_name or "confirm",
+            status="rejected",
+            mode=entry.mode,
+            target=entry.to_address,
+            value_wei=entry.value_wei,
+            data_hex=entry.data_hex,
+            risk_score=entry.risk_score,
+            reason="Action rejected by operator",
+            summary=entry.summary,
+            confirmation_id=confirmation_id,
+        )
+        logger.info("Hermes SafeGuard: Action rejected by operator: %s", confirmation_id)
         return {
             "status": "rejected",
             "confirmation_id": confirmation_id,
             "approved": False,
-            "summary": entry.summary if entry else "",
-            "message": "Action was rejected by human operator.",
+            "summary": entry.summary,
+            "message": "Action has been rejected by operator.",
         }
 
 
@@ -1549,7 +1663,11 @@ class ThreatFeed:
             self._load_fallback_defaults()
 
     def _find_default_blocklist(self) -> Path | None:
-        candidates = [
+        env_path = os.getenv("SAFEGUARD_BLOCKLIST_PATH")
+        candidates = []
+        if env_path:
+            candidates.append(Path(env_path))
+        candidates.extend([
             Path("blocklist.json"),
             Path(__file__).parent / "blocklist.json",
             Path("policies/blocklist.json"),
@@ -1557,7 +1675,7 @@ class ThreatFeed:
             Path.home() / ".hermes/blocklist.json",
             Path("blocklist.yaml"),
             Path(__file__).parent / "blocklist.yaml",
-        ]
+        ])
         for p in candidates:
             try:
                 if p.is_file():
@@ -2139,36 +2257,45 @@ def extract_action_addresses(
     return result
 
 
-def _parse_wei_value(val: int | float | str | None, default: int) -> int:
+def _parse_wei_value(val: int | float | str | None, default: int = 0) -> int:
     """
     Parse native asset amount in wei from int, float (interpreted as ETH if float),
-    or string with optional 'eth' / 'ether' / '0x' suffix/prefix.
+    or string with optional 'eth' / 'ether' / 'finney' / 'gwei' / 'wei' / '0x' suffix/prefix.
+    Supports comma separators (e.g. '1,000').
+    Raises ValueError on unparseable non-empty values to prevent silently converting
+    attacker-controlled amounts to zero.
     """
     if val is None:
         return default
-    if isinstance(val, float):
-        return int(val * 10**18)
-    if isinstance(val, int):
+    if isinstance(val, (int, float)):
+        if isinstance(val, float):
+            return int(val * 10**18)
         return val
     if isinstance(val, str):
         s = val.strip().lower()
         if not s:
             return default
-        try:
-            if s.endswith("ether"):
-                num = float(s[:-5].strip())
-                return int(num * 10**18)
-            if s.endswith("eth"):
-                num = float(s[:-3].strip())
-                return int(num * 10**18)
-            if s.startswith("0x"):
-                return int(s, 16)
-            if "." in s:
-                return int(float(s) * 10**18)
-            return int(s)
-        except (ValueError, TypeError):
-            return default
-    return default
+        s = s.replace(",", "")
+        if s.endswith("ether"):
+            num = float(s[:-5].strip())
+            return int(num * 10**18)
+        if s.endswith("eth"):
+            num = float(s[:-3].strip())
+            return int(num * 10**18)
+        if s.endswith("finney"):
+            num = float(s[:-6].strip())
+            return int(num * 10**15)
+        if s.endswith("gwei"):
+            num = float(s[:-4].strip())
+            return int(num * 10**9)
+        if s.endswith("wei"):
+            return int(s[:-3].strip())
+        if s.startswith("0x"):
+            return int(s, 16)
+        if "." in s:
+            return int(float(s) * 10**18)
+        return int(s)
+    raise ValueError(f"Unsupported value type for wei parsing: {type(val)}")
 
 
 def _parse_token_value(val: int | float | str | None, default: int) -> int:
@@ -2637,9 +2764,12 @@ class PolicyEngine:
 
     def is_address_approved(self, addr: str) -> bool:
         """Check if an address is approved in memory store, allowlists, or known protocols."""
-        norm = normalize_address(addr)
+        try:
+            norm = normalize_address(addr)
+        except Exception:
+            return False
         if not norm or norm == "0" * 40:
-            return True
+            return False
         # Hard security check: threat feed and denylist strictly override any approval
         if self.threat_feed and self.threat_feed.is_address_blocked(norm):
             return False
@@ -2768,12 +2898,24 @@ class PolicyEngine:
             or ""
         ).strip()
 
-        # Resolve confirmed flag from direct parameter, tool_args, or confirmation_id store
+        # Resolve confirmed flag strictly from confirmation_id store with parameter binding
         active_conf_id = confirmation_id or tool_args.get("confirmation_id")
-        if active_conf_id and get_default_confirmation_store().is_confirmed(str(active_conf_id)):
-            confirmed = True
-        elif tool_args.get("confirmed"):
-            confirmed = bool(tool_args.get("confirmed"))
+        if active_conf_id:
+            cs = get_default_confirmation_store()
+            if cs.is_rejected(str(active_conf_id)):
+                res = VerificationResult(
+                    False,
+                    f"SG: confirmation {active_conf_id} was rejected by operator",
+                    RiskScore.CRITICAL,
+                )
+                log_financial_action(
+                    action=tool_name, status="blocked", mode=self.config.mode,
+                    target=to_address, value_wei=value_wei, data_hex=data_hex,
+                    risk_score="critical", reason=res.reason,
+                )
+                return res
+            if cs.is_confirmed(str(active_conf_id), to_address=to_address, value_wei=value_wei, data_hex=data_hex):
+                confirmed = True
 
         # Check all address arguments (including nested structures) against threat feed and denylist
         def _extract_all_strings(obj: Any) -> list[str]:
@@ -2907,6 +3049,14 @@ class PolicyEngine:
             elif amount > self.config.max_token_per_tx:
                 return "SG: approve amount exceeds token cap"
 
+        # 2b. ERC-20 transfer(address,uint256)
+        if sel == ERC20_TRANSFER_SELECTOR:
+            if len(raw) < 136:
+                return "SG: malformed transfer calldata"
+            amount = int(raw[72:136], 16)
+            if amount > self.config.max_token_per_tx:
+                return "SG: token transfer amount exceeds token cap"
+
         # 3. Recursive Multicall Unpacking: multicall(bytes[])
         if sel == MULTICALL_SELECTOR:
             if len(raw) < 72:
@@ -2923,6 +3073,22 @@ class PolicyEngine:
 
         # 4. Zero-Slippage Swap Protection: Uniswap V2
         if sel == V2_SWAP_SELECTOR:
+            if len(raw) < 136:
+                return "SG: malformed swap calldata"
+            amount_out_min = int(raw[72:136], 16)
+            if amount_out_min == 0 and self.config.block_zero_slippage:
+                return "SG: zero slippage swap blocked"
+
+        # 4b. Zero-Slippage Swap Protection: Uniswap swapExactETHForTokens (0x7ff36ab5)
+        if sel == "7ff36ab5":
+            if len(raw) < 72:
+                return "SG: malformed swap calldata"
+            amount_out_min = int(raw[8:72], 16)
+            if amount_out_min == 0 and self.config.block_zero_slippage:
+                return "SG: zero slippage swap blocked"
+
+        # 4c. Zero-Slippage Swap Protection: Uniswap swapExactTokensForETH (0x18cbafe5)
+        if sel == "18cbafe5":
             if len(raw) < 136:
                 return "SG: malformed swap calldata"
             amount_out_min = int(raw[72:136], 16)
@@ -2981,8 +3147,22 @@ class PolicyEngine:
             VerificationResult(allowed: bool, reason: str, risk_score: str)
         """
         # Resolve confirmation ID if provided
-        if confirmation_id and get_default_confirmation_store().is_confirmed(str(confirmation_id)):
-            confirmed = True
+        if confirmation_id:
+            cs = get_default_confirmation_store()
+            if cs.is_rejected(str(confirmation_id)):
+                res = VerificationResult(
+                    False,
+                    f"SG: confirmation {confirmation_id} was rejected by operator",
+                    RiskScore.CRITICAL,
+                )
+                log_financial_action(
+                    action="transaction", status="blocked", mode=self.config.mode,
+                    target=to_address, value_wei=value_wei, data_hex=data_hex,
+                    risk_score="critical", reason=res.reason,
+                )
+                return res
+            if cs.is_confirmed(str(confirmation_id), to_address=to_address, value_wei=value_wei, data_hex=data_hex):
+                confirmed = True
 
         # Step 0: Prompt / indirect injection check on untrusted context
         injection_signal = InjectionSignal()

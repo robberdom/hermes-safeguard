@@ -8,5 +8,10 @@ provides_tools:
   - safeguard_execute_tx
 provides_hooks:
   - pre_tool_call
+provides_commands:
+  - safeguard-status
+  - safeguard-mode
+  - safeguard-confirm
+  - safeguard-reject
 capabilities:
   - tools.override

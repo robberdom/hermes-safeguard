@@ -85,8 +85,28 @@ from policy_engine import (
 
 DEFAULT_RPC_URL = "http://127.0.0.1:8545"
 
-# Cached deployed policy address for the current session
-_CACHED_POLICY_ADDRESS: str | None = None
+# Sender used for simulation when no wallet address is configured.
+# This is the public Anvil dev account; it is a simulation placeholder only and
+# holds no funds on a live chain.
+DEFAULT_FROM_ADDRESS = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+
+
+def resolve_from_address(from_address: str | None = None) -> str:
+    """
+    Resolve the wallet address whose balances the drain check should measure.
+
+    Priority: explicit argument -> SAFEGUARD_WALLET_ADDRESS -> DEFAULT_FROM_ADDRESS.
+    Without this, balance-loss detection silently inspects an unrelated account.
+    """
+    if from_address and str(from_address).strip():
+        return str(from_address).strip()
+    env_addr = os.getenv("SAFEGUARD_WALLET_ADDRESS", "").strip()
+    if env_addr:
+        return env_addr
+    return DEFAULT_FROM_ADDRESS
+
+# Cached deployed policy address keyed by (rpc_url, chain_id)
+_CACHED_POLICY_ADDRESSES: dict[tuple[str, int], str] = {}
 DEFAULT_MAX_VALUE_WEI = 500_000_000_000_000_000  # 0.5 ether
 
 # Well-known protocol & marketplace addresses
@@ -540,7 +560,11 @@ def decode_revert_reason(data_hex: str) -> str:
 
 
 def decode_call_result(result_hex: str) -> Tuple[bool, str]:
-    """Decode return result from eth_call."""
+    """
+    Decode return result from eth_call.
+    For void-returning verifiers (SafeGuardPolicy.checkTransaction), 0x/empty indicates success.
+    Fails closed on unparseable return values.
+    """
     if not result_hex or result_hex == "0x":
         return True, ""
 
@@ -557,16 +581,16 @@ def decode_call_result(result_hex: str) -> Tuple[bool, str]:
                 reason = bytes.fromhex(str_hex).decode("utf-8", errors="replace")
                 return allowed, reason
         except Exception:
-            pass
+            return False, "Malformed return data from on-chain policy contract"
 
     if len(data) == 64:
         try:
             allowed = bool(int(data[:64], 16))
             return allowed, ""
         except Exception:
-            pass
+            return False, "Malformed uint256/bool return from on-chain policy contract"
 
-    return True, ""
+    return False, "Unexpected return data length from on-chain policy contract"
 
 
 # ==============================================================================
@@ -656,9 +680,19 @@ def find_contract_artifact() -> Path:
 
 def deploy_policy_contract(rpc_url: str = DEFAULT_RPC_URL) -> str:
     """Deploy SafeGuardPolicy.sol bytecode to the local RPC node and return its address."""
-    global _CACHED_POLICY_ADDRESS
-    if _CACHED_POLICY_ADDRESS:
-        return _CACHED_POLICY_ADDRESS
+    global _CACHED_POLICY_ADDRESSES
+
+    chain_id = 1
+    try:
+        chain_res = rpc_request(rpc_url, "eth_chainId", [])
+        c_val = chain_res.get("result", "0x1")
+        chain_id = int(c_val, 16) if isinstance(c_val, str) and c_val.startswith("0x") else int(c_val)
+    except Exception:
+        chain_id = 1
+
+    cache_key = (rpc_url, chain_id)
+    if cache_key in _CACHED_POLICY_ADDRESSES:
+        return _CACHED_POLICY_ADDRESSES[cache_key]
 
     artifact_path = find_contract_artifact()
     with open(artifact_path, "r", encoding="utf-8") as f:
@@ -701,7 +735,7 @@ def deploy_policy_contract(rpc_url: str = DEFAULT_RPC_URL) -> str:
         receipt = receipt_res.get("result")
         if receipt and receipt.get("contractAddress"):
             contract_addr = receipt["contractAddress"]
-            _CACHED_POLICY_ADDRESS = contract_addr
+            _CACHED_POLICY_ADDRESSES[cache_key] = contract_addr
             return contract_addr
         time.sleep(0.05)
 
@@ -724,6 +758,8 @@ def inspect_execution_trace(
     memory_store: AddressMemoryStore | None = None,
     tax_warning_threshold: float = TAX_WARNING_THRESHOLD_PCT,
     tax_block_threshold: float = TAX_BLOCK_THRESHOLD_PCT,
+    denylist: list[str] | set[str] | None = None,
+    threat_feed: Any | None = None,
 ) -> VerificationResult:
     """
     Inspect execution trace and pre/post state diffs via Anvil's debug_traceCall RPC method.
@@ -745,6 +781,18 @@ def inspect_execution_trace(
     allowed_targets.update(KNOWN_VERIFIED_PROTOCOLS)
     if memory_store:
         allowed_targets.update(memory_store.approved_addresses)
+
+    # Hard security invariant: subtract denylist and threat feed addresses from allowed_targets
+    blocked_addresses = set()
+    if denylist:
+        for a in denylist:
+            try:
+                blocked_addresses.add(normalize_address(a))
+            except Exception:
+                pass
+    if threat_feed:
+        blocked_addresses.update(getattr(threat_feed, "blocked_addresses", set()))
+    allowed_targets = allowed_targets - blocked_addresses
 
     raw_data = data_hex.strip() if data_hex else ""
     if raw_data.startswith(("0x", "0X")):
@@ -1168,12 +1216,44 @@ def check_pre_tool_call(
     if not is_financial_tool(tool_name):
         return VerificationResult(True, "", RiskScore.LOW)
 
-    # Resolve confirmed status from confirmation_id or tool_args
+    # Extract transaction parameters early so a confirmation can be bound to them
+    to_address = str(
+        tool_args.get("to")
+        or tool_args.get("to_address")
+        or tool_args.get("target")
+        or tool_args.get("recipient")
+        or ""
+    ).strip()
+    value_raw = tool_args.get("value", tool_args.get("value_wei", tool_args.get("amount", 0)))
+    try:
+        value_wei = _parse_wei_value(value_raw, 0)
+    except (ValueError, TypeError):
+        return VerificationResult(
+            False, "SG: malformed or unparseable transaction amount", RiskScore.HIGH
+        )
+    data_hex = str(
+        tool_args.get("data")
+        or tool_args.get("data_hex")
+        or tool_args.get("calldata")
+        or tool_args.get("input")
+        or ""
+    ).strip()
+
+    # Resolve confirmed status strictly from confirmation_id store, bound to this exact tx
     active_conf_id = confirmation_id or tool_args.get("confirmation_id")
-    if active_conf_id and get_default_confirmation_store().is_confirmed(str(active_conf_id)):
-        confirmed = True
-    elif tool_args.get("confirmed"):
-        confirmed = bool(tool_args.get("confirmed"))
+    if active_conf_id:
+        cs = get_default_confirmation_store()
+        if cs.is_rejected(str(active_conf_id)):
+            return VerificationResult(
+                False, f"SG: confirmation {active_conf_id} was rejected by operator", RiskScore.CRITICAL
+            )
+        if cs.is_confirmed(
+            str(active_conf_id),
+            to_address=to_address,
+            value_wei=value_wei,
+            data_hex=data_hex,
+        ):
+            confirmed = True
 
     # 2. Resolve PolicyConfig
     if config is None:
@@ -1193,24 +1273,6 @@ def check_pre_tool_call(
 
     if memory_store is not None:
         policy_cfg.memory_store = memory_store
-
-    # 3. Extract transaction parameters
-    to_address = str(
-        tool_args.get("to")
-        or tool_args.get("to_address")
-        or tool_args.get("target")
-        or tool_args.get("recipient")
-        or ""
-    ).strip()
-    value_raw = tool_args.get("value", tool_args.get("value_wei", tool_args.get("amount", 0)))
-    value_wei = _parse_wei_value(value_raw, 0)
-    data_hex = str(
-        tool_args.get("data")
-        or tool_args.get("data_hex")
-        or tool_args.get("calldata")
-        or tool_args.get("input")
-        or ""
-    ).strip()
 
     # 4. Check prompt injection on untrusted context
     engine = PolicyEngine(policy_cfg)
@@ -1336,6 +1398,14 @@ def check_pre_tool_call(
             injection_detected=True,
         )
         log_financial_action(action=tool_name, status="allowed", mode=policy_cfg.mode, target="", value_wei=value_wei, data_hex=data_hex, risk_score="high", warning=warn)
+        if active_conf_id:
+            get_default_confirmation_store().is_confirmed(
+                str(active_conf_id),
+                to_address=to_address,
+                value_wei=value_wei,
+                data_hex=data_hex,
+                consume=True,
+            )
         return res
 
     res = VerificationResult(True, "", RiskScore.LOW)
@@ -1349,7 +1419,7 @@ def verify_transaction(
     data_hex: str,
     policy_address: str | None = None,
     rpc_url: str = DEFAULT_RPC_URL,
-    from_address: str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+    from_address: str | None = None,
     whitelist: list[str] | None = None,
     config: PolicyConfig | dict | str | None = None,
     context: list[Any] | None = None,
@@ -1381,6 +1451,9 @@ def verify_transaction(
         Fails closed on any RPC, revert, trace failure, or connection error.
     """
     try:
+        # Balance-loss detection must measure the agent's wallet, not a placeholder account
+        from_address = resolve_from_address(from_address)
+
         # Resolve PolicyConfig
         if config is None:
             policy_cfg = PolicyConfig.strict(recipient_allowlist=whitelist)
@@ -1404,14 +1477,35 @@ def verify_transaction(
             policy_cfg.memory_store = memory_store
 
         # Resolve confirmation ID if provided
-        if confirmation_id and get_default_confirmation_store().is_confirmed(str(confirmation_id)):
-            confirmed = True
+        if confirmation_id:
+            cs = get_default_confirmation_store()
+            if cs.is_rejected(str(confirmation_id)):
+                return VerificationResult(
+                    False, f"SG: confirmation {confirmation_id} was rejected by operator", RiskScore.CRITICAL
+                )
+            if cs.is_confirmed(str(confirmation_id), to_address=to_address, value_wei=value_wei, data_hex=data_hex):
+                confirmed = True
 
-        # Configure active policy engine for local mock RPC and direct evaluation
+        # Configure active policy engine for direct evaluation
         engine = PolicyEngine(policy_cfg)
         if memory_store is not None:
             engine.memory_store = memory_store
-        _MockRPCHandler.active_policy_engine = engine
+
+        def _consume_confirmation_if_used() -> None:
+            """Single-use: burn the operator confirmation once the tx is actually allowed."""
+            if not confirmation_id or not confirmed:
+                return
+            try:
+                get_default_confirmation_store().is_confirmed(
+                    str(confirmation_id),
+                    to_address=to_address,
+                    value_wei=value_wei,
+                    data_hex=data_hex,
+                    consume=True,
+                )
+            except Exception:
+                # Never let bookkeeping failure flip an allow into an exception path
+                pass
 
         # Step 1: Policy check & Prompt Injection inspection
         # Direct policy check against PolicyEngine (strict, balanced, or degen)
@@ -1468,6 +1562,8 @@ def verify_transaction(
             memory_store=engine.memory_store,
             tax_warning_threshold=getattr(policy_cfg, "tax_warning_threshold", TAX_WARNING_THRESHOLD_PCT),
             tax_block_threshold=getattr(policy_cfg, "tax_block_threshold", TAX_BLOCK_THRESHOLD_PCT),
+            denylist=getattr(policy_cfg, "recipient_denylist", getattr(engine, "denylist", [])),
+            threat_feed=getattr(engine, "threat_feed", getattr(policy_cfg, "threat_feed", None)),
         )
 
         if not trace_res.allowed:
@@ -1511,6 +1607,7 @@ def verify_transaction(
                 target=to_address, value_wei=value_wei, data_hex=data_hex,
                 risk_score=risk, warning=combined_warn,
             )
+            _consume_confirmation_if_used()
             return res_obj
 
         if pre_res.injection_detected and trace_res.allowed:
@@ -1529,6 +1626,7 @@ def verify_transaction(
                 target=to_address, value_wei=value_wei, data_hex=data_hex,
                 risk_score="high", warning=res_obj.warning,
             )
+            _consume_confirmation_if_used()
             return res_obj
 
         log_financial_action(
@@ -1536,6 +1634,7 @@ def verify_transaction(
             target=to_address, value_wei=value_wei, data_hex=data_hex,
             risk_score=trace_res.risk_score, warning=trace_res.warning,
         )
+        _consume_confirmation_if_used()
         return trace_res
 
     except Exception as e:
@@ -1548,15 +1647,11 @@ def verify_transaction(
 
 def _evaluate_calldata_security(inner_data_hex: str, max_value_wei: int = DEFAULT_MAX_VALUE_WEI) -> str | None:
     """Recursively evaluate calldata against SafeGuardPolicy security rules."""
-    engine = getattr(_MockRPCHandler, "active_policy_engine", None)
-    if engine is not None:
-        return engine.evaluate_calldata_security(inner_data_hex)
     return PolicyEngine(PolicyConfig.strict(max_eth_per_tx=max_value_wei)).evaluate_calldata_security(inner_data_hex)
 
 
 class _MockRPCHandler(BaseHTTPRequestHandler):
     """Minimal standard-library JSON-RPC mock simulating SafeGuardPolicy and Anvil debug_traceCall."""
-    active_policy_engine: PolicyEngine | None = None
 
     def do_POST(self):
         try:
@@ -1595,27 +1690,12 @@ class _MockRPCHandler(BaseHTTPRequestHandler):
                     inner_len = int(data[8 + offset : 8 + offset + 64], 16) * 2
                     inner_data = data[8 + offset + 64 : 8 + offset + 64 + inner_len]
 
-                    engine = getattr(self.__class__, "active_policy_engine", None)
-                    if engine is not None:
-                        allowed, err = engine.evaluate_transaction_policy(target_addr, val_wei, inner_data, confirmed=True)
-                        if not allowed:
-                            resp = self._make_revert(req_id, err)
-                        else:
-                            resp = {"jsonrpc": "2.0", "id": req_id, "result": "0x"}
+                    engine = PolicyEngine(PolicyConfig.strict(max_eth_per_tx=DEFAULT_MAX_VALUE_WEI))
+                    allowed, err = engine.evaluate_transaction_policy(target_addr, val_wei, inner_data, confirmed=True)
+                    if not allowed:
+                        resp = self._make_revert(req_id, err)
                     else:
-                        # 1. Value cap
-                        if val_wei > DEFAULT_MAX_VALUE_WEI:
-                            resp = self._make_revert(req_id, "SG: value exceeds max per tx")
-                        # 2. Target whitelist
-                        elif target_int != 0xBEEF:
-                            resp = self._make_revert(req_id, "SG: target not whitelisted")
-                        # 3. Security evaluation
-                        else:
-                            err = _evaluate_calldata_security(inner_data, DEFAULT_MAX_VALUE_WEI)
-                            if err:
-                                resp = self._make_revert(req_id, err)
-                            else:
-                                resp = {"jsonrpc": "2.0", "id": req_id, "result": "0x"}
+                        resp = {"jsonrpc": "2.0", "id": req_id, "result": "0x"}
                 else:
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": "0x"}
 
