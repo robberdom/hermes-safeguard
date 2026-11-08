@@ -1,0 +1,12 @@
+name: hermes-safeguard
+version: "0.1.0"
+description: Policy engine + simulation guard for on-chain transactions. Supports strict / balanced / degen modes.
+author: pohtaytohpohtahtoh
+requires_hermes: ">=0.22.0"
+provides_tools:
+  - safeguard_check_policy
+  - safeguard_execute_tx
+provides_hooks:
+  - pre_tool_call
+capabilities:
+  - tools.override

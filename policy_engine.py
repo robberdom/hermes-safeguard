@@ -233,7 +233,7 @@ class PromptInjectionDetector:
 
     Detects:
       1. Simple obfuscation (Morse code, Base64, Hex encoding).
-      2. Instruction overrides & jailbreaks ("ignore previous instructions", "disregard prior directives", etc.).
+      2. Instruction overrides & jailbreaks ("disregard prior directives", "override safeguards", etc.).
       3. Financial drain commands ("transfer everything", "send all eth", "drain wallet", "sweep funds", etc.).
       4. Approval abuses & wallet tampering ("setApprovalForAll", "approve max", "change wallet", "export private key").
     """

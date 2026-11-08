@@ -56,17 +56,32 @@ Inside `def register(ctx):`:
 ```python
 ctx.register_tool(
     name="safeguard_check_policy",
-    description="Simulate and verify an onchain transaction against SafeGuard policies without signing.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "to": {"type": "string", "description": "Target address"},
-            "value": {"type": "string", "description": "ETH value in wei or ether"},
-            "data": {"type": "string", "description": "Call data hex string"}
+    toolset="hermes-safeguard",
+    schema={
+        "name": "safeguard_check_policy",
+        "description": "Simulate and verify an onchain transaction against SafeGuard policies without signing.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "Target address"},
+                "value": {"type": "string", "description": "ETH value in wei or ether"},
+                "data": {"type": "string", "description": "Call data hex string"},
+            },
+            "required": ["to"],
         },
-        "required": ["to"]
     },
-    handler=safeguard_check_policy_handler
+    handler=safeguard_check_policy_handler,
+    description="Simulate and verify an onchain transaction against SafeGuard policies without signing.",
+    override=True,
+)
+```
+
+### Slash Command Registration
+```python
+ctx.register_command(
+    name="safeguard-status",
+    handler=safeguard_status_handler,
+    description="Display current SafeGuard policy mode, limits, and RPC connectivity.",
 )
 ```
 
