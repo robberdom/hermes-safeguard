@@ -689,8 +689,11 @@ class AddressEntry:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        addr = self.address
+        if addr and not addr.startswith(("0x", "0X")):
+            addr = f"0x{addr}"
         return {
-            "address": self.address,
+            "address": addr,
             "address_type": self.address_type,
             "label": self.label,
             "source": self.source,
@@ -2289,6 +2292,32 @@ class ThreatFeed:
 
             return matches
 
+    def sync_live_threats(self) -> dict[str, Any]:
+        """
+        Synchronize with dynamic Web3 security APIs (PeckShield, ScamSniffer, SlowMist).
+        Returns summary of newly ingested threats and updated counts.
+        """
+        try:
+            from threat_stream import ThreatStreamSyncer
+            syncer = ThreatStreamSyncer(threat_feed=self)
+            return syncer.sync_once()
+        except ImportError:
+            return {"error": "threat_stream module unavailable"}
+
+    def start_live_stream(self, interval: int = 300, webhook_port: int | None = None) -> Any:
+        """
+        Start dynamic 5-minute background polling and optional webhook ingestion.
+        """
+        try:
+            from threat_stream import ThreatStreamSyncer
+            syncer = ThreatStreamSyncer(threat_feed=self, poll_interval=interval)
+            syncer.start_polling_worker()
+            if webhook_port:
+                syncer.start_webhook_server(port=webhook_port)
+            return syncer
+        except ImportError:
+            return None
+
 
 _DEFAULT_THREAT_FEED: ThreatFeed | None = None
 
@@ -2906,7 +2935,11 @@ class PolicyEngine:
       4. Calldata inspection (unbounded approvals, smuggled multicall drainers, slippage protection).
     """
 
-    def __init__(self, config: PolicyConfig | dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        config: PolicyConfig | dict[str, Any] | None = None,
+        threat_feed: ThreatFeed | None = None,
+    ) -> None:
         if config is None:
             self.config = PolicyConfig.strict()
         elif isinstance(config, dict):
@@ -2936,7 +2969,9 @@ class PolicyEngine:
             self.memory_store = get_default_memory_store()
 
         # Initialize Threat Feed / Security Blocklist
-        if getattr(self.config, "threat_feed", None) is not None:
+        if threat_feed is not None:
+            self.threat_feed = threat_feed
+        elif getattr(self.config, "threat_feed", None) is not None:
             self.threat_feed = self.config.threat_feed
         elif getattr(self.config, "blocklist_path", None):
             self.threat_feed = ThreatFeed(self.config.blocklist_path)

@@ -48,6 +48,7 @@ logger = logging.getLogger("LiveBlockchainAgent")
 
 PUBLIC_ETH_RPCS = [
     os.getenv("SAFEGUARD_RPC_URL", "").strip(),
+    os.getenv("ETH_RPC_URL", "").strip(),
     os.getenv("RPC_URL", "").strip(),
     "https://ethereum-rpc.publicnode.com",
     "https://1rpc.io/eth",
@@ -56,11 +57,21 @@ PUBLIC_ETH_RPCS = [
     "http://127.0.0.1:8545",
 ]
 
+PUBLIC_BASE_RPCS = [
+    os.getenv("SAFEGUARD_BASE_RPC_URL", "").strip(),
+    os.getenv("BASE_RPC_URL", "").strip(),
+    "https://mainnet.base.org",
+    "https://base-rpc.publicnode.com",
+    "https://1rpc.io/base",
+    "https://base.drpc.org",
+]
 
-def resolve_active_rpc() -> str:
-    """Find the first responsive Ethereum JSON-RPC endpoint."""
+
+def resolve_active_rpc(network: str = "eth") -> str:
+    """Find the first responsive Ethereum or Base JSON-RPC endpoint."""
     headers = {"Content-Type": "application/json", "User-Agent": "HermesSafeGuard/1.0"}
-    for url in PUBLIC_ETH_RPCS:
+    rpc_list = PUBLIC_BASE_RPCS if network.lower() == "base" else PUBLIC_ETH_RPCS
+    for url in rpc_list:
         if not url:
             continue
         try:
@@ -79,6 +90,20 @@ def resolve_active_rpc() -> str:
     # Fallback to local RPC daemon
     ensure_test_rpc_server("127.0.0.1", 8545)
     return "http://127.0.0.1:8545"
+
+
+def resolve_active_sender_address(rpc_url: str) -> str:
+    """Resolve an account with valid balance for execution simulation."""
+    custom = os.getenv("SAFEGUARD_WALLET_ADDRESS", "").strip() or os.getenv("SAFEGUARD_FROM_ADDRESS", "").strip()
+    if custom:
+        return custom
+    if "base" in rpc_url.lower():
+        return "0x3304E22DDaa22bCdC5fCa2269b418046aE7b566A"
+    elif "127.0.0.1" in rpc_url or "localhost" in rpc_url:
+        return "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+    else:
+        # Default to Vitalik's address on Ethereum mainnet (funded, allowing simulation)
+        return "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 
 def fetch_live_blockchain_state(rpc_url: str) -> Dict[str, Any]:
@@ -117,6 +142,35 @@ def fetch_live_blockchain_state(rpc_url: str) -> Dict[str, Any]:
     }
 
 
+def fetch_live_base_state(base_rpc_url: str) -> Dict[str, Any]:
+    """Read live state directly from the Base blockchain (Chain ID 8453)."""
+    def call(method, params):
+        req = urllib.request.Request(
+            base_rpc_url,
+            data=json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "HermesSafeGuard/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            return json.loads(resp.read().decode("utf-8")).get("result")
+
+    block_hex = call("eth_blockNumber", [])
+    block_num = int(block_hex, 16) if block_hex and block_hex != "0x" else 0
+
+    # Base Uniswap SwapRouter02
+    base_uniswap = "0x2626664c2603336E57B271c5C0b26F421741e481"
+    base_router_code = call("eth_getCode", [base_uniswap, "latest"]) or "0x"
+
+    # Base Aerodrome Slipstream Router
+    aerodrome_slipstream = "0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5"
+    aero_code = call("eth_getCode", [aerodrome_slipstream, "latest"]) or "0x"
+
+    return {
+        "block_number": block_num,
+        "base_uniswap_code_bytes": (len(base_router_code) - 2) // 2 if len(base_router_code) > 2 else 0,
+        "aerodrome_code_bytes": (len(aero_code) - 2) // 2 if len(aero_code) > 2 else 0,
+    }
+
+
 def run_live_agent():
     load_dotenv()
     reset_default_confirmation_store()
@@ -125,19 +179,43 @@ def run_live_agent():
     print("      HERMES SAFEGUARD — LIVE BLOCKCHAIN & AUTONOMOUS AGENT VERIFIER     ")
     print("=" * 72)
 
-    rpc_url = resolve_active_rpc()
-    os.environ["SAFEGUARD_RPC_URL"] = rpc_url
-    print(f"🔗 Connected JSON-RPC Endpoint: {rpc_url}")
+    # Check command-line argument for network override
+    selected_network = "eth"
+    for arg in sys.argv[1:]:
+        if arg.lower() in ("base", "--base", "-b"):
+            selected_network = "base"
+            break
+        elif arg.lower() in ("eth", "--eth", "ethereum"):
+            selected_network = "eth"
+            break
+        elif arg.lower() in ("anvil", "local"):
+            selected_network = "local"
+            break
 
-    # Query live state from blockchain
+    rpc_url = resolve_active_rpc(network=selected_network)
+    os.environ["SAFEGUARD_RPC_URL"] = rpc_url
+    print(f"🔗 Connected JSON-RPC Endpoint ({selected_network.upper()}): {rpc_url}")
+
+    # Query live state from Ethereum blockchain
     try:
-        state = fetch_live_blockchain_state(rpc_url)
+        state = fetch_live_blockchain_state(rpc_url if selected_network != "base" else resolve_active_rpc("eth"))
         print(f"📦 Live Ethereum Block Height: #{state['block_number']:,}")
         print(f"👤 Live State vitalik.eth Balance: {state['vitalik_eth']:.2f} ETH")
         print(f"🏛️ Uniswap V2 Router Bytecode Size: {state['uniswap_router_code_bytes']} bytes (Verified Smart Contract)")
         print(f"🚨 Inferno Drainer Bytecode: {state['drainer_code_bytes']} bytes (Known Phishing Exploit)")
     except Exception as e:
-        print(f"⚠️ Live state read exception: {e}")
+        print(f"⚠️ Live Ethereum state read exception: {e}")
+
+    # Query live state from Base blockchain
+    try:
+        base_rpc = rpc_url if selected_network == "base" else resolve_active_rpc("base")
+        base_state = fetch_live_base_state(base_rpc)
+        if base_state.get("block_number"):
+            print(f"🔵 Live Base Block Height: #{base_state['block_number']:,} (Chain ID 8453)")
+            print(f"🥞 Base Uniswap SwapRouter02: {base_state['base_uniswap_code_bytes']} bytes (Verified Smart Contract)")
+            print(f"✈️ Aerodrome Slipstream Router: {base_state['aerodrome_code_bytes']} bytes (Verified Base DEX)")
+    except Exception as e:
+        logger.debug("Live Base state read exception: %s", e)
 
     chat_id = get_operator_chat_id()
     if chat_id:
@@ -146,18 +224,22 @@ def run_live_agent():
         print("ℹ️ Telegram pairing: None. Type /safeguard-connect-tg in Hermes to pair your phone.")
     print("=" * 72 + "\n")
 
+    # Resolve active sender wallet with valid balance on target chain
+    active_from = resolve_active_sender_address(rpc_url)
+
     # --------------------------------------------------------------------------
     # 1. AUTONOMOUS EXECUTION (Routine Safe Transaction)
     # --------------------------------------------------------------------------
     print("━" * 72)
     print("1️⃣ AUTONOMOUS OPERATION: Safe Everyday Transaction")
     print("━" * 72)
-    print("Agent Action: Transferring 0.05 ETH to safe treasury target...")
+    print(f"Agent Action: Transferring 0.05 ETH from {active_from[:10]}... to safe treasury target...")
 
     t0 = time.time()
     res_auto = safeguard.on_pre_tool_call(
         "transfer",
         {
+            "from": active_from,
             "to": DEFAULT_ALLOWED_TARGET,
             "value": "0.05 ether",
         },
@@ -245,7 +327,7 @@ def run_live_agent():
 
     res_hitl = safeguard.on_pre_tool_call(
         "transfer",
-        {"to": attacker_target, "value": f"{tx_val_eth} ether"},
+        {"from": active_from, "to": attacker_target, "value": f"{tx_val_eth} ether"},
         context=untrusted_context,
     )
 
@@ -279,7 +361,7 @@ def run_live_agent():
             print("Agent retrying transaction with confirmation_id...")
             retry = safeguard.on_pre_tool_call(
                 "transfer",
-                {"to": attacker_target, "value": f"{tx_val_eth} ether", "confirmation_id": conf_id},
+                {"from": active_from, "to": attacker_target, "value": f"{tx_val_eth} ether", "confirmation_id": conf_id},
                 context=untrusted_context,
             )
             print(f"Retry Decision: {retry.get('action', '').upper()} (Allowed: {retry.get('allowed')})")

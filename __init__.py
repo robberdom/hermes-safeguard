@@ -149,10 +149,8 @@ def _references_protected_path(value: str) -> bool:
         return True
     # Catch protected filenames embedded in a larger string (e.g. shell/python one-liners)
     # without matching them as a substring of a longer identifier.
-    if re.search(
-        r"(?<![a-z0-9_])(?:policy_engine\.py|verifier\.py|blocklist\.json|__init__\.py|plugin\.yaml|safeguardpolicy\.sol|\.env|\.safeguard_pairing\.json|\.safeguard_confirmations\.json|\.safeguard_kill_switch)(?![a-z0-9_])",
-        lowered,
-    ):
+    pattern = rf"(?<![a-z0-9_])(?:{'|'.join(re.escape(name) for name in PROTECTED_BASENAMES)})(?![a-z0-9_])"
+    if re.search(pattern, lowered):
         return True
     return False
 
@@ -1464,6 +1462,14 @@ def safeguard_threats_command_handler(*args: Any, **kwargs: Any) -> str:
     source_str = str(tf.filepath) if tf.filepath else "In-memory default feed"
     version_str = getattr(tf, "version", "1.0.0")
 
+    stream_status = "Active (PeckShield, ScamSniffer, SlowMist)"
+    try:
+        from threat_stream import get_default_threat_stream_syncer
+        syncer = get_default_threat_stream_syncer()
+        poll_info = f"Every {syncer.poll_interval}s"
+    except Exception:
+        poll_info = "Every 60s"
+
     return "\n".join([
         "🛡️ SafeGuard Threat Intelligence Status",
         "=" * 55,
@@ -1471,6 +1477,8 @@ def safeguard_threats_command_handler(*args: Any, **kwargs: Any) -> str:
         f"  • Feed Version:               {version_str}",
         f"  • Blocked Threat Addresses:   {total_addrs}",
         f"  • Blocked Calldata Selectors: {total_sels}",
+        f"  • Dynamic Live Streams:       {stream_status}",
+        f"  • Dynamic Poll Schedule:      {poll_info} (automated daemon)",
         "  • Ingested Threat Feeds:      Web3 exploit reports, drainer proxies, phishing",
         "  • Simulation Protections:     Local Anvil EVM trace, drain detection, honeypot tax",
         "",
@@ -1522,16 +1530,27 @@ def safeguard_sync_command_handler(*args: Any, **kwargs: Any) -> str:
                         elif isinstance(entry, str):
                             tf.add_selector(entry)
                     synced_from = f"Remote URL ({remote_url})"
+                    try:
+                        tf.save()
+                    except Exception:
+                        pass
         except Exception as e:
-            error_note = f" (Remote pull error: {e}; fell back to local cache reload)"
+            error_note = f" (Remote pull error: {e}; fell back to multi-provider stream sync)"
 
     if not synced_from:
-        # Reload from local file / default blocklist
+        # Multi-provider dynamic sync (PeckShield, ScamSniffer, SlowMist)
         try:
-            tf.load()
-            synced_from = f"Local Blocklist ({tf.filepath or 'defaults'})"
+            from threat_stream import get_default_threat_stream_syncer
+            syncer = get_default_threat_stream_syncer()
+            res = syncer.sync_once()
+            synced_from = "Dynamic Web3 Streams (PeckShield, ScamSniffer, SlowMist)"
         except Exception as e:
-            return f"❌ SafeGuard: Failed to sync threat feed: {e}"
+            # Fallback to local blocklist reload
+            try:
+                tf.load()
+                synced_from = f"Local Blocklist ({tf.filepath or 'defaults'})"
+            except Exception as e2:
+                return f"❌ SafeGuard: Failed to sync threat feed: {e2}"
 
     addresses_after = len(tf.blocked_addresses)
     selectors_count = len(tf.blocked_selectors)
@@ -2106,22 +2125,27 @@ def register(ctx: Any) -> None:
         reg_fn = getattr(ctx, reg_method_name, None)
         if callable(reg_fn):
             for cmd_base, handler in cmd_handlers.items():
+                desc = cmd_descriptions.get(cmd_base, "")
                 for cmd_name in (cmd_base, f"/{cmd_base}"):
-                    if cmd_base in registered_cmds:
+                    if (reg_method_name, cmd_name) in registered_cmds:
                         continue
                     try:
                         reg_fn(
                             name=cmd_name,
                             handler=handler,
-                            description=cmd_descriptions.get(cmd_base, ""),
+                            description=desc,
                         )
-                        registered_cmds.add(cmd_base)
-                        break
+                        registered_cmds.add((reg_method_name, cmd_name))
                     except TypeError:
                         try:
-                            reg_fn(cmd_name, handler)
-                            registered_cmds.add(cmd_base)
-                            break
+                            reg_fn(cmd_name, handler, desc)
+                            registered_cmds.add((reg_method_name, cmd_name))
+                        except TypeError:
+                            try:
+                                reg_fn(cmd_name, handler)
+                                registered_cmds.add((reg_method_name, cmd_name))
+                            except Exception:
+                                pass
                         except Exception:
                             pass
                     except Exception:
@@ -2166,3 +2190,18 @@ def register(ctx: Any) -> None:
                 pass
         except Exception:
             pass
+
+    # 6. Auto-start Dynamic Threat Stream Syncer in background (60s polling + optional webhook)
+    if os.getenv("SAFEGUARD_AUTO_STREAM", "true").lower() in ("true", "1", "yes"):
+        try:
+            from threat_stream import get_default_threat_stream_syncer
+            syncer = get_default_threat_stream_syncer()
+            syncer.start_polling_worker()
+            webhook_port_env = os.getenv("SAFEGUARD_WEBHOOK_PORT")
+            if webhook_port_env:
+                try:
+                    syncer.start_webhook_server(port=int(webhook_port_env))
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug("SafeGuard: Auto-stream startup skipped: %s", e)

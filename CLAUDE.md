@@ -369,8 +369,8 @@ SafeGuard registers interactive slash commands directly into Hermes Agent (`ctx.
 ## 9. Known Limitations & Next Priorities
 
 ### 1. Live Threat Feed Integration
-- **Current State**: Static local `blocklist.json` with manual updates and agent query tool (`safeguard_search_threat_reports`).
-- **Next Priority**: Background cron worker and webhook ingestion service synchronizing real-time malicious addresses and exploit reports directly from Web3 security APIs (SlowMist, ScamSniffer, PeckShield, Chainabuse) and live security alert monitoring.
+- **Status in v1**: **Implemented & Active**. Continuous background polling service and webhook receiver (`threat_stream.py`) polling every 5 minutes from Web3 security APIs (PeckShield, ScamSniffer, SlowMist).
+- **Next Priority**: Enterprise signed feeds (EIP-712 cryptographic proofs for feed integrity).
 
 ### 2. Full Hermes Hook & Runtime Integration
 - **Current State**: Core policy verification, hook simulation logic (`check_pre_tool_call`), and standalone CLI/Python APIs are fully tested.
