@@ -9,9 +9,25 @@ provides_tools:
 provides_hooks:
   - pre_tool_call
 provides_commands:
+  - safeguard-help
   - safeguard-status
   - safeguard-mode
+  - safeguard-strict
+  - safeguard-balanced
+  - safeguard-degen
+  - safeguard-pending
   - safeguard-confirm
   - safeguard-reject
+  - safeguard-whitelist
+  - safeguard-allow
+  - safeguard-revoke
+  - safeguard-check
+  - safeguard-threats
+  - safeguard-sync
+  - safeguard-test-alert
+  - safeguard-panic
+  - safeguard-resume
+  - safeguard-audit
+  - safegaurd-mode
 capabilities:
   - tools.override

@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import urllib.request
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -30,9 +31,19 @@ from policy_engine import (
     RiskScore,
     VerificationResult,
     _parse_wei_value,
+    get_default_audit_logger,
+    get_default_confirmation_store,
+    get_default_memory_store,
+    get_default_threat_feed,
     is_financial_tool,
     log_financial_action,
+    normalize_address,
+    safeguard_approve_address,
     safeguard_confirm_action,
+    safeguard_get_audit_log,
+    safeguard_list_approved_addresses,
+    safeguard_list_pending_confirmations,
+    safeguard_revoke_address,
 )
 from verifier import (
     DEFAULT_RPC_URL,
@@ -78,6 +89,28 @@ _COMMAND_VERBS: frozenset[str] = frozenset({
     "bash", "shell", "sh", "zsh", "cmd", "powershell", "terminal",
     "exec", "eval", "python", "python3", "perl", "ruby", "node", "subprocess",
 })
+
+# Emergency Kill-Switch State
+_KILL_SWITCH_ACTIVE: bool = False
+
+
+def is_kill_switch_active() -> bool:
+    """True if operator has engaged emergency panic lockdown."""
+    global _KILL_SWITCH_ACTIVE
+    if _KILL_SWITCH_ACTIVE:
+        return True
+    return os.getenv("SAFEGUARD_KILL_SWITCH", "").strip().lower() in ("true", "1", "yes", "active")
+
+
+def set_kill_switch(active: bool) -> None:
+    """Engage or release the emergency kill-switch."""
+    global _KILL_SWITCH_ACTIVE
+    _KILL_SWITCH_ACTIVE = active
+    if active:
+        os.environ["SAFEGUARD_KILL_SWITCH"] = "true"
+    else:
+        if "SAFEGUARD_KILL_SWITCH" in os.environ:
+            del os.environ["SAFEGUARD_KILL_SWITCH"]
 
 
 def _iter_strings(obj: Any, depth: int = 0):
@@ -386,6 +419,23 @@ def safeguard_check_policy_handler(*args: Any, **kwargs: Any) -> str:
     config, resolved_mode = _get_policy_config()
     rpc_url = os.getenv("SAFEGUARD_RPC_URL", os.getenv("RPC_URL", DEFAULT_RPC_URL))
 
+    if is_kill_switch_active():
+        panic_msg = "SafeGuard Panic: Emergency kill-switch is ACTIVE. All onchain transactions are halted."
+        log_financial_action(
+            action="safeguard_check_policy", status="blocked", mode=resolved_mode,
+            target=to_addr or "emergency_kill_switch", value_wei=_parse_wei_value(val_raw, 0),
+            data_hex=data_raw, risk_score="critical", reason=panic_msg
+        )
+        return json.dumps({
+            "status": "blocked",
+            "executed": False,
+            "allowed": False,
+            "reason": panic_msg,
+            "risk_score": "critical",
+            "warning": None,
+            "mode": resolved_mode,
+        })
+
     if not to_addr:
         return json.dumps({
             "allowed": False,
@@ -454,6 +504,23 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
     data_raw = str(call_args.get("data") or call_args.get("data_hex") or "0x").strip()
     config, resolved_mode = _get_policy_config()
     rpc_url = os.getenv("SAFEGUARD_RPC_URL", os.getenv("RPC_URL", DEFAULT_RPC_URL))
+
+    if is_kill_switch_active():
+        panic_msg = "SafeGuard Panic: Emergency kill-switch is ACTIVE. All onchain transactions are halted."
+        log_financial_action(
+            action="safeguard_execute_tx", status="blocked", mode=resolved_mode,
+            target=to_addr or "emergency_kill_switch", value_wei=_parse_wei_value(val_raw, 0),
+            data_hex=data_raw, risk_score="critical", reason=panic_msg
+        )
+        return json.dumps({
+            "status": "blocked",
+            "executed": False,
+            "allowed": False,
+            "reason": panic_msg,
+            "risk_score": "critical",
+            "warning": None,
+            "mode": resolved_mode,
+        })
 
     if not to_addr:
         return json.dumps({
@@ -613,6 +680,23 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
                 risk_score="critical", reason=err_msg
             )
             print(f"SafeGuard [{mode.upper()}]: Intercepted '{tool_name}' -> BLOCKED: Policy tampering attempt")
+            return {
+                "action": "block",
+                "message": err_msg,
+                "reason": err_msg,
+                "risk_score": "critical",
+                "mode": mode,
+            }
+
+        # Emergency Kill-Switch: If active, hard-block ALL financial operations immediately
+        if is_kill_switch_active() and _is_financial_tool_call(tool_name, tool_args):
+            err_msg = "SafeGuard Panic: Emergency kill-switch is ACTIVE. All onchain transactions and financial operations are halted."
+            log_financial_action(
+                action=tool_name, status="blocked", mode=mode,
+                target="emergency_kill_switch", value_wei=0, data_hex="",
+                risk_score="critical", reason=err_msg
+            )
+            print(f"SafeGuard [PANIC]: Intercepted '{tool_name}' -> BLOCKED: Emergency kill-switch active")
             return {
                 "action": "block",
                 "message": err_msg,
@@ -786,6 +870,137 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
 
 
 # ==============================================================================
+# Helper: Slash Command Argument Parser
+# ==============================================================================
+
+def _parse_command_args(*args: Any, **kwargs: Any) -> str:
+    """
+    Extract raw argument string across diverse Hermes slash command dispatch signatures.
+    Handles:
+      - handler("degen")
+      - handler(ctx, "degen")
+      - handler({"args": "degen"})
+      - handler(raw_args="degen")
+    """
+    if args:
+        if len(args) >= 2 and isinstance(args[1], str):
+            return args[1].strip()
+        if isinstance(args[0], str):
+            return args[0].strip()
+        if isinstance(args[0], dict):
+            for k in ("args", "raw_args", "mode", "id", "address", "target", "text"):
+                val = args[0].get(k)
+                if val is not None:
+                    return str(val).strip()
+    for k in ("args", "raw_args", "mode", "id", "address", "target", "text"):
+        val = kwargs.get(k)
+        if val is not None:
+            return str(val).strip()
+    return ""
+
+
+# ==============================================================================
+# Slash Command: /safeguard-mode, /safeguard-strict, /safeguard-balanced, /safeguard-degen
+# ==============================================================================
+
+def safeguard_mode_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    Switch or cycle SafeGuard policy mode between strict, balanced, and degen.
+    - If no argument is given (or 'next'/'cycle'/'toggle'): cycles strict -> balanced -> degen -> strict.
+    - If a mode name is given ('strict', 'balanced', 'degen' or '1', '2', '3'): switches directly.
+    """
+    raw_arg = _parse_command_args(*args, **kwargs).strip().lower()
+
+    current_mode = os.getenv("SAFEGUARD_MODE", "balanced").strip().lower()
+    if current_mode not in ("strict", "balanced", "degen"):
+        current_mode = "balanced"
+
+    mode_cycle = ["strict", "balanced", "degen"]
+    number_map = {"1": "strict", "2": "balanced", "3": "degen"}
+
+    target_mode = None
+    if raw_arg in number_map:
+        target_mode = number_map[raw_arg]
+    else:
+        # Check if any recognized token appears in the argument text
+        tokens = [t for t in raw_arg.split() if t in ("strict", "balanced", "degen")]
+        if tokens:
+            target_mode = tokens[-1]
+
+    if target_mode:
+        action_verb = "Switched to" if target_mode != current_mode else "Already active:"
+    elif raw_arg in ("", "next", "cycle", "toggle", "switch"):
+        # Cycle to next mode
+        curr_idx = mode_cycle.index(current_mode)
+        target_mode = mode_cycle[(curr_idx + 1) % len(mode_cycle)]
+        action_verb = f"Cycled from {current_mode.upper()} ➔"
+    else:
+        return (
+            f"⚠️ Unknown mode: '{raw_arg}'.\n"
+            f"Current active mode: {current_mode.upper()}\n"
+            f"Valid modes: strict (1), balanced (2), degen (3)\n\n"
+            f"Usage:\n"
+            f"  /safeguard-mode              - Cycle to next mode\n"
+            f"  /safeguard-mode <mode>       - Switch directly (strict, balanced, degen)\n"
+            f"  /safeguard-strict            - Shortcut for strict mode\n"
+            f"  /safeguard-balanced          - Shortcut for balanced mode\n"
+            f"  /safeguard-degen             - Shortcut for degen mode"
+        )
+
+    # Set active mode in environment
+    os.environ["SAFEGUARD_MODE"] = target_mode
+    if "SAFEGUARD_POLICY_PATH" in os.environ:
+        del os.environ["SAFEGUARD_POLICY_PATH"]
+
+    config, resolved_mode = _get_policy_config()
+    max_eth_val = getattr(config, "max_eth_per_tx", 0)
+    max_eth_disp = f"{max_eth_val / 10**18:.2f} ETH" if max_eth_val else "Unlimited"
+    unlimited_app = "Allowed" if getattr(config, "allow_unlimited_approve", False) else "Blocked"
+    zero_slip = "Blocked" if getattr(config, "block_zero_slippage", True) else "Allowed (with warning)"
+
+    next_idx = (mode_cycle.index(target_mode) + 1) % len(mode_cycle)
+    next_mode_name = mode_cycle[next_idx]
+
+    lines = [
+        f"🛡️ SafeGuard Policy: {action_verb} {target_mode.upper()}",
+        "=" * 50,
+        f"Active Mode: {target_mode.upper()}",
+        f"  • Max ETH per Tx:          {max_eth_disp}",
+        f"  • Unlimited Approvals:     {unlimited_app}",
+        f"  • Zero-Slippage DEX Swaps: {zero_slip}",
+        f"  • Threat Blocklist:        Enforced across all modes",
+    ]
+    if target_mode == "strict":
+        lines.append("  • Unknown Recipients:      Requires operator confirmation (standing trust granted upon confirm)")
+    elif target_mode == "balanced":
+        lines.append("  • Unknown Recipients:      Permitted with EVM simulation & trace inspection")
+    else:
+        lines.append("  • High Token Tax:          Honeypots (>50% tax) blocked; degen tokens (<=50%) permitted with warning")
+
+    lines.extend([
+        "=" * 50,
+        f"💡 Tip: Run /safeguard-mode to cycle to {next_mode_name.upper()} mode,",
+        f"   or use shortcuts: /safeguard-strict, /safeguard-balanced, /safeguard-degen",
+    ])
+    return "\n".join(lines)
+
+
+def safeguard_strict_command_handler(*args: Any, **kwargs: Any) -> str:
+    """Operator shortcut: switch SafeGuard to strict mode."""
+    return safeguard_mode_command_handler("strict")
+
+
+def safeguard_balanced_command_handler(*args: Any, **kwargs: Any) -> str:
+    """Operator shortcut: switch SafeGuard to balanced mode."""
+    return safeguard_mode_command_handler("balanced")
+
+
+def safeguard_degen_command_handler(*args: Any, **kwargs: Any) -> str:
+    """Operator shortcut: switch SafeGuard to degen mode."""
+    return safeguard_mode_command_handler("degen")
+
+
+# ==============================================================================
 # Slash Command: /safeguard-status
 # ==============================================================================
 
@@ -796,20 +1011,15 @@ def safeguard_status_handler(*args: Any, **kwargs: Any) -> str:
     is supplied (e.g., /safeguard-status degen or /safeguard-mode strict).
     """
     # Check for requested mode change
-    arg_text = ""
-    if args:
-        if isinstance(args[0], str):
-            arg_text = args[0].strip().lower()
-        elif isinstance(args[0], dict):
-            arg_text = str(args[0].get("mode") or args[0].get("args") or "").strip().lower()
-    if not arg_text and kwargs:
-        arg_text = str(kwargs.get("mode") or kwargs.get("args") or kwargs.get("raw_args") or "").strip().lower()
+    arg_text = _parse_command_args(*args, **kwargs).lower()
 
     mode_switched = False
     tokens = [t for t in arg_text.split() if t in ("strict", "balanced", "degen")]
     if tokens:
         target_mode = tokens[-1]
         os.environ["SAFEGUARD_MODE"] = target_mode
+        if "SAFEGUARD_POLICY_PATH" in os.environ:
+            del os.environ["SAFEGUARD_POLICY_PATH"]
         mode_switched = True
 
     config, mode = _get_policy_config()
@@ -836,6 +1046,10 @@ def safeguard_status_handler(*args: Any, **kwargs: Any) -> str:
     status_lines = [
         "================ SafeGuard Status ================",
         mode_header,
+    ]
+    if is_kill_switch_active():
+        status_lines.append("⚠️  EMERGENCY KILL-SWITCH: ACTIVE (All Transactions Halted)")
+    status_lines.extend([
         "Policy Limits:",
         f"  - Max ETH per Tx: {max_eth_display}",
         f"  - Unlimited Approvals Allowed: {unlimited_approve}",
@@ -843,9 +1057,47 @@ def safeguard_status_handler(*args: Any, **kwargs: Any) -> str:
         f"  - EVM Trace Simulation Required: {simulation_required}",
         f"Anvil/RPC Connectivity: {conn_str}",
         "Toggle mode: /safeguard-mode <strict|balanced|degen>",
+        "Commands: /safeguard-help for full slash commands reference",
         "==================================================",
-    ]
+    ])
     return "\n".join(status_lines)
+
+
+# ==============================================================================
+# Slash Command: /safeguard-pending, /safeguard-confirm, /safeguard-reject
+# ==============================================================================
+
+def safeguard_pending_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    List all pending transactions currently awaiting human operator confirmation.
+    Usage: /safeguard-pending
+    """
+    pending = safeguard_list_pending_confirmations()
+    if not pending:
+        return "✅ SafeGuard: No pending transactions awaiting confirmation. All clear!"
+
+    lines = [
+        f"⏳ Pending SafeGuard Confirmations ({len(pending)} item(s)):",
+        "=" * 55,
+    ]
+    for idx, item in enumerate(pending, 1):
+        cid = item.get("id", "unknown")
+        target = item.get("to_address") or item.get("target", "N/A")
+        val_eth = item.get("value_eth", 0.0)
+        risk = str(item.get("risk_score", "medium")).upper()
+        reason = item.get("reason", "No reason specified")
+        action = item.get("action", "transaction")
+        lines.extend([
+            f"[{idx}] ID: {cid}",
+            f"    Action: {action} | Risk: {risk}",
+            f"    Target: {target}",
+            f"    Value:  {val_eth:.4f} ETH",
+            f"    Reason: {reason}",
+            f"    Approve: /safeguard-confirm {cid}",
+            f"    Reject:  /safeguard-reject {cid}",
+            "-" * 55,
+        ])
+    return "\n".join(lines)
 
 
 def safeguard_confirm_command_handler(*args: Any, **kwargs: Any) -> str:
@@ -853,49 +1105,520 @@ def safeguard_confirm_command_handler(*args: Any, **kwargs: Any) -> str:
     Operator slash command to approve a held action by its confirmation_id.
     Usage: /safeguard-confirm <confirmation_id>
     """
-    arg_text = ""
-    if args:
-        if isinstance(args[0], str):
-            arg_text = args[0].strip()
-        elif isinstance(args[0], dict):
-            arg_text = str(args[0].get("id") or args[0].get("args") or "").strip()
-    if not arg_text and kwargs:
-        arg_text = str(kwargs.get("id") or kwargs.get("args") or kwargs.get("raw_args") or "").strip()
-
+    arg_text = _parse_command_args(*args, **kwargs)
     tokens = arg_text.split()
     conf_id = tokens[0] if tokens else ""
     if not conf_id:
-        return "Usage: /safeguard-confirm <confirmation_id>"
+        return (
+            "Usage: /safeguard-confirm <confirmation_id>\n"
+            "Tip: Run /safeguard-pending to view pending confirmation requests."
+        )
 
     result = safeguard_confirm_action(confirmation_id=conf_id, approved=True)
     if result.get("status") == "confirmed":
-        return f"SafeGuard: Action {conf_id} has been CONFIRMED by operator."
-    return f"SafeGuard: Failed to confirm {conf_id}: {result.get('message', 'Unknown error')}"
+        return f"✅ SafeGuard: Action {conf_id} has been CONFIRMED by operator."
+    return f"❌ SafeGuard: Failed to confirm {conf_id}: {result.get('message', 'Unknown error')}"
 
 
 def safeguard_reject_command_handler(*args: Any, **kwargs: Any) -> str:
     """
     Operator slash command to reject a held action by its confirmation_id.
-    Usage: /safeguard-reject <confirmation_id>
+    Usage: /safeguard-reject <confirmation_id> [reason]
     """
-    arg_text = ""
-    if args:
-        if isinstance(args[0], str):
-            arg_text = args[0].strip()
-        elif isinstance(args[0], dict):
-            arg_text = str(args[0].get("id") or args[0].get("args") or "").strip()
-    if not arg_text and kwargs:
-        arg_text = str(kwargs.get("id") or kwargs.get("args") or kwargs.get("raw_args") or "").strip()
-
+    arg_text = _parse_command_args(*args, **kwargs)
     tokens = arg_text.split()
     conf_id = tokens[0] if tokens else ""
     if not conf_id:
-        return "Usage: /safeguard-reject <confirmation_id>"
+        return (
+            "Usage: /safeguard-reject <confirmation_id>\n"
+            "Tip: Run /safeguard-pending to view pending confirmation requests."
+        )
 
     result = safeguard_confirm_action(confirmation_id=conf_id, approved=False)
     if result.get("status") == "rejected":
-        return f"SafeGuard: Action {conf_id} has been REJECTED by operator."
-    return f"SafeGuard: Failed to reject {conf_id}: {result.get('message', 'Unknown error')}"
+        return f"🚫 SafeGuard: Action {conf_id} has been REJECTED by operator."
+    return f"❌ SafeGuard: Failed to reject {conf_id}: {result.get('message', 'Unknown error')}"
+
+
+# ==============================================================================
+# Slash Command: /safeguard-whitelist, /safeguard-allow, /safeguard-revoke
+# ==============================================================================
+
+def safeguard_whitelist_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    List all pre-approved / trusted addresses in SafeGuard memory store.
+    Usage: /safeguard-whitelist (alias: /safeguard-contacts)
+    """
+    addrs = safeguard_list_approved_addresses()
+    if not addrs:
+        return (
+            "ℹ️ SafeGuard Memory Store: No pre-approved addresses.\n"
+            "Pre-approve a trusted recipient using: /safeguard-allow <address> [label]"
+        )
+
+    lines = [
+        f"📋 SafeGuard Approved Addresses ({len(addrs)} entry/entries):",
+        "=" * 55,
+    ]
+    for idx, entry in enumerate(addrs, 1):
+        addr = entry.get("address", "")
+        label = entry.get("label") or "(unlabeled)"
+        atype = entry.get("type", "recipient")
+        source = entry.get("source", "manual")
+        lines.append(f"[{idx}] {addr} | {label} [{atype}] (via {source})")
+    lines.extend([
+        "=" * 55,
+        "Commands: /safeguard-allow <addr> [label] | /safeguard-revoke <addr>",
+    ])
+    return "\n".join(lines)
+
+
+def safeguard_allow_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    Pre-approve a trusted recipient or contract address into SafeGuard memory.
+    Usage: /safeguard-allow <address> [label]
+    """
+    raw = _parse_command_args(*args, **kwargs)
+    tokens = raw.split(maxsplit=1)
+    if not tokens:
+        return (
+            "Usage: /safeguard-allow <address> [label]\n"
+            "Example: /safeguard-allow 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045 Vitalik Treasury"
+        )
+
+    addr = tokens[0]
+    label = tokens[1] if len(tokens) > 1 else "Operator Approved"
+
+    try:
+        res = safeguard_approve_address(address=addr, label=label)
+        return (
+            f"✅ SafeGuard: Pre-approved address {res['address']}\n"
+            f"Label: {res.get('label')}\n"
+            f"Standing trust recorded. In strict mode, transactions to this address will not require confirmation."
+        )
+    except Exception as e:
+        return f"❌ SafeGuard: Failed to approve address: {e}"
+
+
+def safeguard_revoke_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    Revoke approval for an address in SafeGuard memory store.
+    Usage: /safeguard-revoke <address>
+    """
+    raw = _parse_command_args(*args, **kwargs)
+    tokens = raw.split()
+    if not tokens:
+        return "Usage: /safeguard-revoke <address>"
+
+    addr = tokens[0]
+    try:
+        removed = safeguard_revoke_address(address=addr)
+        if removed:
+            return f"✅ SafeGuard: Revoked approval for {addr}."
+        return f"ℹ️ Address {addr} was not found in approved memory store."
+    except Exception as e:
+        return f"❌ SafeGuard: Error revoking address: {e}"
+
+
+# ==============================================================================
+# Slash Command: /safeguard-check, /safeguard-threats
+# ==============================================================================
+
+def safeguard_check_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    Inspect an address against threat feeds, known drainers, and memory store.
+    Usage: /safeguard-check <address>
+    """
+    raw = _parse_command_args(*args, **kwargs)
+    tokens = raw.split()
+    if not tokens:
+        return "Usage: /safeguard-check <address>"
+
+    addr = tokens[0]
+    try:
+        norm = normalize_address(addr)
+    except Exception as e:
+        return f"❌ Invalid Ethereum address: {e}"
+
+    tf = get_default_threat_feed()
+    is_threat = tf.is_address_blocked(norm)
+    threat = tf.get_address_threat(norm) if is_threat else None
+
+    ms = get_default_memory_store()
+    is_approved = ms.is_approved(norm)
+    entry = ms.get_entry(norm) if is_approved else None
+
+    lines = [
+        f"🔍 SafeGuard Address Security Report: 0x{norm}",
+        "=" * 55,
+    ]
+    if is_threat:
+        ttype = getattr(threat, "threat_type", "threat_feed") if threat else "threat_feed"
+        sev = getattr(threat, "severity", "critical") if threat else "critical"
+        tname = threat.name if (threat and threat.name) else "Known exploit / malicious address"
+        tdesc = threat.description if (threat and threat.description) else "Found in blocklist threat feed"
+        lines.extend([
+            "🚨 THREAT STATUS: BLOCKED (Known Exploit / Drainer / Phishing)",
+            f"   Threat Name: {tname}",
+            f"   Type:        {ttype}",
+            f"   Severity:    {sev}",
+            f"   Description: {tdesc}",
+            "⚠️ All interactions with this address are strictly blocked across all modes.",
+        ])
+    else:
+        lines.append("🛡️ THREAT STATUS: Clean (Not flagged on active blocklists/threat feeds)")
+
+    if is_approved:
+        lbl = entry.label if entry else ""
+        lines.append(f"⭐ APPROVAL STATUS: Approved ({lbl}) in SafeGuard memory store")
+    else:
+        lines.append("ℹ️ APPROVAL STATUS: Not pre-approved")
+
+    lines.append("=" * 55)
+    return "\n".join(lines)
+
+
+def safeguard_threats_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    Display current threat intelligence feeds and blocklist summary.
+    Usage: /safeguard-threats
+    """
+    tf = get_default_threat_feed()
+    total_addrs = len(tf.blocked_addresses)
+    total_sels = len(tf.blocked_selectors)
+    source_str = str(tf.filepath) if tf.filepath else "In-memory default feed"
+    version_str = getattr(tf, "version", "1.0.0")
+
+    return "\n".join([
+        "🛡️ SafeGuard Threat Intelligence Status",
+        "=" * 55,
+        f"  • Feed Source:                {source_str}",
+        f"  • Feed Version:               {version_str}",
+        f"  • Blocked Threat Addresses:   {total_addrs}",
+        f"  • Blocked Calldata Selectors: {total_sels}",
+        "  • Ingested Threat Feeds:      Web3 exploit reports, drainer proxies, phishing",
+        "  • Simulation Protections:     Local Anvil EVM trace, drain detection, honeypot tax",
+        "",
+        "Commands:",
+        "  /safeguard-check <address> - Inspect address against threat feed",
+        "  /safeguard-sync            - Force sync & refresh threat feed",
+        "=" * 55,
+    ])
+
+
+def safeguard_sync_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    Force an immediate pull & sync from threat intelligence feeds to update the local denylist cache.
+    Usage: /safeguard-sync [source_url]
+    """
+    arg_url = _parse_command_args(*args, **kwargs).strip()
+    remote_url = arg_url if arg_url.startswith(("http://", "https://")) else os.getenv("SAFEGUARD_THREAT_FEED_URL", "").strip()
+
+    tf = get_default_threat_feed()
+    addresses_before = len(tf.blocked_addresses)
+
+    synced_from = ""
+    error_note = ""
+
+    if remote_url:
+        try:
+            req = urllib.request.Request(
+                remote_url,
+                headers={"User-Agent": "Hermes-SafeGuard/0.1.0 (Threat-Feed-Sync)"}
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                content = resp.read().decode("utf-8")
+                payload = json.loads(content)
+                if isinstance(payload, dict):
+                    # Ingest threats into feed
+                    for entry in payload.get("malicious_contracts", []):
+                        if isinstance(entry, dict) and "address" in entry:
+                            tf.add_address(entry["address"], "malicious_contract", entry.get("name", ""), entry.get("description", ""))
+                        elif isinstance(entry, str):
+                            tf.add_address(entry, "malicious_contract")
+                    for entry in payload.get("phishing_addresses", []):
+                        if isinstance(entry, dict) and "address" in entry:
+                            tf.add_address(entry["address"], "phishing", entry.get("name", ""), entry.get("description", ""))
+                        elif isinstance(entry, str):
+                            tf.add_address(entry, "phishing")
+                    for entry in payload.get("dangerous_selectors", []):
+                        if isinstance(entry, dict) and "selector" in entry:
+                            tf.add_selector(entry["selector"], entry.get("signature", ""), entry.get("description", ""))
+                        elif isinstance(entry, str):
+                            tf.add_selector(entry)
+                    synced_from = f"Remote URL ({remote_url})"
+        except Exception as e:
+            error_note = f" (Remote pull error: {e}; fell back to local cache reload)"
+
+    if not synced_from:
+        # Reload from local file / default blocklist
+        try:
+            tf.load()
+            synced_from = f"Local Blocklist ({tf.filepath or 'defaults'})"
+        except Exception as e:
+            return f"❌ SafeGuard: Failed to sync threat feed: {e}"
+
+    addresses_after = len(tf.blocked_addresses)
+    selectors_count = len(tf.blocked_selectors)
+
+    return "\n".join([
+        "🔄 SafeGuard Threat Intelligence Sync Complete",
+        "=" * 55,
+        f"  • Source:                     {synced_from}{error_note}",
+        f"  • Blocked Threat Addresses:   {addresses_after} (delta: {addresses_after - addresses_before:+d})",
+        f"  • Blocked Calldata Selectors: {selectors_count}",
+        "  • Threat Cache Status:        ACTIVE & UP TO DATE",
+        "=" * 55,
+    ])
+
+
+# ==============================================================================
+# Slash Command: /safeguard-test-alert
+# ==============================================================================
+
+def send_safeguard_alert(message: str, title: str = "SafeGuard Alert") -> dict[str, Any]:
+    """
+    Dispatch an alert to configured Telegram bot or webhook URL.
+    Returns status dict indicating delivery or configuration status.
+    """
+    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("SAFEGUARD_TELEGRAM_BOT_TOKEN", "")).strip()
+    telegram_chat = os.getenv("TELEGRAM_CHAT_ID", os.getenv("SAFEGUARD_TELEGRAM_CHAT_ID", "")).strip()
+    webhook_url = os.getenv("SAFEGUARD_WEBHOOK_URL", os.getenv("WEBHOOK_URL", "")).strip()
+
+    if telegram_token and telegram_chat:
+        url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+        body = json.dumps({
+            "chat_id": telegram_chat,
+            "text": f"🛡️ <b>{title}</b>\n\n{message}",
+            "parse_mode": "HTML",
+        }).encode("utf-8")
+        try:
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json", "User-Agent": "Hermes-SafeGuard/0.1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp_text = resp.read().decode("utf-8")
+                return {"status": "delivered", "destination": "telegram", "chat_id": telegram_chat, "response": resp_text}
+        except Exception as e:
+            return {"status": "error", "destination": "telegram", "error": str(e)}
+
+    if webhook_url:
+        body = json.dumps({
+            "event": "safeguard_alert",
+            "title": title,
+            "message": message,
+            "mode": os.getenv("SAFEGUARD_MODE", "balanced"),
+        }).encode("utf-8")
+        try:
+            req = urllib.request.Request(
+                webhook_url,
+                data=body,
+                headers={"Content-Type": "application/json", "User-Agent": "Hermes-SafeGuard/0.1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return {"status": "delivered", "destination": "webhook", "url": webhook_url}
+        except Exception as e:
+            return {"status": "error", "destination": "webhook", "error": str(e)}
+
+    return {
+        "status": "unconfigured",
+        "destination": None,
+        "message": "Neither TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID nor SAFEGUARD_WEBHOOK_URL is configured.",
+    }
+
+
+def safeguard_test_alert_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    Send a test ping to configured Telegram chat or webhook to verify alert connectivity.
+    Usage: /safeguard-test-alert
+    """
+    mode = os.getenv("SAFEGUARD_MODE", "balanced").upper()
+    test_msg = (
+        f"<b>Status</b>: Operational\n"
+        f"<b>Policy Mode</b>: {mode}\n"
+        f"<b>RPC Target</b>: {os.getenv('RPC_URL', DEFAULT_RPC_URL)}\n"
+        f"<b>Verification Engine</b>: Anvil EVM Trace Simulation Active\n"
+        f"<i>Test alert sent via /safeguard-test-alert operator command.</i>"
+    )
+    result = send_safeguard_alert(message=test_msg, title="Hermes SafeGuard Connectivity Test")
+
+    if result.get("status") == "delivered":
+        dest = result.get("destination", "endpoint")
+        if dest == "telegram":
+            chat_id = str(result.get("chat_id", ""))
+            masked = f"...{chat_id[-4:]}" if len(chat_id) > 4 else chat_id
+            return f"✅ SafeGuard: Test alert sent successfully to Telegram chat (ID: {masked})!"
+        return f"✅ SafeGuard: Test alert successfully dispatched to webhook ({result.get('url')})!"
+
+    if result.get("status") == "error":
+        return f"❌ SafeGuard: Failed to dispatch test alert: {result.get('error')}"
+
+    return "\n".join([
+        "⚠️ SafeGuard Alert Delivery Unconfigured",
+        "=" * 55,
+        "No alert webhook or Telegram credentials were detected in environment.",
+        "",
+        "To enable real-time operator alerts & Telegram confirmations:",
+        "  1. Set TELEGRAM_BOT_TOKEN=<your_bot_token>",
+        "  2. Set TELEGRAM_CHAT_ID=<your_chat_id>",
+        "     (or SAFEGUARD_WEBHOOK_URL=https://...)",
+        "",
+        "Simulated alert preview:",
+        "  🛡️ Hermes SafeGuard Connectivity Test",
+        f"  • Mode:   {mode}",
+        "  • Engine: Anvil EVM Trace Simulation Active",
+        "  • Status: Ready to deliver on configuration",
+        "=" * 55,
+    ])
+
+
+# ==============================================================================
+# Slash Command: /safeguard-panic, /safeguard-resume (Emergency Kill-Switch)
+# ==============================================================================
+
+def safeguard_panic_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    Operator slash command to activate emergency kill-switch.
+    Halts all onchain financial operations across all modes.
+    Usage: /safeguard-panic
+    """
+    set_kill_switch(True)
+    log_financial_action(
+        action="emergency_panic",
+        status="blocked",
+        mode=os.getenv("SAFEGUARD_MODE", "balanced"),
+        target="system",
+        value_wei=0,
+        data_hex="",
+        risk_score="critical",
+        reason="Operator engaged emergency panic kill-switch",
+    )
+    return "\n".join([
+        "🚨" * 15,
+        "EMERGENCY KILL-SWITCH ENGAGED",
+        "🚨" * 15,
+        "All onchain transactions, transfers, approvals, and swaps are LOCKED DOWN.",
+        "No financial tools will execute across any policy mode.",
+        "",
+        "To release the kill-switch and restore verification, run:",
+        "  /safeguard-resume",
+        "=" * 55,
+    ])
+
+
+def safeguard_resume_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    Operator slash command to release emergency kill-switch and resume normal policy verification.
+    Usage: /safeguard-resume
+    """
+    set_kill_switch(False)
+    current_mode = os.getenv("SAFEGUARD_MODE", "balanced").upper()
+    log_financial_action(
+        action="emergency_resume",
+        status="allowed",
+        mode=current_mode.lower(),
+        target="system",
+        value_wei=0,
+        data_hex="",
+        risk_score="low",
+        reason="Operator released emergency panic kill-switch",
+    )
+    return "\n".join([
+        "✅ SafeGuard: Emergency kill-switch has been RELEASED.",
+        f"Normal policy verification is restored under {current_mode} mode.",
+        "Financial tools and hooks are operational.",
+        "=" * 55,
+    ])
+
+
+# ==============================================================================
+# Slash Command: /safeguard-audit
+# ==============================================================================
+
+def safeguard_audit_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    Show recent SafeGuard audit logs.
+    Usage: /safeguard-audit [limit] (alias: /safeguard-logs)
+    """
+    raw = _parse_command_args(*args, **kwargs)
+    limit = 5
+    tokens = raw.split()
+    if tokens and tokens[0].isdigit():
+        limit = min(max(1, int(tokens[0])), 50)
+
+    entries = safeguard_get_audit_log(limit=limit)
+    if not entries:
+        return "SafeGuard Audit Log: No recent financial actions logged."
+
+    lines = [
+        f"📜 SafeGuard Audit Log (Last {len(entries)} events):",
+        "=" * 55,
+    ]
+    for idx, e in enumerate(entries, 1):
+        status = str(e.get("status", "unknown")).upper()
+        mode = e.get("mode", "")
+        action = e.get("action", "tx")
+        val_eth = e.get("value_eth", 0.0)
+        target = e.get("target", "N/A")
+        reason = e.get("reason", "")
+        risk = e.get("risk_score", "")
+        lines.extend([
+            f"[{idx}] {status} [{mode}] {action} | {val_eth:.4f} ETH ➔ {target}",
+            f"    Risk: {risk} | {reason}",
+        ])
+    lines.append("=" * 55)
+    return "\n".join(lines)
+
+
+# ==============================================================================
+# Slash Command: /safeguard-help
+# ==============================================================================
+
+def safeguard_help_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    Display complete help guide for all SafeGuard slash commands.
+    Usage: /safeguard-help (alias: /safeguard)
+    """
+    current_mode = os.getenv("SAFEGUARD_MODE", "balanced").upper()
+    return "\n".join([
+        "🛡️ Hermes SafeGuard Slash Commands Reference",
+        f"Current Active Mode: {current_mode}",
+        "=" * 58,
+        "⚙️  POLICY MODE SWITCHING:",
+        "  /safeguard-mode                   - Cycle next mode (strict ➔ balanced ➔ degen)",
+        "  /safeguard-mode <strict|balanced|degen> - Set mode directly",
+        "  /safeguard-strict                 - Shortcut: Switch to STRICT mode",
+        "  /safeguard-balanced               - Shortcut: Switch to BALANCED mode",
+        "  /safeguard-degen                  - Shortcut: Switch to DEGEN mode",
+        "",
+        "📊 STATUS & DIAGNOSTICS:",
+        "  /safeguard-status                 - Show active mode, limits, and RPC connection",
+        "  /safeguard-threats                - View threat feed & drainer signatures summary",
+        "  /safeguard-sync [url]             - Force threat intelligence feed sync & refresh",
+        "  /safeguard-test-alert             - Send test ping to verify Telegram/webhook alerts",
+        "  /safeguard-audit [limit]          - View recent transaction decisions (default: 5)",
+        "",
+        "🚨 EMERGENCY CIRCUIT-BREAKER:",
+        "  /safeguard-panic                  - Emergency kill-switch: HALT all transactions",
+        "  /safeguard-resume                 - Release kill-switch & restore normal policy",
+        "",
+        "⏳ HUMAN CONFIRMATION WORKFLOW:",
+        "  /safeguard-pending                - List all transactions awaiting operator confirmation",
+        "  /safeguard-confirm <id>           - Approve a held transaction",
+        "  /safeguard-reject <id> [reason]   - Reject a held transaction",
+        "",
+        "📋 TRUSTED CONTACTS & WHITELIST:",
+        "  /safeguard-whitelist              - List all approved addresses & labels",
+        "  /safeguard-allow <addr> [label]   - Pre-approve a trusted recipient/contract",
+        "  /safeguard-revoke <addr>          - Revoke an address from trusted memory",
+        "  /safeguard-check <addr>           - Check address reputation against threat feeds",
+        "",
+        "ℹ️  HELP & INFO:",
+        "  /safeguard-help                   - Show this command reference",
+        "=" * 58,
+    ])
 
 
 # ==============================================================================
@@ -1104,20 +1827,99 @@ def register(ctx: Any) -> None:
     # 3. Register hook: pre_tool_call
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
 
-    # 4. Register slash commands: /safeguard-status, /safeguard-mode, /safeguard-confirm, /safeguard-reject
+    # 4. Register slash commands
     # In Hermes Agent, commands are registered by base name and invoked by users in chat sessions.
     # The confirmation and rejection commands are operator-only and not callable as model tools.
     cmd_handlers = {
+        # Core mode commands
+        "safeguard-mode": safeguard_mode_command_handler,
+        "safeguard-strict": safeguard_strict_command_handler,
+        "safeguard-balanced": safeguard_balanced_command_handler,
+        "safeguard-degen": safeguard_degen_command_handler,
+
+        # Diagnostics & Status
         "safeguard-status": safeguard_status_handler,
-        "safeguard-mode": safeguard_status_handler,
+        "safeguard-help": safeguard_help_command_handler,
+        "safeguard": safeguard_help_command_handler,
+        "safeguard-threats": safeguard_threats_command_handler,
+        "safeguard-sync": safeguard_sync_command_handler,
+        "safeguard-test-alert": safeguard_test_alert_command_handler,
+        "safeguard-audit": safeguard_audit_command_handler,
+        "safeguard-logs": safeguard_audit_command_handler,
+
+        # Emergency Kill-Switch
+        "safeguard-panic": safeguard_panic_command_handler,
+        "safeguard-resume": safeguard_resume_command_handler,
+
+        # Operator Confirmations
+        "safeguard-pending": safeguard_pending_command_handler,
         "safeguard-confirm": safeguard_confirm_command_handler,
         "safeguard-reject": safeguard_reject_command_handler,
+
+        # Trusted Contacts & Memory Whitelist
+        "safeguard-whitelist": safeguard_whitelist_command_handler,
+        "safeguard-contacts": safeguard_whitelist_command_handler,
+        "safeguard-allow": safeguard_allow_command_handler,
+        "safeguard-whitelist-add": safeguard_allow_command_handler,
+        "safeguard-revoke": safeguard_revoke_command_handler,
+        "safeguard-whitelist-remove": safeguard_revoke_command_handler,
+        "safeguard-check": safeguard_check_command_handler,
+
+        # Common typo aliases (safegaurd with 'au')
+        "safegaurd-mode": safeguard_mode_command_handler,
+        "safegaurd-strict": safeguard_strict_command_handler,
+        "safegaurd-balanced": safeguard_balanced_command_handler,
+        "safegaurd-degen": safeguard_degen_command_handler,
+        "safegaurd-status": safeguard_status_handler,
+        "safegaurd-panic": safeguard_panic_command_handler,
+        "safegaurd-resume": safeguard_resume_command_handler,
+        "safegaurd-sync": safeguard_sync_command_handler,
+        "safegaurd-test-alert": safeguard_test_alert_command_handler,
+        "safegaurd-confirm": safeguard_confirm_command_handler,
+        "safegaurd-reject": safeguard_reject_command_handler,
+        "safegaurd-pending": safeguard_pending_command_handler,
+        "safegaurd-help": safeguard_help_command_handler,
+        "safegaurd": safeguard_help_command_handler,
     }
     cmd_descriptions = {
-        "safeguard-status": "Inspect or switch SafeGuard policy mode.",
-        "safeguard-mode": "Switch SafeGuard policy mode (strict, balanced, degen).",
+        "safeguard-mode": "Switch or cycle SafeGuard policy mode (strict ➔ balanced ➔ degen).",
+        "safeguard-strict": "Instantly switch SafeGuard policy mode to strict.",
+        "safeguard-balanced": "Instantly switch SafeGuard policy mode to balanced.",
+        "safeguard-degen": "Instantly switch SafeGuard policy mode to degen.",
+        "safeguard-status": "Display current SafeGuard policy mode, limits, and RPC connectivity.",
+        "safeguard-help": "Display SafeGuard slash commands documentation and usage guide.",
+        "safeguard": "Display SafeGuard slash commands documentation and usage guide.",
+        "safeguard-threats": "View threat intelligence feeds and blocklist summary.",
+        "safeguard-sync": "Force threat intelligence sync & refresh local cache.",
+        "safeguard-test-alert": "Send test ping to verify Telegram/webhook alert connectivity.",
+        "safeguard-panic": "Emergency kill-switch: halt all onchain financial operations.",
+        "safeguard-resume": "Release emergency kill-switch & restore normal policy operations.",
+        "safeguard-audit": "View recent transaction security audit decisions and history.",
+        "safeguard-logs": "View recent transaction security audit decisions and history.",
+        "safeguard-pending": "List all held transactions awaiting operator confirmation.",
         "safeguard-confirm": "Approve a held SafeGuard transaction by its confirmation ID.",
         "safeguard-reject": "Reject a held SafeGuard transaction by its confirmation ID.",
+        "safeguard-whitelist": "List all approved/trusted addresses in SafeGuard memory.",
+        "safeguard-contacts": "List all approved/trusted addresses in SafeGuard memory.",
+        "safeguard-allow": "Pre-approve a trusted recipient or contract address in memory.",
+        "safeguard-whitelist-add": "Pre-approve a trusted recipient or contract address in memory.",
+        "safeguard-revoke": "Revoke an approved address from SafeGuard memory.",
+        "safeguard-whitelist-remove": "Revoke an approved address from SafeGuard memory.",
+        "safeguard-check": "Check an address reputation against threat feeds and memory.",
+        "safegaurd-mode": "Switch or cycle SafeGuard policy mode (alias).",
+        "safegaurd-strict": "Instantly switch SafeGuard policy mode to strict (alias).",
+        "safegaurd-balanced": "Instantly switch SafeGuard policy mode to balanced (alias).",
+        "safegaurd-degen": "Instantly switch SafeGuard policy mode to degen (alias).",
+        "safegaurd-status": "Display current SafeGuard status (alias).",
+        "safegaurd-panic": "Emergency kill-switch (alias).",
+        "safegaurd-resume": "Release emergency kill-switch (alias).",
+        "safegaurd-sync": "Force threat intelligence sync (alias).",
+        "safegaurd-test-alert": "Test alert delivery (alias).",
+        "safegaurd-confirm": "Approve a held SafeGuard transaction (alias).",
+        "safegaurd-reject": "Reject a held SafeGuard transaction (alias).",
+        "safegaurd-pending": "List transactions awaiting confirmation (alias).",
+        "safegaurd-help": "Display SafeGuard command help (alias).",
+        "safegaurd": "Display SafeGuard command help (alias).",
     }
 
     registered_cmds: set[str] = set()
@@ -1152,3 +1954,36 @@ def register(ctx: Any) -> None:
             for cmd_base, handler in cmd_handlers.items():
                 d[cmd_base] = handler
                 d[f"/{cmd_base}"] = handler
+
+    # 5. Register system prompt section so Hermes Agent avoids searching codebase for policy modes
+    sys_prompt_fn = getattr(ctx, "register_system_prompt_section", None)
+    if callable(sys_prompt_fn):
+        prompt_content = (
+            "Hermes SafeGuard security middleware is ACTIVE. "
+            "Policy mode is operator-controlled via instant slash commands.\n"
+            "When the user asks to switch policy modes, view security status, or confirm transactions, "
+            "guide them to use SafeGuard slash commands instead of searching files or running scripts:\n"
+            "  /safeguard-mode [strict|balanced|degen|next] - Cycle or switch policy modes instantly\n"
+            "  /safeguard-strict, /safeguard-balanced, /safeguard-degen - Quick mode switches\n"
+            "  /safeguard-status - View current mode, limits, and RPC connection\n"
+            "  /safeguard-pending - View transactions awaiting human confirmation\n"
+            "  /safeguard-confirm <id> - Approve held transaction\n"
+            "  /safeguard-reject <id> - Reject held transaction\n"
+            "  /safeguard-whitelist - View approved contacts/addresses\n"
+            "  /safeguard-allow <addr> [label] - Pre-approve trusted address\n"
+            "  /safeguard-check <addr> - Check address reputation against threat feeds\n"
+            "  /safeguard-help - View complete SafeGuard command reference"
+        )
+        try:
+            sys_prompt_fn(
+                name="safeguard.guidelines",
+                content=prompt_content,
+                position="after_memory",
+            )
+        except TypeError:
+            try:
+                sys_prompt_fn("safeguard.guidelines", prompt_content)
+            except Exception:
+                pass
+        except Exception:
+            pass

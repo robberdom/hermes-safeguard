@@ -336,6 +336,36 @@ In `strict` mode, confirming a transaction to an unknown recipient functions as 
 
 ---
 
+## 8.5 Operator Slash Commands Reference
+
+SafeGuard registers interactive slash commands directly into Hermes Agent (`ctx.register_command`). Mode switching is strictly operator-driven to prevent prompt injection escalation.
+
+**CRITICAL AGENT INSTRUCTION**: When a user in chat asks to switch modes (e.g., "switch to degen mode"), do NOT search the codebase, grep files, or attempt to edit Python code. Immediately direct the user to (or invoke) the slash command: `/safeguard-mode degen`.
+
+### Complete Commands Table:
+- `/safeguard-mode`: Cycle modes in order (`strict` ➔ `balanced` ➔ `degen` ➔ `strict`).
+- `/safeguard-mode <strict|balanced|degen>`: Directly switch policy mode.
+- `/safeguard-strict`, `/safeguard-balanced`, `/safeguard-degen`: Quick mode shortcuts.
+- `/safeguard-status`: View active limits, mode, and Anvil/RPC connectivity.
+- `/safeguard-pending`: List all held transactions awaiting operator confirmation.
+- `/safeguard-confirm <id>`: Approve a held transaction.
+- `/safeguard-reject <id> [reason]`: Reject a held transaction.
+- `/safeguard-whitelist`: View pre-approved contacts and contracts.
+- `/safeguard-allow <addr> [label]`: Pre-approve a trusted address into memory.
+- `/safeguard-revoke <addr>`: Revoke an approved address from memory.
+- `/safeguard-check <addr>`: Check address reputation against threat feeds.
+- `/safeguard-threats`: View threat feed and blocklist summary.
+- `/safeguard-sync [url]`: Force immediate pull & sync from threat feeds to refresh local cache.
+- `/safeguard-test-alert`: Send test ping to verify Telegram or webhook alert delivery.
+- `/safeguard-panic`: Emergency kill-switch: immediately HALT all financial operations.
+- `/safeguard-resume`: Release emergency kill-switch & restore normal policy operations.
+- `/safeguard-audit [limit]`: View recent transaction decisions.
+- `/safeguard-help`: Show complete slash command cheat sheet.
+
+*(Typo aliases like `/safegaurd-mode` and `/safegaurd-status` are registered automatically).*
+
+---
+
 ## 9. Known Limitations & Next Priorities
 
 ### 1. Live Threat Feed Integration

@@ -36,6 +36,27 @@ provides_tools:
 provides_hooks:
   - pre_tool_call
   - post_tool_call
+provides_commands:
+  - safeguard-help
+  - safeguard-status
+  - safeguard-mode
+  - safeguard-strict
+  - safeguard-balanced
+  - safeguard-degen
+  - safeguard-pending
+  - safeguard-confirm
+  - safeguard-reject
+  - safeguard-whitelist
+  - safeguard-allow
+  - safeguard-revoke
+  - safeguard-check
+  - safeguard-threats
+  - safeguard-sync
+  - safeguard-test-alert
+  - safeguard-panic
+  - safeguard-resume
+  - safeguard-audit
+  - safegaurd-mode
 capabilities:
   - tools.override
 ```
@@ -43,6 +64,7 @@ capabilities:
 ### Manifest Rules
 - `provides_tools`: Must exactly match names passed to `ctx.register_tool()`.
 - `provides_hooks`: Must match event names passed to `ctx.register_hook()`.
+- `provides_commands`: Lists interactive in-session slash commands registered via `ctx.register_command()`.
 - `capabilities`: Must explicitly declare `tools.override` when overriding or intercepting default transaction tools.
 - Validation command: `hermes plugins validate . --install-deps` checks manifest consistency, public API imports, and capabilities.
 
@@ -78,10 +100,43 @@ ctx.register_tool(
 
 ### Slash Command Registration
 ```python
-ctx.register_command(
-    name="safeguard-status",
-    handler=safeguard_status_handler,
-    description="Display current SafeGuard policy mode, limits, and RPC connectivity.",
+# Mode management (cycle or set directly)
+ctx.register_command("safeguard-mode", safeguard_mode_command_handler, "Switch or cycle SafeGuard policy mode.")
+ctx.register_command("safeguard-strict", safeguard_strict_command_handler, "Switch to strict mode.")
+ctx.register_command("safeguard-balanced", safeguard_balanced_command_handler, "Switch to balanced mode.")
+ctx.register_command("safeguard-degen", safeguard_degen_command_handler, "Switch to degen mode.")
+
+# Diagnostics & help
+ctx.register_command("safeguard-status", safeguard_status_handler, "Display SafeGuard status and limits.")
+ctx.register_command("safeguard-help", safeguard_help_command_handler, "Display SafeGuard slash command reference.")
+ctx.register_command("safeguard-threats", safeguard_threats_command_handler, "Display threat intelligence status.")
+ctx.register_command("safeguard-audit", safeguard_audit_command_handler, "Display recent audit decisions.")
+
+# Human-in-the-loop confirmations
+ctx.register_command("safeguard-pending", safeguard_pending_command_handler, "List pending held transactions.")
+ctx.register_command("safeguard-confirm", safeguard_confirm_command_handler, "Approve a held transaction by ID.")
+ctx.register_command("safeguard-reject", safeguard_reject_command_handler, "Reject a held transaction by ID.")
+
+# Address memory & whitelist
+ctx.register_command("safeguard-whitelist", safeguard_whitelist_command_handler, "List approved addresses.")
+ctx.register_command("safeguard-allow", safeguard_allow_command_handler, "Pre-approve a trusted address.")
+ctx.register_command("safeguard-revoke", safeguard_revoke_command_handler, "Revoke approval for an address.")
+ctx.register_command("safeguard-check", safeguard_check_command_handler, "Check address against threat feeds.")
+
+# Threats, sync & emergency kill-switch
+ctx.register_command("safeguard-threats", safeguard_threats_command_handler, "View threat feed stats.")
+ctx.register_command("safeguard-sync", safeguard_sync_command_handler, "Sync threat intelligence feeds.")
+ctx.register_command("safeguard-test-alert", safeguard_test_alert_command_handler, "Verify alert connectivity.")
+ctx.register_command("safeguard-panic", safeguard_panic_command_handler, "Engage emergency kill-switch.")
+ctx.register_command("safeguard-resume", safeguard_resume_command_handler, "Release emergency kill-switch.")
+```
+
+### System Prompt Injection
+```python
+ctx.register_system_prompt_section(
+    "safeguard.guidelines",
+    "Hermes SafeGuard is active. Direct users to slash commands for mode switches and operator actions.",
+    position="after_memory",
 )
 ```
 

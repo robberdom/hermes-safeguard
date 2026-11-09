@@ -136,6 +136,40 @@ Many users intentionally provide agents broad key access for NFT minting, DEX in
 
 ---
 
+## Interactive Slash Commands (`/` Commands)
+
+SafeGuard provides a full suite of zero-token, interactive slash commands for instant operator control across Hermes chat sessions (CLI, TUI, Telegram, Discord). 
+
+> **Why Slash Commands?**  
+> Running `/safeguard-mode degen` executes in `<1ms` directly inside the session router. It eliminates the need for the LLM agent to grep the repository, read source files, or burn API tokens trying to discover how to switch modes.
+
+| Category | Command | Description |
+| :--- | :--- | :--- |
+| **Mode Control** | `/safeguard-mode` | Cycle to next mode (`strict` ➔ `balanced` ➔ `degen` ➔ `strict`) |
+| | `/safeguard-mode <mode>` | Switch directly (`strict`, `balanced`, `degen` or `1`, `2`, `3`) |
+| | `/safeguard-strict` | Direct shortcut: Switch to **strict** mode |
+| | `/safeguard-balanced` | Direct shortcut: Switch to **balanced** mode |
+| | `/safeguard-degen` | Direct shortcut: Switch to **degen** mode |
+| **Emergency Controls** | `/safeguard-panic` | Emergency kill-switch: **HALT** all onchain actions across session |
+| | `/safeguard-resume` | Release emergency kill-switch & restore normal operations |
+| **Threats & Alerts** | `/safeguard-threats` | View threat intelligence feeds and blocklist summary |
+| | `/safeguard-sync [url]` | Force immediate threat feed sync & local cache refresh |
+| | `/safeguard-test-alert` | Send test ping to verify Telegram/webhook connectivity |
+| **Confirmations** | `/safeguard-pending` | List all held transactions awaiting operator confirmation |
+| | `/safeguard-confirm <id>` | Approve a held transaction by its confirmation ID |
+| | `/safeguard-reject <id>` | Reject a held transaction by its confirmation ID |
+| **Trusted Memory** | `/safeguard-whitelist` | List all approved addresses, labels, and sources |
+| | `/safeguard-allow <addr> [lbl]` | Pre-approve trusted address (standing trust for strict mode) |
+| | `/safeguard-revoke <addr>` | Revoke approval for an address from memory store |
+| | `/safeguard-check <addr>` | Check address reputation against threat feeds & memory |
+| **Status & Logs** | `/safeguard-status` | Display active mode, limits, RPC connectivity, and kill-switch state |
+| | `/safeguard-audit [limit]` | View recent transaction decisions (default: last 5) |
+| | `/safeguard-help` | Display command manual and cheat sheet |
+
+*(Typo tolerance: Common variants such as `/safegaurd-mode`, `/safegaurd-status`, and `/safeguard-contacts` are also registered).*
+
+---
+
 ## Human Approval & Hermes Messaging / Telegram Integration
 
 ### 1. The Human Confirmation Flow
