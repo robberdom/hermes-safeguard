@@ -2665,13 +2665,42 @@ class PolicyConfig:
                 raise ValueError("YAML content must deserialize to a dictionary mapping.")
             return cls.from_dict(loaded)
         else:
-            # Fallback basic YAML parser for standard key-value structures
-            import json
-            try:
-                loaded = json.loads(raw_text)
-                return cls.from_dict(loaded)
-            except Exception as e:
-                raise RuntimeError("PyYAML not available to parse YAML configuration") from e
+            # Fallback basic YAML parser for standard key-value structures (zero dependencies)
+            loaded = {}
+            current_list_key = None
+            for line in raw_text.splitlines():
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                if line.startswith("- "):
+                    if current_list_key:
+                        val = line[2:].strip().strip('"').strip("'")
+                        if isinstance(loaded.get(current_list_key), list):
+                            loaded[current_list_key].append(val)
+                elif ":" in line:
+                    parts = line.split(":", 1)
+                    k = parts[0].strip()
+                    v = parts[1].strip()
+                    if not v:
+                        current_list_key = k
+                        if k not in loaded:
+                            loaded[k] = []
+                    else:
+                        current_list_key = None
+                        v_unquoted = v.strip('"').strip("'")
+                        if v_unquoted.lower() == "true":
+                            loaded[k] = True
+                        elif v_unquoted.lower() == "false":
+                            loaded[k] = False
+                        else:
+                            try:
+                                if "." in v_unquoted:
+                                    loaded[k] = float(v_unquoted)
+                                else:
+                                    loaded[k] = int(v_unquoted)
+                            except ValueError:
+                                loaded[k] = v_unquoted
+            return cls.from_dict(loaded)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert PolicyConfig to a Python dictionary."""
