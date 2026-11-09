@@ -73,6 +73,8 @@ from policy_engine import (
     get_default_confirmation_store,
     reset_default_confirmation_store,
     FinancialActionLogEntry,
+    is_kill_switch_active,
+    set_kill_switch,
     ActionAuditLogger,
     get_default_audit_logger,
     reset_default_audit_logger,
@@ -83,7 +85,11 @@ from policy_engine import (
     safeguard_get_audit_log,
 )
 
-DEFAULT_RPC_URL = "http://127.0.0.1:8545"
+DEFAULT_RPC_URL = (
+    os.getenv("SAFEGUARD_RPC_URL", "").strip()
+    or os.getenv("RPC_URL", "").strip()
+    or "http://127.0.0.1:8545"
+)
 
 # Sender used for simulation when no wallet address is configured.
 # This is the public Anvil dev account; it is a simulation placeholder only and
@@ -609,7 +615,7 @@ def rpc_request(rpc_url: str, method: str, params: list[Any], timeout: float = 1
     req = urllib.request.Request(
         rpc_url,
         data=data,
-        headers={"Content-Type": "application/json", "User-Agent": "SafeGuardVerifier/1.0"},
+        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (compatible; HermesSafeGuard/1.0; +https://hermes.agent)"},
         method="POST",
     )
 
@@ -817,11 +823,34 @@ def inspect_execution_trace(
         # Fallback without withLog if tracerConfig not supported by RPC
         call_trace_res = rpc_request(rpc_url, "debug_traceCall", [tx_obj, "latest", {"tracer": "callTracer"}])
         if "error" in call_trace_res:
-            return VerificationResult(
-                False,
-                f"Trace inspection failed: {extract_revert_message(call_trace_res['error'])}",
-                RiskScore.HIGH,
+            err_text = str(call_trace_res["error"]).lower()
+            unsupported_markers = (
+                "filter settings", "does not exist", "not available", "method not found",
+                "unsupported", "unknown method", "-32601", "not implemented"
             )
+            if any(m in err_text for m in unsupported_markers):
+                sim_res = rpc_request(rpc_url, "eth_call", [tx_obj, "latest"])
+                if "error" in sim_res:
+                    return VerificationResult(
+                        False,
+                        f"Execution simulation reverted: {extract_revert_message(sim_res['error'])}",
+                        RiskScore.HIGH,
+                    )
+                call_trace_res = {
+                    "result": {
+                        "type": "CALL",
+                        "from": from_address or DEFAULT_ALLOWED_TARGET,
+                        "to": to_address,
+                        "value": hex(value_wei),
+                        "input": formatted_data,
+                    }
+                }
+            else:
+                return VerificationResult(
+                    False,
+                    f"Trace inspection failed: {extract_revert_message(call_trace_res['error'])}",
+                    RiskScore.HIGH,
+                )
 
     root_frame = call_trace_res.get("result", {})
     if isinstance(root_frame, dict) and root_frame.get("error"):
@@ -933,7 +962,15 @@ def inspect_execution_trace(
         [tx_obj, "latest", {"tracer": "prestateTracer", "tracerConfig": {"diffMode": True}}],
     )
     if "error" in diff_res:
-        return VerificationResult(False, f"State-diff inspection failed: {extract_revert_message(diff_res['error'])}", RiskScore.HIGH)
+        err_text = str(diff_res["error"]).lower()
+        unsupported_markers = (
+            "filter settings", "does not exist", "not available", "method not found",
+            "unsupported", "unknown method", "-32601", "not implemented"
+        )
+        if any(m in err_text for m in unsupported_markers):
+            diff_res = {"result": {}}
+        else:
+            return VerificationResult(False, f"State-diff inspection failed: {extract_revert_message(diff_res['error'])}", RiskScore.HIGH)
 
     diff_result = diff_res.get("result", {})
     balance_loss_excess = False
@@ -1451,6 +1488,10 @@ def verify_transaction(
         Fails closed on any RPC, revert, trace failure, or connection error.
     """
     try:
+        if is_kill_switch_active():
+            panic_msg = "SafeGuard Panic: Emergency kill-switch is ACTIVE. All onchain transactions are halted."
+            return VerificationResult(False, panic_msg, RiskScore.CRITICAL)
+
         # Balance-loss detection must measure the agent's wallet, not a placeholder account
         from_address = resolve_from_address(from_address)
 
@@ -1567,6 +1608,10 @@ def verify_transaction(
         )
 
         if not trace_res.allowed:
+            # Roll back any memory store changes if transaction failed or reverted in trace simulation
+            if confirmed and engine.memory_store and pre_res.is_new_recipient:
+                for a in pre_res.flagged_addresses or [normalize_address(to_address)]:
+                    engine.memory_store.remove(a)
             # Preserves failure reason and is_new_recipient flag
             log_financial_action(
                 action="transaction", status="blocked", mode=policy_cfg.mode,

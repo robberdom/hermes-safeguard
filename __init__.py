@@ -44,6 +44,8 @@ from policy_engine import (
     safeguard_list_approved_addresses,
     safeguard_list_pending_confirmations,
     safeguard_revoke_address,
+    is_kill_switch_active,
+    set_kill_switch,
 )
 from verifier import (
     DEFAULT_RPC_URL,
@@ -75,6 +77,10 @@ PROTECTED_BASENAMES: frozenset[str] = frozenset({
     "__init__.py",
     "plugin.yaml",
     "safeguardpolicy.sol",
+    ".env",
+    ".safeguard_pairing.json",
+    ".safeguard_confirmations.json",
+    ".safeguard_kill_switch",
 })
 
 # Tool-name verbs that can mutate a file or run arbitrary commands.
@@ -144,7 +150,7 @@ def _references_protected_path(value: str) -> bool:
     # Catch protected filenames embedded in a larger string (e.g. shell/python one-liners)
     # without matching them as a substring of a longer identifier.
     if re.search(
-        r"(?<![a-z0-9_])(?:policy_engine\.py|verifier\.py|blocklist\.json|__init__\.py|plugin\.yaml|safeguardpolicy\.sol)(?![a-z0-9_])",
+        r"(?<![a-z0-9_])(?:policy_engine\.py|verifier\.py|blocklist\.json|__init__\.py|plugin\.yaml|safeguardpolicy\.sol|\.env|\.safeguard_pairing\.json|\.safeguard_confirmations\.json|\.safeguard_kill_switch)(?![a-z0-9_])",
         lowered,
     ):
         return True
@@ -449,6 +455,9 @@ def safeguard_check_policy_handler(*args: Any, **kwargs: Any) -> str:
     if not data_raw:
         data_raw = "0x"
 
+    context = kwargs.get("context") or kwargs.get("messages") or call_args.get("context") or []
+    conf_id = call_args.get("confirmation_id") or kwargs.get("confirmation_id")
+
     try:
         res = verify_transaction(
             to_address=to_addr,
@@ -456,6 +465,8 @@ def safeguard_check_policy_handler(*args: Any, **kwargs: Any) -> str:
             data_hex=data_raw,
             config=config,
             rpc_url=rpc_url,
+            context=context,
+            confirmation_id=conf_id,
         )
         risk_str = res.risk_score.value if hasattr(res.risk_score, "value") else str(res.risk_score).lower()
         out = {
@@ -537,6 +548,9 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
     if not data_raw:
         data_raw = "0x"
 
+    context = kwargs.get("context") or kwargs.get("messages") or call_args.get("context") or []
+    conf_id = call_args.get("confirmation_id") or kwargs.get("confirmation_id")
+
     try:
         res = verify_transaction(
             to_address=to_addr,
@@ -544,8 +558,27 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
             data_hex=data_raw,
             config=config,
             rpc_url=rpc_url,
+            context=context,
+            confirmation_id=conf_id,
         )
         risk_str = res.risk_score.value if hasattr(res.risk_score, "value") else str(res.risk_score).lower()
+
+        if getattr(res, "requires_confirmation", False):
+            cid = getattr(res, "confirmation_id", "") or conf_id
+            summary = getattr(res, "confirmation_summary", "") or res.reason
+            _notify_telegram_operator(cid, summary, risk_score=risk_str, mode=resolved_mode)
+            return json.dumps({
+                "status": "requires_confirmation",
+                "executed": False,
+                "allowed": False,
+                "requires_confirmation": True,
+                "confirmation_id": cid,
+                "confirmation_summary": summary,
+                "reason": res.reason or "Transaction requires explicit operator confirmation",
+                "risk_score": risk_str,
+                "warning": res.warning if res.warning else None,
+                "mode": resolved_mode,
+            })
 
         if not res.allowed or risk_str == "critical":
             return json.dumps({
@@ -617,6 +650,91 @@ def safeguard_confirm_action_handler(*args: Any, **kwargs: Any) -> str:
         })
     result = safeguard_confirm_action(confirmation_id=conf_id, approved=approved)
     return json.dumps(result, indent=2)
+
+
+# ==============================================================================
+# Telegram Operator Notification Helper
+# ==============================================================================
+
+def _notify_telegram_operator(
+    conf_id: str,
+    summary: str,
+    risk_score: str = "high",
+    mode: str = "balanced",
+) -> bool:
+    """
+    If TELEGRAM_BOT_TOKEN and TELEGRAM_OPERATOR_CHAT_ID are configured in environment or .env,
+    automatically send a real-time interactive alert with Approve/Reject buttons to the operator.
+    Safe and non-blocking: fails silently if unconfigured or network is unavailable.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_OPERATOR_CHAT_ID", "").strip()
+    if not chat_id:
+        try:
+            from telegram_adapter import get_operator_chat_id
+            chat_id = get_operator_chat_id() or ""
+        except Exception:
+            pass
+    if not token or not chat_id:
+        return False
+
+    try:
+        from telegram_adapter import TelegramBot
+        import html
+        bot = TelegramBot(token)
+        risk_emoji = "🚨" if risk_score.lower() == "critical" else "⚠️"
+        safe_summary = html.escape(summary)
+        text = (
+            f"<b>{risk_emoji} SafeGuard [{mode.upper()}] Operator Approval Required</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>ID:</b> <code>{conf_id}</code>\n"
+            f"<b>Risk Level:</b> <code>{risk_score.upper()}</code>\n\n"
+            f"<b>Summary:</b>\n{safe_summary}\n\n"
+            f"<i>Action held. Tap below or run /safeguard-confirm {conf_id} to approve.</i>"
+        )
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Approve Transaction", "callback_data": f"approve:{conf_id}"},
+                    {"text": "🚫 Reject", "callback_data": f"reject:{conf_id}"},
+                ],
+                [
+                    {"text": "📋 View Details", "callback_data": f"details:{conf_id}"},
+                ],
+            ]
+        }
+        res = bot.send_message(chat_id, text, reply_markup=reply_markup)
+        return bool(res.get("ok"))
+    except Exception as e:
+        logger.warning("SafeGuard: Telegram operator alert notification skipped: %s", e)
+        return False
+
+
+def _notify_telegram_event(title: str, details: str) -> bool:
+    """
+    Send an informational event alert to the paired Telegram operator.
+    Safe and non-blocking: fails silently if unconfigured or network is unavailable.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_OPERATOR_CHAT_ID", "").strip()
+    if not chat_id:
+        try:
+            from telegram_adapter import get_operator_chat_id
+            chat_id = get_operator_chat_id() or ""
+        except Exception:
+            pass
+    if not token or not chat_id:
+        return False
+
+    try:
+        from telegram_adapter import TelegramBot
+        bot = TelegramBot(token)
+        text = f"<b>{title}</b>\n━━━━━━━━━━━━━━━━━━━━━━\n{details}"
+        res = bot.send_message(chat_id, text)
+        return bool(res.get("ok"))
+    except Exception as e:
+        logger.debug("SafeGuard: Telegram event notification skipped: %s", e)
+        return False
 
 
 # ==============================================================================
@@ -771,12 +889,14 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
         if getattr(res, "requires_confirmation", False):
             conf_id = getattr(res, "confirmation_id", "")
             summary = getattr(res, "confirmation_summary", "") or res.reason
+            tg_notified = _notify_telegram_operator(conf_id, summary, risk_score=risk_str, mode=mode)
+            tg_status = " (Interactive prompt dispatched to operator's Telegram)" if tg_notified else ""
             msg = (
                 f"SafeGuard [{mode.upper()}] REQUIRES OPERATOR CONFIRMATION (ID: {conf_id}):\n"
                 f"{summary}\n\n"
-                f"Action is held for operator approval. Operator must run /safeguard-confirm {conf_id} in chat to approve, or /safeguard-reject {conf_id} to reject."
+                f"Action is held for operator approval{tg_status}. Operator must approve via Telegram or run /safeguard-confirm {conf_id} in chat to approve, or /safeguard-reject {conf_id} to reject."
             )
-            print(f"SafeGuard [{mode.upper()}]: Intercepted '{tool_name}' -> REQUIRES CONFIRMATION: ID {conf_id}")
+            print(f"SafeGuard [{mode.upper()}]: Intercepted '{tool_name}' -> REQUIRES CONFIRMATION: ID {conf_id}{tg_status}")
             return {
                 "action": "block",
                 "message": msg,
@@ -786,6 +906,7 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
                 "confirmation_id": conf_id,
                 "confirmation_summary": summary,
                 "mode": mode,
+                "telegram_notified": tg_notified,
             }
 
         # Check for unambiguous fund drains
@@ -832,6 +953,23 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
                 }
 
         # Strict and Balanced modes: fail-closed on any disallowed policy result or critical risk
+        if getattr(res, "requires_confirmation", False):
+            cid = getattr(res, "confirmation_id", "") or conf_id
+            summary = getattr(res, "confirmation_summary", "") or res.reason
+            _notify_telegram_operator(cid, summary, risk_score=risk_str, mode=resolved_mode)
+            return json.dumps({
+                "status": "requires_confirmation",
+                "executed": False,
+                "allowed": False,
+                "requires_confirmation": True,
+                "confirmation_id": cid,
+                "confirmation_summary": summary,
+                "reason": res.reason or "Transaction requires explicit operator confirmation",
+                "risk_score": risk_str,
+                "warning": res.warning if res.warning else None,
+                "mode": resolved_mode,
+            })
+
         if not res.allowed or risk_str == "critical":
             msg = f"SafeGuard [{mode}] BLOCKED: {res.reason or 'Transaction blocked by SafeGuard policy'}"
             print(f"SafeGuard [{mode.upper()}]: Intercepted '{tool_name}' -> BLOCKED: {res.reason}")
@@ -1106,6 +1244,10 @@ def safeguard_confirm_command_handler(*args: Any, **kwargs: Any) -> str:
     Usage: /safeguard-confirm <confirmation_id>
     """
     arg_text = _parse_command_args(*args, **kwargs)
+    for prefix in ("/safeguard-confirm", "safeguard-confirm", "/confirm", "confirm"):
+        if arg_text.startswith(prefix):
+            arg_text = arg_text[len(prefix):].strip()
+            break
     tokens = arg_text.split()
     conf_id = tokens[0] if tokens else ""
     if not conf_id:
@@ -1126,6 +1268,10 @@ def safeguard_reject_command_handler(*args: Any, **kwargs: Any) -> str:
     Usage: /safeguard-reject <confirmation_id> [reason]
     """
     arg_text = _parse_command_args(*args, **kwargs)
+    for prefix in ("/safeguard-reject", "safeguard-reject", "/reject", "reject"):
+        if arg_text.startswith(prefix):
+            arg_text = arg_text[len(prefix):].strip()
+            break
     tokens = arg_text.split()
     conf_id = tokens[0] if tokens else ""
     if not conf_id:
@@ -1218,6 +1364,35 @@ def safeguard_revoke_command_handler(*args: Any, **kwargs: Any) -> str:
         return f"ℹ️ Address {addr} was not found in approved memory store."
     except Exception as e:
         return f"❌ SafeGuard: Error revoking address: {e}"
+
+
+def safeguard_connect_tg_command_handler(*args: Any, **kwargs: Any) -> str:
+    """
+    Generate an OTP pairing code to link an operator's personal phone Telegram to this Hermes Agent session.
+    Usage: /safeguard-connect-tg (or /connect-tg)
+    """
+    try:
+        from telegram_adapter import create_pairing_code, get_bot_username
+        code, deep_link = create_pairing_code()
+        bot_user = get_bot_username() or "your_bot"
+        lines = [
+            "📲 SafeGuard Telegram Connection",
+            "=" * 50,
+            f"Pairing Code: {code}  (Expires in 10 minutes)",
+            "",
+            "To connect your phone's Telegram to this Hermes Agent:",
+            f"  1. Tap link to pair in one click: {deep_link}",
+            f"  2. Or open Telegram bot @{bot_user} and send: /pair {code}",
+            "",
+            "Once connected:",
+            "  • Routine transactions run 100% autonomously.",
+            "  • Elevated risks (prompt injection, large transfers) send",
+            "    Approve/Reject buttons directly to your phone!",
+            "=" * 50,
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ SafeGuard: Failed to generate pairing code: {e}"
 
 
 # ==============================================================================
@@ -1855,6 +2030,10 @@ def register(ctx: Any) -> None:
         "safeguard-pending": safeguard_pending_command_handler,
         "safeguard-confirm": safeguard_confirm_command_handler,
         "safeguard-reject": safeguard_reject_command_handler,
+        "safeguard-connect-tg": safeguard_connect_tg_command_handler,
+        "connect-tg": safeguard_connect_tg_command_handler,
+        "connect_tg": safeguard_connect_tg_command_handler,
+        "safeguard-tg": safeguard_connect_tg_command_handler,
 
         # Trusted Contacts & Memory Whitelist
         "safeguard-whitelist": safeguard_whitelist_command_handler,

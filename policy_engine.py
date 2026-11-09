@@ -120,6 +120,48 @@ def is_financial_tool(tool_name: str) -> bool:
     return any(kw in name for kw in financial_keywords)
 
 
+# Emergency Kill-Switch State (Shared across processes via file and env)
+_KILL_SWITCH_FILE = Path.home() / ".hermes" / ".safeguard_kill_switch"
+_LOCAL_KILL_SWITCH_FILE = Path(__file__).resolve().parent / ".safeguard_kill_switch"
+_KILL_SWITCH_ACTIVE: bool = False
+
+
+def is_kill_switch_active() -> bool:
+    """True if operator has engaged emergency panic lockdown."""
+    global _KILL_SWITCH_ACTIVE
+    if _KILL_SWITCH_ACTIVE:
+        return True
+    if os.getenv("SAFEGUARD_KILL_SWITCH", "").strip().lower() in ("true", "1", "yes", "active"):
+        return True
+    for p in (_KILL_SWITCH_FILE, _LOCAL_KILL_SWITCH_FILE):
+        if p.is_file():
+            return True
+    return False
+
+
+def set_kill_switch(active: bool) -> None:
+    """Engage or release the emergency kill-switch."""
+    global _KILL_SWITCH_ACTIVE
+    _KILL_SWITCH_ACTIVE = active
+    if active:
+        os.environ["SAFEGUARD_KILL_SWITCH"] = "true"
+        for p in (_KILL_SWITCH_FILE, _LOCAL_KILL_SWITCH_FILE):
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.touch()
+            except Exception:
+                pass
+    else:
+        if "SAFEGUARD_KILL_SWITCH" in os.environ:
+            del os.environ["SAFEGUARD_KILL_SWITCH"]
+        for p in (_KILL_SWITCH_FILE, _LOCAL_KILL_SWITCH_FILE):
+            try:
+                if p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
+
+
 # ==============================================================================
 # Context Tagging & Inspection Data Structures
 # ==============================================================================
@@ -918,15 +960,122 @@ class PendingConfirmation:
         }
 
 
-class ConfirmationStore:
-    """Thread-safe store for pending, confirmed, and rejected human approval requests."""
+DEFAULT_CONFIRMATION_STORE_PATH = Path.home() / ".hermes" / "safeguard_confirmations.json"
+LOCAL_CONFIRMATION_STORE_PATH = Path(__file__).resolve().parent / ".safeguard_confirmations.json"
 
-    def __init__(self, ttl: float = 300.0) -> None:
+
+def _resolve_confirmation_store_path() -> Path:
+    try:
+        DEFAULT_CONFIRMATION_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        return DEFAULT_CONFIRMATION_STORE_PATH
+    except Exception:
+        return LOCAL_CONFIRMATION_STORE_PATH
+
+
+class ConfirmationStore:
+    """Thread-safe and process-safe store for pending, confirmed, and rejected human approval requests."""
+
+    def __init__(
+        self,
+        ttl: float = 300.0,
+        filepath: str | Path | None = None,
+        auto_save: bool = True,
+    ) -> None:
         self._lock = threading.Lock()
         self._pending: dict[str, PendingConfirmation] = {}
         self._confirmed_ids: set[str] = set()
         self._rejected_ids: set[str] = set()
         self.ttl: float = ttl
+        self.filepath: Path | None = Path(filepath) if filepath else None
+        self.auto_save: bool = auto_save
+        self._last_mtime: float = 0.0
+
+        if self.filepath and self.filepath.is_file():
+            self._load()
+
+    def _save(self) -> None:
+        if not self.auto_save or not self.filepath:
+            return
+        try:
+            self.filepath.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "pending": {
+                    k: {
+                        "id": v.id,
+                        "action": v.action,
+                        "tool_name": v.tool_name,
+                        "tool_args": v.tool_args,
+                        "to_address": v.to_address,
+                        "value_wei": v.value_wei,
+                        "data_hex": v.data_hex,
+                        "risk_score": v.risk_score,
+                        "reason": v.reason,
+                        "summary": v.summary,
+                        "mode": v.mode,
+                        "created_at": v.created_at,
+                        "tx_digest": v.tx_digest,
+                        "confirmed": v.confirmed,
+                        "rejected": v.rejected,
+                        "consumed": v.consumed,
+                        "metadata": v.metadata,
+                    }
+                    for k, v in self._pending.items()
+                },
+                "confirmed_ids": list(self._confirmed_ids),
+                "rejected_ids": list(self._rejected_ids),
+            }
+            tmp = self.filepath.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            tmp.replace(self.filepath)
+            self._last_mtime = self.filepath.stat().st_mtime
+        except Exception:
+            pass
+
+    def _load(self) -> None:
+        if not self.filepath or not self.filepath.is_file():
+            return
+        try:
+            mtime = self.filepath.stat().st_mtime
+            if mtime <= self._last_mtime and self._pending:
+                return
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            pending_raw = data.get("pending", {})
+            for k, raw in pending_raw.items():
+                if k not in self._pending:
+                    self._pending[k] = PendingConfirmation(
+                        id=raw["id"],
+                        action=raw.get("action", ""),
+                        tool_name=raw.get("tool_name", ""),
+                        tool_args=raw.get("tool_args", {}),
+                        to_address=raw.get("to_address", ""),
+                        value_wei=int(raw.get("value_wei", 0)),
+                        data_hex=raw.get("data_hex", "0x"),
+                        risk_score=raw.get("risk_score", "high"),
+                        reason=raw.get("reason", ""),
+                        summary=raw.get("summary", ""),
+                        mode=raw.get("mode", "degen"),
+                        created_at=float(raw.get("created_at", time.time())),
+                        tx_digest=raw.get("tx_digest", ""),
+                        confirmed=bool(raw.get("confirmed", False)),
+                        rejected=bool(raw.get("rejected", False)),
+                        consumed=bool(raw.get("consumed", False)),
+                        metadata=raw.get("metadata", {}),
+                    )
+                else:
+                    cur = self._pending[k]
+                    cur.confirmed = bool(raw.get("confirmed", cur.confirmed))
+                    cur.rejected = bool(raw.get("rejected", cur.rejected))
+                    cur.consumed = bool(raw.get("consumed", cur.consumed))
+
+            for cid in data.get("confirmed_ids", []):
+                self._confirmed_ids.add(cid)
+            for rid in data.get("rejected_ids", []):
+                self._rejected_ids.add(rid)
+            self._last_mtime = mtime
+        except Exception:
+            pass
 
     def compute_tx_digest(self, to_address: str, value_wei: int, data_hex: str) -> str:
         try:
@@ -959,11 +1108,13 @@ class ConfirmationStore:
         tx_digest = self.compute_tx_digest(norm_to, value_wei, clean_data)
 
         with self._lock:
+            self._load()
             now = time.time()
             # If an identical unconsumed and unexpired confirmation request exists, reuse it
             for existing in self._pending.values():
                 if (
                     existing.tx_digest == tx_digest
+                    and not existing.confirmed
                     and not existing.consumed
                     and not existing.rejected
                     and (now - existing.created_at) < self.ttl
@@ -989,10 +1140,12 @@ class ConfirmationStore:
                 metadata=dict(metadata or {}),
             )
             self._pending[conf_id] = entry
+            self._save()
             return entry
 
     def confirm(self, confirmation_id: str) -> bool:
         with self._lock:
+            self._load()
             if confirmation_id not in self._pending:
                 return False
             entry = self._pending[confirmation_id]
@@ -1002,10 +1155,12 @@ class ConfirmationStore:
             entry.rejected = False
             self._confirmed_ids.add(confirmation_id)
             self._rejected_ids.discard(confirmation_id)
+            self._save()
             return True
 
     def reject(self, confirmation_id: str) -> bool:
         with self._lock:
+            self._load()
             if confirmation_id not in self._pending:
                 return False
             entry = self._pending[confirmation_id]
@@ -1013,6 +1168,7 @@ class ConfirmationStore:
             entry.confirmed = False
             self._rejected_ids.add(confirmation_id)
             self._confirmed_ids.discard(confirmation_id)
+            self._save()
             return True
 
     def is_confirmed(
@@ -1024,6 +1180,7 @@ class ConfirmationStore:
         consume: bool = False,
     ) -> bool:
         with self._lock:
+            self._load()
             if confirmation_id in self._rejected_ids:
                 return False
             entry = self._pending.get(confirmation_id)
@@ -1048,10 +1205,12 @@ class ConfirmationStore:
             if consume:
                 entry.consumed = True
                 self._confirmed_ids.discard(confirmation_id)
+                self._save()
             return True
 
     def is_rejected(self, confirmation_id: str) -> bool:
         with self._lock:
+            self._load()
             if confirmation_id in self._rejected_ids:
                 return True
             entry = self._pending.get(confirmation_id)
@@ -1059,20 +1218,33 @@ class ConfirmationStore:
 
     def get(self, confirmation_id: str) -> PendingConfirmation | None:
         with self._lock:
+            self._load()
             return self._pending.get(confirmation_id)
 
     def list_pending(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [p.to_dict() for p in self._pending.values() if not p.confirmed and not p.rejected]
+            self._load()
+            now = time.time()
+            return [
+                p.to_dict()
+                for p in self._pending.values()
+                if not p.confirmed and not p.rejected and not p.consumed and (now - p.created_at) < self.ttl
+            ]
 
     def clear(self) -> None:
         with self._lock:
             self._pending.clear()
             self._confirmed_ids.clear()
             self._rejected_ids.clear()
+            if self.filepath and self.filepath.is_file():
+                try:
+                    self.filepath.unlink()
+                except Exception:
+                    pass
+            self._last_mtime = 0.0
 
 
-_DEFAULT_CONFIRMATION_STORE = ConfirmationStore()
+_DEFAULT_CONFIRMATION_STORE = ConfirmationStore(filepath=_resolve_confirmation_store_path())
 
 
 def get_default_confirmation_store() -> ConfirmationStore:
@@ -1082,7 +1254,9 @@ def get_default_confirmation_store() -> ConfirmationStore:
 
 def reset_default_confirmation_store() -> None:
     global _DEFAULT_CONFIRMATION_STORE
-    _DEFAULT_CONFIRMATION_STORE = ConfirmationStore()
+    if _DEFAULT_CONFIRMATION_STORE:
+        _DEFAULT_CONFIRMATION_STORE.clear()
+    _DEFAULT_CONFIRMATION_STORE = ConfirmationStore(filepath=_resolve_confirmation_store_path())
 
 
 # ==============================================================================
@@ -2908,6 +3082,15 @@ class PolicyEngine:
         if not is_financial_tool(tool_name):
             return VerificationResult(True, "", RiskScore.LOW)
 
+        if is_kill_switch_active():
+            panic_msg = "SafeGuard Panic: Emergency kill-switch is ACTIVE. All onchain transactions and financial operations are halted."
+            log_financial_action(
+                action=tool_name, status="blocked", mode=self.config.mode,
+                target="emergency_kill_switch", value_wei=0, data_hex="",
+                risk_score="critical", reason=panic_msg
+            )
+            return VerificationResult(False, panic_msg, RiskScore.CRITICAL)
+
         # Extract target address, value, and calldata from tool arguments
         to_address = str(
             tool_args.get("to")
@@ -3175,6 +3358,15 @@ class PolicyEngine:
         Returns:
             VerificationResult(allowed: bool, reason: str, risk_score: str)
         """
+        if is_kill_switch_active():
+            panic_msg = "SafeGuard Panic: Emergency kill-switch is ACTIVE. All onchain transactions are halted."
+            log_financial_action(
+                action="transaction", status="blocked", mode=self.config.mode,
+                target=to_address or "emergency_kill_switch", value_wei=value_wei, data_hex=data_hex,
+                risk_score="critical", reason=panic_msg
+            )
+            return VerificationResult(False, panic_msg, RiskScore.CRITICAL)
+
         # Resolve confirmation ID if provided
         if confirmation_id:
             cs = get_default_confirmation_store()
