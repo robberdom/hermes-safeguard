@@ -58,6 +58,23 @@ Hermes SafeGuard provides defense-in-depth security middleware for autonomous on
 
 ---
 
+## Supported Networks (v1 & Multi-Chain Expansion)
+
+Hermes SafeGuard v1 is officially pre-configured and validated for **Ethereum Mainnet** and **Base L2**, alongside local **Anvil state forks**:
+
+| Network | Chain ID | Verified Default Protocols & Routers | Status |
+| :--- | :--- | :--- | :--- |
+| **Ethereum Mainnet** | `1` | Uniswap (V2, V3, Universal), Aave V3/V2, OpenSea Seaport (1.5, 1.6, SeaDrop), 1inch, CoW Swap, Curve, Balancer, Lido, Robinhood Gateway | **Supported in v1** |
+| **Base L2** | `8453` | Aerodrome (Router & Slipstream), Base Uniswap (Router02 & Universal), Aave V3 Base, Canonical Base USDC | **Supported in v1** |
+| **Local Anvil Fork** | `31337` | Live state fork of Ethereum or Base (`anvil --fork-url <RPC>`) with zero-cost `debug_traceCall` | **Recommended for Layer 4** |
+| **Arbitrum One** | `42161` | Robinhood Arbitrum Swap Router, Aave V3 Arbitrum | *Verified in v1 (Full router catalog in v1.1)* |
+| **Optimism / Polygon / BSC** | Multiple | Additional L2s, cross-chain bridge invariants, and expanded DEX router definitions | *Planned for v1.1* |
+
+> [!NOTE]
+> SafeGuard defaults to Ethereum L1 and Base L2 contracts out of the box. Additional EVM networks can be targeted immediately by setting `SAFEGUARD_RPC_URL` and configuring their router addresses in policy YAML.
+
+---
+
 ## Architecture Overview
 
 ```
