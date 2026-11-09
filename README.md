@@ -71,7 +71,7 @@ Hermes SafeGuard v1 is officially pre-configured and validated for **Ethereum Ma
 | **Optimism / Polygon / BSC** | Multiple | Additional L2s, cross-chain bridge invariants, and expanded DEX router definitions | *Planned for v1.1* |
 
 > [!NOTE]
-> SafeGuard defaults to Ethereum L1 and Base L2 contracts out of the box. Additional EVM networks can be targeted immediately by setting `SAFEGUARD_RPC_URL` and configuring their router addresses in policy YAML.
+> **Live Chain Scope**: SafeGuard connects to live blockchain state specifically on **Ethereum Mainnet** and **Base L2**. Transactions targeted at other networks (such as Arbitrum, Polygon, Solana, or proprietary custodial platforms like Robinhood Crypto) cannot be read or verified against live on-chain state in v1 without adding dedicated RPC endpoints for those networks. Expansion to additional EVM chains is scheduled for v1.1.
 
 ---
 
