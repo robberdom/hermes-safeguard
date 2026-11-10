@@ -59,6 +59,11 @@ logger = logging.getLogger("SafeGuardTelegram")
 
 PAIRING_FILE = Path.home() / ".hermes" / "safeguard_pairing.json"
 LOCAL_PAIRING_FILE = REPO_ROOT / ".safeguard_pairing.json"
+try:
+    from storage import resolve_state_path
+    CANONICAL_PAIRING_FILE = resolve_state_path(".safeguard_pairing.json")
+except Exception:
+    CANONICAL_PAIRING_FILE = None
 
 _ACTIVE_OTP_CODES: Dict[str, Dict[str, Any]] = {}
 _LIVE_FEED_ENABLED: bool = os.getenv("SAFEGUARD_TG_LIVE_FEED", "0").lower() in ("1", "true", "yes")
@@ -86,7 +91,8 @@ def _get_pairing_file_path() -> Path:
 
 
 def load_pairings() -> Dict[str, Any]:
-    for p in (LOCAL_PAIRING_FILE, PAIRING_FILE):
+    candidates = [p for p in (CANONICAL_PAIRING_FILE, LOCAL_PAIRING_FILE, PAIRING_FILE) if p is not None]
+    for p in candidates:
         if p.is_file():
             try:
                 with open(p, "r", encoding="utf-8") as f:
@@ -99,7 +105,8 @@ def load_pairings() -> Dict[str, Any]:
 
 
 def save_pairings(data: Dict[str, Any]) -> None:
-    for p in (LOCAL_PAIRING_FILE, PAIRING_FILE):
+    candidates = [p for p in (CANONICAL_PAIRING_FILE, LOCAL_PAIRING_FILE, PAIRING_FILE) if p is not None]
+    for p in candidates:
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             with open(p, "w", encoding="utf-8") as f:

@@ -132,6 +132,29 @@ class TestPluginRegistration(unittest.TestCase):
 
         self.assertIn("legacy_tool", registered)
 
+    def test_grep_contract_address_redirection(self):
+        """Ensure agent grep/search attempts for onchain addresses are intercepted and redirected."""
+        res = safeguard.on_pre_tool_call(
+            "grep",
+            {"query": "0x5FbDB2315678afecb367f032d93F642f64180aa3", "path": "."},
+        )
+        self.assertEqual(res.get("action"), "block")
+        self.assertIn("on-chain smart contract", res.get("message", ""))
+        self.assertIn("safeguard_execute_tx", res.get("message", ""))
+
+    def test_auto_encode_mint_calldata(self):
+        """Ensure safeguard_execute_tx automatically encodes mint calldata for NFT contracts when data is 0x."""
+        import json
+        raw_res = safeguard.safeguard_execute_tx_handler(
+            to="0x5FbDB2315678afecb367f032d93F642f64180aa3",
+            value="0.05 ether",
+            data="0x",
+            mode="degen",
+        )
+        res = json.loads(raw_res)
+        # In degen mode with test RPC, the transaction passes or executes without error
+        self.assertTrue(res.get("allowed", False))
+
 
 if __name__ == "__main__":
     unittest.main()

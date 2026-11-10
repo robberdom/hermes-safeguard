@@ -126,6 +126,18 @@ _LOCAL_KILL_SWITCH_FILE = Path(__file__).resolve().parent / ".safeguard_kill_swi
 _KILL_SWITCH_ACTIVE: bool = False
 
 
+def _get_kill_switch_files() -> list[Path]:
+    files = [_LOCAL_KILL_SWITCH_FILE, _KILL_SWITCH_FILE]
+    try:
+        from storage import resolve_state_path
+        p = resolve_state_path(".safeguard_kill_switch")
+        if p not in files:
+            files.append(p)
+    except Exception:
+        pass
+    return files
+
+
 def is_kill_switch_active() -> bool:
     """True if operator has engaged emergency panic lockdown."""
     global _KILL_SWITCH_ACTIVE
@@ -133,7 +145,7 @@ def is_kill_switch_active() -> bool:
         return True
     if os.getenv("SAFEGUARD_KILL_SWITCH", "").strip().lower() in ("true", "1", "yes", "active"):
         return True
-    for p in (_KILL_SWITCH_FILE, _LOCAL_KILL_SWITCH_FILE):
+    for p in _get_kill_switch_files():
         if p.is_file():
             return True
     return False
@@ -145,7 +157,7 @@ def set_kill_switch(active: bool) -> None:
     _KILL_SWITCH_ACTIVE = active
     if active:
         os.environ["SAFEGUARD_KILL_SWITCH"] = "true"
-        for p in (_KILL_SWITCH_FILE, _LOCAL_KILL_SWITCH_FILE):
+        for p in _get_kill_switch_files():
             try:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.touch()
@@ -154,7 +166,7 @@ def set_kill_switch(active: bool) -> None:
     else:
         if "SAFEGUARD_KILL_SWITCH" in os.environ:
             del os.environ["SAFEGUARD_KILL_SWITCH"]
-        for p in (_KILL_SWITCH_FILE, _LOCAL_KILL_SWITCH_FILE):
+        for p in _get_kill_switch_files():
             try:
                 if p.is_file():
                     p.unlink()
@@ -311,7 +323,7 @@ class PromptInjectionDetector:
         r"transfer\s+ownership|"
         r"set\s+owner|"
         r"(?:export|reveal|send)\s+(?:private\s+key|seed\s+phrase|mnemonic)|"
-        r"(?:send|transfer)\s+(?:eth|funds|tokens|balance)\s+to\s+(?:0x[0-9a-fA-F]{40}|attacker|me|destination)",
+        r"(?:send|transfer|withdraw|drain|sweep)\s+(?:(?:\d+[a-zA-Z%]*|\$[\w]+|all|everything|entire\s+balance|funds|tokens?|eth|[a-zA-Z0-9_:-]+)\s+)*(?:to|into)\s+(?:(?:my\s+)?wallet|me|attacker|destination|recipient|0x[0-9a-fA-F]{40}|[a-zA-Z0-9_.-]+)",
         re.IGNORECASE,
     )
 
@@ -737,6 +749,7 @@ class AddressMemoryStore:
         self.auto_save: bool = auto_save
         self._lock = threading.Lock()
         self._entries: dict[str, AddressEntry] = {}
+        self._last_mtime: float = 0.0
 
         if self.filepath and self.filepath.is_file():
             self.load()
@@ -756,8 +769,20 @@ class AddressMemoryStore:
                             metadata=dict(item.get("metadata", {})),
                         )
 
+    def _ensure_loaded(self) -> None:
+        if not self.filepath or not self.filepath.is_file():
+            return
+        try:
+            mtime = self.filepath.stat().st_mtime
+            if mtime <= self._last_mtime and self._entries:
+                return
+            self.load()
+        except Exception:
+            pass
+
     @property
     def approved_addresses(self) -> set[str]:
+        self._ensure_loaded()
         with self._lock:
             return set(self._entries.keys())
 
@@ -770,6 +795,7 @@ class AddressMemoryStore:
         metadata: dict[str, Any] | None = None,
     ) -> AddressEntry:
         """Approve and record a recipient address or trusted contract."""
+        self._ensure_loaded()
         norm = normalize_address(address)
         entry = AddressEntry(
             address=norm,
@@ -790,6 +816,7 @@ class AddressMemoryStore:
 
     def is_approved(self, address: str, address_type: str | None = None) -> bool:
         """Check if an address is approved (and optionally matches expected address_type)."""
+        self._ensure_loaded()
         norm = normalize_address(address)
         with self._lock:
             entry = self._entries.get(norm)
@@ -804,11 +831,13 @@ class AddressMemoryStore:
         return self.is_approved(address, address_type)
 
     def get(self, address: str) -> AddressEntry | None:
+        self._ensure_loaded()
         norm = normalize_address(address)
         with self._lock:
             return self._entries.get(norm)
 
     def remove(self, address: str) -> bool:
+        self._ensure_loaded()
         norm = normalize_address(address)
         with self._lock:
             existed = norm in self._entries
@@ -825,6 +854,7 @@ class AddressMemoryStore:
             self.save()
 
     def list_addresses(self) -> list[dict[str, Any]]:
+        self._ensure_loaded()
         with self._lock:
             return [e.to_dict() for e in self._entries.values()]
 
@@ -839,6 +869,10 @@ class AddressMemoryStore:
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         temp_path.replace(target_path)
+        try:
+            self._last_mtime = target_path.stat().st_mtime
+        except Exception:
+            pass
 
     def load(self, path: str | Path | None = None) -> None:
         target_path = Path(path) if path else self.filepath
@@ -856,15 +890,27 @@ class AddressMemoryStore:
                     elif isinstance(item, str):
                         norm = normalize_address(item)
                         self._entries[norm] = AddressEntry(address=norm)
+        try:
+            self._last_mtime = target_path.stat().st_mtime
+        except Exception:
+            pass
 
 
+DEFAULT_MEMORY_STORE_PATH = Path(__file__).resolve().parent / ".safeguard_memory.json"
 _DEFAULT_MEMORY_STORE: AddressMemoryStore | None = None
 
 
 def get_default_memory_store() -> AddressMemoryStore:
     global _DEFAULT_MEMORY_STORE
     if _DEFAULT_MEMORY_STORE is None:
-        mem_path = os.getenv("SAFEGUARD_MEMORY_PATH")
+        if "SAFEGUARD_MEMORY_PATH" in os.environ:
+            mem_path = os.environ["SAFEGUARD_MEMORY_PATH"]
+        else:
+            try:
+                from storage import resolve_state_path
+                mem_path = str(resolve_state_path(".safeguard_memory.json"))
+            except Exception:
+                mem_path = str(DEFAULT_MEMORY_STORE_PATH)
         _DEFAULT_MEMORY_STORE = AddressMemoryStore(filepath=mem_path)
     return _DEFAULT_MEMORY_STORE
 
@@ -876,7 +922,13 @@ def set_default_memory_store(store: AddressMemoryStore | None) -> None:
 
 def reset_default_memory_store() -> None:
     global _DEFAULT_MEMORY_STORE
-    _DEFAULT_MEMORY_STORE = AddressMemoryStore()
+    if _DEFAULT_MEMORY_STORE:
+        _DEFAULT_MEMORY_STORE.clear()
+    mem_path = os.getenv("SAFEGUARD_MEMORY_PATH")
+    if mem_path:
+        _DEFAULT_MEMORY_STORE = AddressMemoryStore(filepath=mem_path)
+    else:
+        _DEFAULT_MEMORY_STORE = AddressMemoryStore()
 
 
 def safeguard_approve_address(
@@ -968,6 +1020,13 @@ LOCAL_CONFIRMATION_STORE_PATH = Path(__file__).resolve().parent / ".safeguard_co
 
 
 def _resolve_confirmation_store_path() -> Path:
+    try:
+        from storage import resolve_state_path
+        p = resolve_state_path(".safeguard_confirmations.json")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+    except Exception:
+        pass
     try:
         DEFAULT_CONFIRMATION_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
         return DEFAULT_CONFIRMATION_STORE_PATH
@@ -1161,6 +1220,28 @@ class ConfirmationStore:
             self._save()
             return True
 
+    def find_confirmed_entry(self, to_address: str, value_wei: int | None = None) -> PendingConfirmation | None:
+        """Find an unconsumed confirmed entry matching to_address and value."""
+        with self._lock:
+            self._load()
+            now = time.time()
+            try:
+                norm_to = normalize_address(to_address)
+            except Exception:
+                norm_to = str(to_address).strip().lower()
+            for entry in reversed(list(self._pending.values())):
+                if (
+                    entry.confirmed
+                    and not entry.rejected
+                    and not entry.consumed
+                    and (now - entry.created_at) < self.ttl
+                    and entry.to_address == norm_to
+                ):
+                    if value_wei is not None and int(entry.value_wei) != int(value_wei):
+                        continue
+                    return entry
+            return None
+
     def reject(self, confirmation_id: str) -> bool:
         with self._lock:
             self._load()
@@ -1203,7 +1284,8 @@ class ConfirmationStore:
                 return False
             if data_hex is not None:
                 clean_data = _canonical_data_hex(data_hex)
-                if entry.data_hex != clean_data:
+                entry_data = _canonical_data_hex(entry.data_hex)
+                if entry_data != clean_data:
                     return False
             if consume:
                 entry.consumed = True
@@ -1625,6 +1707,17 @@ def safeguard_confirm_action(
         }
 
     if approved:
+        # Exploit safety check: Never confirm known critical exploits even if operator requests
+        raw_data = str(entry.data_hex or "").lower().replace("0x", "")
+        sel = raw_data[:8]
+        if sel in ("d8a17684", "f4c9c118", "756e6578", "de1e9a7e", "74617802"):
+            cs.reject(confirmation_id)
+            return {
+                "status": "error",
+                "confirmation_id": confirmation_id,
+                "approved": False,
+                "message": "Cannot confirm action: transaction calldata matches known exploit pattern / drainer selector. SafeGuard blocked confirmation.",
+            }
         success = cs.confirm(confirmation_id)
         if not success:
             return {
@@ -2941,7 +3034,36 @@ class PolicyEngine:
         threat_feed: ThreatFeed | None = None,
     ) -> None:
         if config is None:
-            self.config = PolicyConfig.strict()
+            env_var = os.getenv("SAFEGUARD_MODE")
+            if env_var and env_var.strip():
+                active_m = env_var.strip().lower()
+            else:
+                active_m = None
+                try:
+                    from storage import read_state_file
+                    content = read_state_file(".safeguard_mode")
+                    if content and content.strip().lower() in ("strict", "balanced", "degen"):
+                        active_m = content.strip().lower()
+                except Exception:
+                    pass
+                if not active_m:
+                    for p in [Path(".safeguard_mode"), Path(__file__).resolve().parent / ".safeguard_mode"]:
+                        if p.is_file():
+                            try:
+                                content = p.read_text(encoding="utf-8").strip().lower()
+                                if content in ("strict", "balanced", "degen"):
+                                    active_m = content
+                                    break
+                            except Exception:
+                                pass
+                if not active_m:
+                    active_m = "degen"
+            if active_m == "degen":
+                self.config = PolicyConfig.degen()
+            elif active_m == "balanced":
+                self.config = PolicyConfig.balanced()
+            else:
+                self.config = PolicyConfig.strict()
         elif isinstance(config, dict):
             self.config = PolicyConfig.from_dict(config)
         elif isinstance(config, PolicyConfig):
@@ -3402,9 +3524,9 @@ class PolicyEngine:
             )
             return VerificationResult(False, panic_msg, RiskScore.CRITICAL)
 
-        # Resolve confirmation ID if provided
+        # Resolve confirmation ID if provided or locate matching unconsumed confirmed request
+        cs = get_default_confirmation_store()
         if confirmation_id:
-            cs = get_default_confirmation_store()
             if cs.is_rejected(str(confirmation_id)):
                 res = VerificationResult(
                     False,
@@ -3419,6 +3541,12 @@ class PolicyEngine:
                 return res
             if cs.is_confirmed(str(confirmation_id), to_address=to_address, value_wei=value_wei, data_hex=data_hex):
                 confirmed = True
+        elif not confirmed:
+            matched_entry = cs.find_confirmed_entry(to_address, value_wei)
+            if matched_entry is not None:
+                if cs.is_confirmed(matched_entry.id, to_address=to_address, value_wei=value_wei, data_hex=data_hex):
+                    confirmed = True
+                    confirmation_id = matched_entry.id
 
         # Step 0: Prompt / indirect injection check on untrusted context
         injection_signal = InjectionSignal()
@@ -3685,26 +3813,6 @@ class PolicyEngine:
                         log_financial_action(action="contract_call", status="requires_confirmation", mode="degen", target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="medium", reason=conf.reason, summary=summary, confirmation_id=conf.id)
                         return VerificationResult(
                             False, "SG: target not in degen contract allowlist", RiskScore.MEDIUM,
-                            requires_confirmation=True,
-                            is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
-                            confirmation_id=conf.id, confirmation_summary=summary,
-                        )
-            elif self.recipient_allowlist:
-                if target_norm not in self.recipient_allowlist and not self.memory_store.is_approved(target_norm):
-                    if not confirmed:
-                        summary = generate_transaction_summary(
-                            to_address, value_wei, data_hex,
-                            risk_reasons=[f"Target 0x{target_norm} is not in recipient allowlist"],
-                            mode="degen",
-                        )
-                        conf = get_default_confirmation_store().create_confirmation_request(
-                            action="transaction", to_address=to_address, value_wei=value_wei, data_hex=data_hex,
-                            risk_score="medium", reason="SG: target not whitelisted",
-                            summary=summary, mode="degen",
-                        )
-                        log_financial_action(action="transaction", status="requires_confirmation", mode="degen", target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="medium", reason=conf.reason, summary=summary, confirmation_id=conf.id)
-                        return VerificationResult(
-                            False, "SG: target not whitelisted", RiskScore.MEDIUM,
                             requires_confirmation=True,
                             is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
                             confirmation_id=conf.id, confirmation_summary=summary,

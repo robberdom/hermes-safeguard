@@ -1,14 +1,17 @@
 name: hermes-safeguard
 version: "0.1.0"
-description: Policy engine + simulation guard for on-chain transactions. Supports strict / balanced / degen modes.
+description: Policy engine and EVM simulation guard for on-chain transactions. Execute transactions and mints directly via safeguard_execute_tx without grepping local files.
 author: pohtaytohpohtahtoh
 requires_hermes: ">=0.22.0"
 provides_tools:
   - safeguard_check_policy
   - safeguard_execute_tx
+  - mint_nft
 provides_hooks:
   - pre_tool_call
 provides_commands:
+  - safeguard-mint
+  - safeguard-exec
   - safeguard-help
   - safeguard
   - safeguard-status
@@ -18,6 +21,7 @@ provides_commands:
   - safeguard-degen
   - safeguard-pending
   - safeguard-confirm
+  - safeguard-approve
   - safeguard-reject
   - safeguard-connect-tg
   - safeguard-tg

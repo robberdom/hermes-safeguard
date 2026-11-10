@@ -25,7 +25,7 @@ foundry.lock
 .env
 .env.*
 *.log
-.safeguard_pairing.json
+.safeguard_*
 .vscode/
 .idea/
 

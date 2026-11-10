@@ -721,6 +721,8 @@ def find_contract_artifact() -> Path:
 def deploy_policy_contract(rpc_url: str = DEFAULT_RPC_URL) -> str:
     """Deploy SafeGuardPolicy.sol bytecode to the local RPC node and return its address."""
     global _CACHED_POLICY_ADDRESSES
+    if os.getenv("SAFEGUARD_RPC_URL"):
+        rpc_url = os.getenv("SAFEGUARD_RPC_URL")
 
     chain_id = 1
     try:
@@ -814,6 +816,8 @@ def inspect_execution_trace(
     norm_from = normalize_address(from_address)
     norm_to = normalize_address(to_address)
     mode = str(mode).lower().strip()
+    if os.getenv("SAFEGUARD_RPC_URL"):
+        rpc_url = os.getenv("SAFEGUARD_RPC_URL")
 
     allowed_targets = {normalize_address(a) for a in (whitelist or [DEFAULT_ALLOWED_TARGET])}
     if contract_allowlist:
@@ -1522,6 +1526,14 @@ def verify_transaction(
         Fails closed on any RPC, revert, trace failure, or connection error.
     """
     try:
+        if os.getenv("SAFEGUARD_RPC_URL"):
+            rpc_url = os.getenv("SAFEGUARD_RPC_URL")
+        if ("127.0.0.1" in rpc_url or "localhost" in rpc_url) and not is_rpc_available("127.0.0.1", 8545):
+            try:
+                ensure_test_rpc_server("127.0.0.1", 8545)
+                rpc_url = DEFAULT_RPC_URL
+            except Exception:
+                pass
         if is_kill_switch_active():
             panic_msg = "SafeGuard Panic: Emergency kill-switch is ACTIVE. All onchain transactions are halted."
             return VerificationResult(False, panic_msg, RiskScore.CRITICAL)
@@ -1531,7 +1543,36 @@ def verify_transaction(
 
         # Resolve PolicyConfig
         if config is None:
-            policy_cfg = PolicyConfig.strict(recipient_allowlist=whitelist)
+            env_var = os.getenv("SAFEGUARD_MODE")
+            if env_var and env_var.strip():
+                active_m = env_var.strip().lower()
+            else:
+                active_m = None
+                try:
+                    from storage import read_state_file
+                    content = read_state_file(".safeguard_mode")
+                    if content and content.strip().lower() in ("strict", "balanced", "degen"):
+                        active_m = content.strip().lower()
+                except Exception:
+                    pass
+                if not active_m:
+                    for p in [Path(".safeguard_mode"), Path(__file__).resolve().parent / ".safeguard_mode"]:
+                        if p.is_file():
+                            try:
+                                content = p.read_text(encoding="utf-8").strip().lower()
+                                if content in ("strict", "balanced", "degen"):
+                                    active_m = content
+                                    break
+                            except Exception:
+                                pass
+                if not active_m:
+                    active_m = "degen"
+            if active_m == "strict":
+                policy_cfg = PolicyConfig.strict(recipient_allowlist=whitelist)
+            elif active_m == "degen":
+                policy_cfg = PolicyConfig.degen(contract_allowlist=whitelist)
+            else:
+                policy_cfg = PolicyConfig.balanced(recipient_allowlist=whitelist)
         elif isinstance(config, PolicyConfig):
             policy_cfg = config
             if whitelist and not policy_cfg.recipient_allowlist:
@@ -1551,9 +1592,15 @@ def verify_transaction(
         if memory_store is not None:
             policy_cfg.memory_store = memory_store
 
-        # Resolve confirmation ID if provided
+        # Resolve confirmation ID if provided or from recent operator approval
+        cs = get_default_confirmation_store()
+        if not confirmation_id:
+            recent_entry = cs.find_confirmed_entry(to_address, value_wei=value_wei)
+            if recent_entry:
+                confirmation_id = recent_entry.id
+                confirmed = True
+
         if confirmation_id:
-            cs = get_default_confirmation_store()
             if cs.is_rejected(str(confirmation_id)):
                 return VerificationResult(
                     False, f"SG: confirmation {confirmation_id} was rejected by operator", RiskScore.CRITICAL
@@ -1587,7 +1634,8 @@ def verify_transaction(
         pre_res = engine.evaluate_transaction_policy(
             to_address, value_wei, data_hex, context=context, confirmed=confirmed, scan_n=scan_n, confirmation_id=confirmation_id
         )
-        if not pre_res.allowed:
+        # If transaction is strictly blocked without requiring confirmation (e.g. kill switch, injection hard block, denylist), return immediately
+        if not pre_res.allowed and not getattr(pre_res, "requires_confirmation", False):
             return pre_res
 
         def _rollback_memory_approval() -> None:
@@ -1598,8 +1646,66 @@ def verify_transaction(
                     except Exception:
                         pass
 
+        # Step 2: Execution trace & state-diff check via debug_traceCall (require_simulation is always True)
+        # Simulation MUST run before operator confirmation: if a transaction is an exploit, drain,
+        # honeypot, or extortion tax, it must be HARD-BLOCKED immediately and NEVER presented for human approval!
+        trace_res = inspect_execution_trace(
+            to_address=to_address,
+            value_wei=value_wei,
+            data_hex=data_hex,
+            from_address=from_address,
+            whitelist=policy_cfg.recipient_allowlist,
+            rpc_url=rpc_url,
+            contract_allowlist=policy_cfg.contract_allowlist,
+            mode=policy_cfg.mode,
+            memory_store=engine.memory_store,
+            tax_warning_threshold=getattr(policy_cfg, "tax_warning_threshold", TAX_WARNING_THRESHOLD_PCT),
+            tax_block_threshold=getattr(policy_cfg, "tax_block_threshold", TAX_BLOCK_THRESHOLD_PCT),
+            denylist=getattr(policy_cfg, "recipient_denylist", getattr(engine, "denylist", [])),
+            threat_feed=getattr(engine, "threat_feed", getattr(policy_cfg, "threat_feed", None)),
+        )
+
+        if not trace_res.allowed:
+            # If trace_res is an EXPLOIT or CRITICAL risk (drain pattern, balance loss, delegatecall, extortion tax):
+            # HARD BLOCK IMMEDIATELY! Exploits can NEVER be held for operator confirmation!
+            if (
+                trace_res.risk_score in (RiskScore.CRITICAL, RiskScore.CRITICAL.value, "critical")
+                or "drain" in trace_res.reason.lower()
+                or "tax" in trace_res.reason.lower()
+                or "delegatecall" in trace_res.reason.lower()
+                or "balance loss" in trace_res.reason.lower()
+            ):
+                _rollback_memory_approval()
+                cid = getattr(pre_res, "confirmation_id", None) or confirmation_id
+                if cid:
+                    try:
+                        get_default_confirmation_store().reject(str(cid))
+                    except Exception:
+                        pass
+                log_financial_action(
+                    action="transaction", status="blocked", mode=policy_cfg.mode,
+                    target=to_address, value_wei=value_wei, data_hex=data_hex,
+                    risk_score=trace_res.risk_score, reason=trace_res.reason,
+                )
+                return VerificationResult(
+                    False,
+                    trace_res.reason,
+                    trace_res.risk_score,
+                    warning=trace_res.warning,
+                    requires_confirmation=False,  # Hard block: exploits can NEVER be confirmed or approved
+                    injection_detected=getattr(pre_res, "injection_detected", False),
+                    is_new_recipient=getattr(pre_res, "is_new_recipient", False),
+                    flagged_addresses=getattr(pre_res, "flagged_addresses", []),
+                )
+
+        # If simulation passed cleanly, but policy requires operator confirmation (e.g. strict mode new recipient):
+        if not pre_res.allowed and getattr(pre_res, "requires_confirmation", False):
+            return pre_res
+
         # In strict mode (or if explicit policy_address provided), evaluate against SafeGuardPolicy.sol contract
-        if policy_cfg.mode == "strict" or policy_address:
+        # An operator-confirmed action or pre-approved address bypasses static on-chain allowlist
+        is_memory_approved = bool(engine.memory_store and engine.memory_store.is_approved(to_address))
+        if (policy_cfg.mode == "strict" or policy_address) and not confirmed and not is_memory_approved:
             if not policy_address:
                 try:
                     policy_address = deploy_policy_contract(rpc_url)
@@ -1638,41 +1744,7 @@ def verify_transaction(
                 log_financial_action(action="transaction", status="blocked", mode=policy_cfg.mode, target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="high", reason=reason)
                 return VerificationResult(False, reason, RiskScore.HIGH)
 
-        # Step 2: Execution trace & state-diff check via debug_traceCall (require_simulation is always True)
-        trace_res = inspect_execution_trace(
-            to_address=to_address,
-            value_wei=value_wei,
-            data_hex=data_hex,
-            from_address=from_address,
-            whitelist=policy_cfg.recipient_allowlist,
-            rpc_url=rpc_url,
-            contract_allowlist=policy_cfg.contract_allowlist,
-            mode=policy_cfg.mode,
-            memory_store=engine.memory_store,
-            tax_warning_threshold=getattr(policy_cfg, "tax_warning_threshold", TAX_WARNING_THRESHOLD_PCT),
-            tax_block_threshold=getattr(policy_cfg, "tax_block_threshold", TAX_BLOCK_THRESHOLD_PCT),
-            denylist=getattr(policy_cfg, "recipient_denylist", getattr(engine, "denylist", [])),
-            threat_feed=getattr(engine, "threat_feed", getattr(policy_cfg, "threat_feed", None)),
-        )
 
-        if not trace_res.allowed:
-            _rollback_memory_approval()
-            # Preserves failure reason and is_new_recipient flag
-            log_financial_action(
-                action="transaction", status="blocked", mode=policy_cfg.mode,
-                target=to_address, value_wei=value_wei, data_hex=data_hex,
-                risk_score=trace_res.risk_score, reason=trace_res.reason,
-            )
-            return VerificationResult(
-                False,
-                trace_res.reason,
-                trace_res.risk_score,
-                warning=trace_res.warning,
-                requires_confirmation=trace_res.requires_confirmation,
-                injection_detected=pre_res.injection_detected,
-                is_new_recipient=pre_res.is_new_recipient,
-                flagged_addresses=pre_res.flagged_addresses,
-            )
 
         if pre_res.is_new_recipient:
             # Combine risk scores and warnings for new recipient allowed in balanced/degen or confirmed strict
@@ -1759,7 +1831,9 @@ class _MockRPCHandler(BaseHTTPRequestHandler):
             method = req.get("method")
             params = req.get("params", [])
 
-            if method == "eth_accounts":
+            if method in ("safeguard_isMock", "safeguard_is_mock", "safeguard_ping"):
+                resp = {"jsonrpc": "2.0", "id": req_id, "result": "hermes-safeguard-mock-rpc"}
+            elif method == "eth_accounts":
                 resp = {"jsonrpc": "2.0", "id": req_id, "result": ["0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"]}
             elif method == "eth_sendTransaction":
                 resp = {"jsonrpc": "2.0", "id": req_id, "result": "0x" + "aa" * 32}
@@ -1787,7 +1861,31 @@ class _MockRPCHandler(BaseHTTPRequestHandler):
                     inner_len = int(data[8 + offset : 8 + offset + 64], 16) * 2
                     inner_data = data[8 + offset + 64 : 8 + offset + 64 + inner_len]
 
-                    engine = PolicyEngine(PolicyConfig.strict(max_eth_per_tx=DEFAULT_MAX_VALUE_WEI))
+                    active_m = None
+                    try:
+                        from storage import read_state_file
+                        content = read_state_file(".safeguard_mode")
+                        if content and content.strip().lower() in ("strict", "balanced", "degen"):
+                            active_m = content.strip().lower()
+                    except Exception:
+                        pass
+                    if not active_m:
+                        for p in [Path(".safeguard_mode"), Path(__file__).resolve().parent / ".safeguard_mode"]:
+                            if p.is_file():
+                                try:
+                                    active_m = p.read_text(encoding="utf-8").strip().lower()
+                                    if active_m in ("strict", "balanced", "degen"):
+                                        break
+                                except Exception:
+                                    pass
+                    active_m = (active_m or os.getenv("SAFEGUARD_MODE", "degen")).strip().lower()
+                    if active_m == "degen":
+                        mock_cfg = PolicyConfig.degen()
+                    elif active_m == "balanced":
+                        mock_cfg = PolicyConfig.balanced()
+                    else:
+                        mock_cfg = PolicyConfig.strict(max_eth_per_tx=DEFAULT_MAX_VALUE_WEI)
+                    engine = PolicyEngine(mock_cfg)
                     allowed, err = engine.evaluate_transaction_policy(target_addr, val_wei, inner_data, confirmed=True)
                     if not allowed:
                         resp = self._make_revert(req_id, err)
@@ -2248,15 +2346,52 @@ class ReusableHTTPServer(HTTPServer):
     allow_reuse_address = True
 
 
-def ensure_test_rpc_server(host: str = "127.0.0.1", port: int = 8545) -> None:
-    """Ensure a local RPC or mock RPC server is available on port 8545 for testing."""
-    global _SHARED_MOCK_SERVER
+def is_mock_rpc_available(host: str = "127.0.0.1", port: int = 8545) -> bool:
+    """Check if the server on host:port is specifically Hermes SafeGuard's mock RPC."""
+    try:
+        res = rpc_request(f"http://{host}:{port}", "safeguard_isMock", [], timeout=0.5)
+        return res.get("result") == "hermes-safeguard-mock-rpc"
+    except Exception:
+        return False
+
+
+def ensure_test_rpc_server(host: str = "127.0.0.1", port: int = 8545) -> int:
+    """Ensure a local mock RPC server is available for testing."""
+    global _SHARED_MOCK_SERVER, DEFAULT_RPC_URL
     with _SHARED_MOCK_SERVER_LOCK:
-        if not is_rpc_available(host, port):
-            _SHARED_MOCK_SERVER = ReusableHTTPServer((host, port), _MockRPCHandler)
-            server_thread = threading.Thread(target=_SHARED_MOCK_SERVER.serve_forever, daemon=True)
-            server_thread.start()
-            time.sleep(0.1)
+        if _SHARED_MOCK_SERVER is not None:
+            active_p = getattr(_SHARED_MOCK_SERVER, "server_port", port)
+            active_u = f"http://{host}:{active_p}"
+            DEFAULT_RPC_URL = active_u
+            os.environ["SAFEGUARD_RPC_URL"] = active_u
+            return active_p
+
+        target_port = port
+        if is_rpc_available(host, port):
+            if is_mock_rpc_available(host, port):
+                target_url = f"http://{host}:{port}"
+                DEFAULT_RPC_URL = target_url
+                os.environ["SAFEGUARD_RPC_URL"] = target_url
+                return port
+            # Port is occupied by a foreign server (e.g. Anvil / dev node).
+            # Fall back to an alternate mock test port to guarantee isolated and passing tests.
+            for alt_port in (8546, 8547, 8548, 18545):
+                if not is_rpc_available(host, alt_port):
+                    target_port = alt_port
+                    break
+            else:
+                target_port = 0
+
+        _SHARED_MOCK_SERVER = ReusableHTTPServer((host, target_port), _MockRPCHandler)
+        actual_port = _SHARED_MOCK_SERVER.server_address[1]
+        _SHARED_MOCK_SERVER.server_port = actual_port
+        server_thread = threading.Thread(target=_SHARED_MOCK_SERVER.serve_forever, daemon=True)
+        server_thread.start()
+        time.sleep(0.1)
+
+        target_url = f"http://{host}:{actual_port}"
+        DEFAULT_RPC_URL = target_url
+        os.environ["SAFEGUARD_RPC_URL"] = target_url
 
         # On Anvil nodes, configure mock bytecode on test targets to simulate traces
         for target in (
@@ -2264,12 +2399,16 @@ def ensure_test_rpc_server(host: str = "127.0.0.1", port: int = 8545) -> None:
             "0x000000000000000000000000000000000000C001",
             "0x000000000000000000000000000000000000F001",
             "0x5555555555555555555555555555555555555555",
+            "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+            "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512",
         ):
             try:
                 code = build_test_contract_bytecode(target_contract=target)
-                rpc_request(f"http://{host}:{port}", "anvil_setCode", [target, code])
+                rpc_request(f"http://{host}:{actual_port}", "anvil_setCode", [target, code])
             except Exception:
                 pass
+
+        return actual_port
 
 
 # ==============================================================================

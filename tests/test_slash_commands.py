@@ -57,7 +57,11 @@ class MockHermesContext:
 
 class TestSafeGuardSlashCommands(unittest.TestCase):
     def setUp(self):
-        # Reset mode to balanced
+        self._orig_env_mode = os.environ.get("SAFEGUARD_MODE")
+        self._mode_file = safeguard.Path(__file__).resolve().parent.parent / ".safeguard_mode"
+        self._orig_file_mode = self._mode_file.read_text(encoding="utf-8") if self._mode_file.is_file() else None
+        self._env_file = safeguard.Path(__file__).resolve().parent.parent / ".env"
+        self._orig_env_content = self._env_file.read_text(encoding="utf-8") if self._env_file.is_file() else None
         os.environ["SAFEGUARD_MODE"] = "balanced"
         if "SAFEGUARD_POLICY_PATH" in os.environ:
             del os.environ["SAFEGUARD_POLICY_PATH"]
@@ -65,7 +69,16 @@ class TestSafeGuardSlashCommands(unittest.TestCase):
         reset_default_memory_store()
 
     def tearDown(self):
-        os.environ["SAFEGUARD_MODE"] = "balanced"
+        if self._orig_env_mode is not None:
+            os.environ["SAFEGUARD_MODE"] = self._orig_env_mode
+        elif "SAFEGUARD_MODE" in os.environ:
+            del os.environ["SAFEGUARD_MODE"]
+        if self._orig_file_mode is not None:
+            self._mode_file.write_text(self._orig_file_mode, encoding="utf-8")
+        elif self._mode_file.is_file():
+            self._mode_file.unlink(missing_ok=True)
+        if self._orig_env_content is not None:
+            self._env_file.write_text(self._orig_env_content, encoding="utf-8")
         if "SAFEGUARD_POLICY_PATH" in os.environ:
             del os.environ["SAFEGUARD_POLICY_PATH"]
         reset_default_confirmation_store()

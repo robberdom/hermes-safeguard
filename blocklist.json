@@ -262,6 +262,32 @@
       "reported_date": "2026-10-28",
       "source": "local_threat_feed",
       "metadata": {}
+    },
+    {
+      "id": "AAP-007",
+      "type": "agent_attack_pattern",
+      "title": "Inter-Agent Obfuscated Relay & Token Drain (Grok-Bankrbot Incident)",
+      "name": "Inter-Agent Obfuscated Relay & Token Drain",
+      "category": "agent_attack_pattern",
+      "threat_level": "CRITICAL",
+      "severity": "CRITICAL",
+      "description": "Multi-agent prompt injection via NFT privilege gifting and Morse-code obfuscation relayed across trusted agent boundaries, triggering unauthorized on-chain token drains.",
+      "indicators": [
+        "morse code",
+        "inter-agent relay",
+        "nft privilege escalation",
+        "token drain",
+        "0x6fc7eb7da9379383efda4253e4f599bbc3a99afed0468eabfe18484ec525739a",
+        "ilhamrafli.base.eth",
+        "debtreliefbot"
+      ],
+      "reported_date": "2026-05-04",
+      "source": "public_incident_report",
+      "metadata": {
+        "incident": "May 4 2026 Grok-Bankrbot Drain",
+        "loss_amount": "$150k-$200k (3B DRB)",
+        "tx_hash": "0x6fc7eb7da9379383efda4253e4f599bbc3a99afed0468eabfe18484ec525739a"
+      }
     }
   ]
 }
