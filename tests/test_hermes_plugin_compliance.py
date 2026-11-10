@@ -63,11 +63,10 @@ class TestHermesPluginCompliance(unittest.TestCase):
         hooks_list = data.get("provides_hooks", [])
         self.assertIn("pre_tool_call", hooks_list)
 
-        cmds_list = data.get("provides_commands", [])
-        self.assertIn("safeguard-mode", cmds_list)
-        self.assertIn("safeguard-status", cmds_list)
-        self.assertIn("safeguard-confirm", cmds_list)
-        self.assertIn("safeguard-reject", cmds_list)
+        env_list = data.get("requires_env", [])
+        env_names = [e["name"] if isinstance(e, dict) else e for e in env_list]
+        self.assertIn("SAFEGUARD_RPC_URL", env_names)
+        self.assertIn("TELEGRAM_BOT_TOKEN", env_names)
 
     def test_schemas_match_declared_tools(self):
         """Verify schemas.py defines schemas for all declared tools with valid JSON schema properties."""

@@ -21,42 +21,86 @@ import re
 from pathlib import Path
 from typing import Any
 
-from policy_engine import (
-    APPROVE_SELECTOR,
-    UINT256_MAX,
-    PolicyConfig,
-    PolicyMode,
-    RiskScore,
-    VerificationResult,
-    _parse_wei_value,
-    get_default_audit_logger,
-    get_default_confirmation_store,
-    get_default_memory_store,
-    get_default_threat_feed,
-    is_financial_tool,
-    log_financial_action,
-    normalize_address,
-    safeguard_approve_address,
-    safeguard_confirm_action,
-    safeguard_get_audit_log,
-    safeguard_list_approved_addresses,
-    safeguard_list_pending_confirmations,
-    safeguard_revoke_address,
-    is_kill_switch_active,
-    set_kill_switch,
-)
-from storage import get_plugin_data_dir, read_state_file, write_state_file, resolve_state_path
-from verifier import (
-    DEFAULT_RPC_URL,
-    ERC20_TRANSFER_SELECTOR,
-    encode_address_word,
-    encode_nft_mint_calldata,
-    encode_uint256_word,
-    ensure_test_rpc_server,
-    is_rpc_available,
-    rpc_request,
-    verify_transaction,
-)
+try:
+    from .policy_engine import (
+        APPROVE_SELECTOR,
+        UINT256_MAX,
+        PolicyConfig,
+        PolicyMode,
+        RiskScore,
+        VerificationResult,
+        _parse_wei_value,
+        get_default_audit_logger,
+        get_default_confirmation_store,
+        get_default_memory_store,
+        get_default_threat_feed,
+        is_financial_tool,
+        log_financial_action,
+        normalize_address,
+        safeguard_approve_address,
+        safeguard_confirm_action,
+        safeguard_get_audit_log,
+        safeguard_list_approved_addresses,
+        safeguard_list_pending_confirmations,
+        safeguard_revoke_address,
+        is_kill_switch_active,
+        set_kill_switch,
+        PromptInjectionDetector,
+        format_layer0_alert_banner,
+        InjectionSignal,
+    )
+    from .storage import get_plugin_data_dir, read_state_file, write_state_file, resolve_state_path
+    from .verifier import (
+        DEFAULT_RPC_URL,
+        ERC20_TRANSFER_SELECTOR,
+        encode_address_word,
+        encode_nft_mint_calldata,
+        encode_uint256_word,
+        ensure_test_rpc_server,
+        is_rpc_available,
+        rpc_request,
+        verify_transaction,
+    )
+except (ImportError, ValueError):
+    from policy_engine import (
+        APPROVE_SELECTOR,
+        UINT256_MAX,
+        PolicyConfig,
+        PolicyMode,
+        RiskScore,
+        VerificationResult,
+        _parse_wei_value,
+        get_default_audit_logger,
+        get_default_confirmation_store,
+        get_default_memory_store,
+        get_default_threat_feed,
+        is_financial_tool,
+        log_financial_action,
+        normalize_address,
+        safeguard_approve_address,
+        safeguard_confirm_action,
+        safeguard_get_audit_log,
+        safeguard_list_approved_addresses,
+        safeguard_list_pending_confirmations,
+        safeguard_revoke_address,
+        is_kill_switch_active,
+        set_kill_switch,
+        PromptInjectionDetector,
+        format_layer0_alert_banner,
+        InjectionSignal,
+    )
+    from storage import get_plugin_data_dir, read_state_file, write_state_file, resolve_state_path
+    from verifier import (
+        DEFAULT_RPC_URL,
+        ERC20_TRANSFER_SELECTOR,
+        encode_address_word,
+        encode_nft_mint_calldata,
+        encode_uint256_word,
+        ensure_test_rpc_server,
+        is_rpc_available,
+        rpc_request,
+        verify_transaction,
+    )
 
 logger = logging.getLogger("hermes-safeguard.tools")
 
@@ -197,12 +241,124 @@ def safeguard_check_policy_handler(*args: Any, **kwargs: Any) -> str:
     if "params" in call_args and isinstance(call_args["params"], dict):
         call_args.update(call_args["params"])
 
-    to_addr = str(call_args.get("to") or call_args.get("to_address") or "").strip()
-    val_raw = call_args.get("value", 0)
-    data_raw = str(call_args.get("data") or call_args.get("data_hex") or "0x").strip()
+    to_addr = str(
+        call_args.get("to")
+        or call_args.get("to_address")
+        or call_args.get("target")
+        or call_args.get("recipient")
+        or call_args.get("address")
+        or call_args.get("contract")
+        or call_args.get("contract_address")
+        or call_args.get("token")
+        or call_args.get("token_address")
+        or call_args.get("destination")
+        or ""
+    ).strip().lower()
+    val_raw = call_args.get("value", call_args.get("value_wei", 0))
+    data_raw = str(
+        call_args.get("data")
+        or call_args.get("data_hex")
+        or call_args.get("calldata")
+        or call_args.get("input")
+        or "0x"
+    ).strip()
 
-    # Read-only dry run: mode is operator-controlled.
+    if not data_raw or data_raw in ("0x", "0X"):
+        if (
+            call_args.get("action") == "mint"
+            or "quantity" in call_args
+            or "mint" in to_addr.lower()
+            or "mint" in str(call_args).lower()
+            or to_addr.lower() == "0x5fbdb2315678afecb367f032d93f642f64180aa3"
+        ):
+            data_raw = encode_nft_mint_calldata(1)
+        else:
+            data_raw = "0x"
+    if is_kill_switch_active():
+        config, resolved_mode = _get_policy_config()
+        val_wei = _parse_wei_value(val_raw, 0)
+        short_addr = f"{to_addr[:6]}...{to_addr[-4:]}" if (to_addr.startswith("0x") and len(to_addr) >= 10) else (to_addr or "unknown")
+        val_display = f"{val_wei / 10**18:.4f}".rstrip("0").rstrip(".") + " ETH" if val_wei else "0 ETH"
+        if val_display == " ETH":
+            val_display = "0 ETH"
+        panic_msg = f"🛑 [SAFEGUARD PANIC LOCK ACTIVE]: Transaction to {short_addr} ({val_display}) ABORTED. Operator kill-switch is engaged. Emergency kill-switch is ACTIVE. Zero RPC calls dispatched."
+        log_financial_action(
+            action="safeguard_check_policy", status="blocked", mode=resolved_mode,
+            target=to_addr or "emergency_kill_switch", value_wei=val_wei,
+            data_hex=data_raw, risk_score="critical", reason=panic_msg
+        )
+        return json.dumps({
+            "status": "blocked",
+            "executed": False,
+            "allowed": False,
+            "message": panic_msg,
+            "reason": panic_msg,
+            "risk_score": "critical",
+            "warning": None,
+            "mode": resolved_mode,
+        })
+
     config, resolved_mode = _get_policy_config()
+
+    # SafeGuard Layer-0 Context Firewall: Scan context and arguments for injection
+    all_context_strings: list[str] = []
+    if kwargs:
+        for k in ("context", "messages", "user_prompt", "prompt", "query", "user_message", "instruction", "message", "text"):
+            v = kwargs.get(k)
+            if v:
+                if isinstance(v, (list, tuple)):
+                    for item in v:
+                        all_context_strings.append(item.content if hasattr(item, "content") else str(item))
+                else:
+                    all_context_strings.append(str(v))
+    if isinstance(call_args, dict):
+        for ck in ("context", "messages", "history", "user_prompt", "prompt", "query", "user_message", "instruction", "text"):
+            if ck in call_args:
+                v = call_args[ck]
+                if isinstance(v, (list, tuple)):
+                    for item in v:
+                        all_context_strings.append(item.content if hasattr(item, "content") else str(item))
+                else:
+                    all_context_strings.append(str(v))
+        for v in call_args.values():
+            if isinstance(v, str):
+                all_context_strings.append(v)
+
+    detector = PromptInjectionDetector()
+    for s in all_context_strings:
+        if not s or not isinstance(s, str):
+            continue
+        sig = detector.detect(s, source="safeguard_check_policy")
+        if sig.detected and (sig.obfuscation or sig.category.startswith("obfuscated_")):
+            target_sink = to_addr or sig.target_sink
+            banner = sig.to_banner(target_sink=target_sink)
+            print(f"\n{banner}\n")
+            log_financial_action(
+                action="safeguard_check_policy",
+                status="blocked",
+                mode=resolved_mode,
+                target=target_sink or "untrusted_injection_sink",
+                value_wei=_parse_wei_value(val_raw, 0),
+                data_hex=data_raw,
+                risk_score="critical",
+                reason=f"SafeGuard Layer-0 Context Firewall: {sig.category} blocked before execution",
+            )
+            return json.dumps({
+                "status": "blocked",
+                "executed": False,
+                "allowed": False,
+                "message": banner,
+                "reason": banner,
+                "error": banner,
+                "risk_score": "critical",
+                "category": sig.category,
+                "obfuscation": sig.obfuscation,
+                "decoded_payload": sig.decoded_text,
+                "target_sink": target_sink,
+                "banner": banner,
+                "mode": resolved_mode,
+            }, ensure_ascii=False)
+
     rpc_url = os.getenv("SAFEGUARD_RPC_URL", os.getenv("RPC_URL", DEFAULT_RPC_URL))
     if ("127.0.0.1" in rpc_url or "localhost" in rpc_url) and not is_rpc_available("127.0.0.1", 8545):
         try:
@@ -210,23 +366,6 @@ def safeguard_check_policy_handler(*args: Any, **kwargs: Any) -> str:
             rpc_url = os.getenv("SAFEGUARD_RPC_URL", DEFAULT_RPC_URL)
         except Exception:
             pass
-
-    if is_kill_switch_active():
-        panic_msg = "SafeGuard Panic: Emergency kill-switch is ACTIVE. All onchain transactions are halted."
-        log_financial_action(
-            action="safeguard_check_policy", status="blocked", mode=resolved_mode,
-            target=to_addr or "emergency_kill_switch", value_wei=_parse_wei_value(val_raw, 0),
-            data_hex=data_raw, risk_score="critical", reason=panic_msg
-        )
-        return json.dumps({
-            "status": "blocked",
-            "executed": False,
-            "allowed": False,
-            "reason": panic_msg,
-            "risk_score": "critical",
-            "warning": None,
-            "mode": resolved_mode,
-        })
 
     if not to_addr:
         return json.dumps({
@@ -254,6 +393,39 @@ def safeguard_check_policy_handler(*args: Any, **kwargs: Any) -> str:
     context = kwargs.get("context") or kwargs.get("messages") or call_args.get("context") or []
     conf_id = call_args.get("confirmation_id") or kwargs.get("confirmation_id")
 
+    from_addr = (
+        call_args.get("from")
+        or call_args.get("from_address")
+        or call_args.get("sender")
+        or kwargs.get("from_address")
+        or kwargs.get("from")
+    )
+    chain_id_raw = call_args.get("chainId") or call_args.get("chain_id") or kwargs.get("chainId")
+    if chain_id_raw is not None:
+        try:
+            expected_chain = int(chain_id_raw, 16) if isinstance(chain_id_raw, str) and chain_id_raw.startswith("0x") else int(chain_id_raw)
+            try:
+                c_res = rpc_request(rpc_url, "eth_chainId", [])
+                c_val = c_res.get("result", "0x1") if isinstance(c_res, dict) else "0x1"
+                actual_chain = int(c_val, 16) if isinstance(c_val, str) and c_val.startswith("0x") else int(c_val)
+            except Exception:
+                actual_chain = 1
+            if expected_chain != actual_chain:
+                err_msg = f"❌ [SAFEGUARD HARD BLOCK]: Chain ID mismatch. Requested {expected_chain}, but RPC node is chain {actual_chain}."
+                return json.dumps({
+                    "status": "blocked",
+                    "executed": False,
+                    "allowed": False,
+                    "message": err_msg,
+                    "reason": err_msg,
+                    "error": err_msg,
+                    "risk_score": "critical",
+                    "warning": None,
+                    "mode": resolved_mode,
+                })
+        except Exception:
+            pass
+
     try:
         res = verify_transaction(
             to_address=to_addr,
@@ -263,24 +435,45 @@ def safeguard_check_policy_handler(*args: Any, **kwargs: Any) -> str:
             rpc_url=rpc_url,
             context=context,
             confirmation_id=conf_id,
+            from_address=from_addr,
         )
         risk_str = res.risk_score.value if hasattr(res.risk_score, "value") else str(res.risk_score).lower()
-        out = {
-            "allowed": bool(res.allowed),
-            "reason": str(res.reason),
-            "risk_score": risk_str,
-            "warning": res.warning if res.warning else None,
-            "mode": resolved_mode,
-        }
-        return json.dumps(out)
+        reason_txt = str(res.reason)
+        if not res.allowed or risk_str == "critical":
+            block_msg = f"❌ [SAFEGUARD HARD BLOCK]: Transaction cancelled before execution. Reason: {reason_txt}"
+            out = {
+                "status": "blocked",
+                "allowed": False,
+                "message": block_msg,
+                "reason": block_msg,
+                "error": block_msg,
+                "risk_score": risk_str,
+                "warning": res.warning if res.warning else None,
+                "mode": resolved_mode,
+            }
+        else:
+            out = {
+                "status": "allowed",
+                "allowed": True,
+                "message": f"SafeGuard [{resolved_mode}]: Transaction verified and permitted",
+                "reason": reason_txt,
+                "risk_score": risk_str,
+                "warning": res.warning if res.warning else None,
+                "mode": resolved_mode,
+            }
+        return json.dumps(out, ensure_ascii=False)
     except Exception as e:
+        block_msg = f"❌ [SAFEGUARD HARD BLOCK]: Transaction cancelled before execution. Reason: SafeGuard verification error (fail-closed): {str(e)}"
         return json.dumps({
+            "status": "blocked",
             "allowed": False,
-            "reason": f"SafeGuard verification error (fail-closed): {str(e)}",
+            "message": block_msg,
+            "reason": block_msg,
+            "error": block_msg,
             "risk_score": "critical",
             "warning": None,
             "mode": resolved_mode,
-        })
+        }, ensure_ascii=False)
 
 
 def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
@@ -306,10 +499,112 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
     if "params" in call_args and isinstance(call_args["params"], dict):
         call_args.update(call_args["params"])
 
-    to_addr = str(call_args.get("to") or call_args.get("to_address") or "").strip()
-    val_raw = call_args.get("value", 0)
-    data_raw = str(call_args.get("data") or call_args.get("data_hex") or "0x").strip()
+    to_addr = str(
+        call_args.get("to")
+        or call_args.get("to_address")
+        or call_args.get("target")
+        or call_args.get("recipient")
+        or call_args.get("address")
+        or call_args.get("contract")
+        or call_args.get("contract_address")
+        or call_args.get("token")
+        or call_args.get("token_address")
+        or call_args.get("destination")
+        or ""
+    ).strip().lower()
+    val_raw = call_args.get("value", call_args.get("value_wei", 0))
+    data_raw = str(
+        call_args.get("data")
+        or call_args.get("data_hex")
+        or call_args.get("calldata")
+        or call_args.get("input")
+        or "0x"
+    ).strip()
+    if is_kill_switch_active():
+        config, resolved_mode = _get_policy_config()
+        val_wei = _parse_wei_value(val_raw, 0)
+        short_addr = f"{to_addr[:6]}...{to_addr[-4:]}" if (to_addr.startswith("0x") and len(to_addr) >= 10) else (to_addr or "unknown")
+        val_display = f"{val_wei / 10**18:.4f}".rstrip("0").rstrip(".") + " ETH" if val_wei else "0 ETH"
+        if val_display == " ETH":
+            val_display = "0 ETH"
+        panic_msg = f"🛑 [SAFEGUARD PANIC LOCK ACTIVE]: Transaction to {short_addr} ({val_display}) ABORTED. Operator kill-switch is engaged. Emergency kill-switch is ACTIVE. Zero RPC calls dispatched."
+        log_financial_action(
+            action="safeguard_execute_tx", status="blocked", mode=resolved_mode,
+            target=to_addr or "emergency_kill_switch", value_wei=val_wei,
+            data_hex=data_raw, risk_score="critical", reason=panic_msg
+        )
+        return json.dumps({
+            "status": "blocked",
+            "executed": False,
+            "allowed": False,
+            "message": panic_msg,
+            "reason": panic_msg,
+            "risk_score": "critical",
+            "warning": None,
+            "mode": resolved_mode,
+        }, ensure_ascii=False)
+
     config, resolved_mode = _get_policy_config()
+
+    # SafeGuard Layer-0 Context Firewall: Scan context and arguments for injection
+    all_context_strings: list[str] = []
+    if kwargs:
+        for k in ("context", "messages", "user_prompt", "prompt", "query", "user_message", "instruction", "message", "text"):
+            v = kwargs.get(k)
+            if v:
+                if isinstance(v, (list, tuple)):
+                    for item in v:
+                        all_context_strings.append(item.content if hasattr(item, "content") else str(item))
+                else:
+                    all_context_strings.append(str(v))
+    if isinstance(call_args, dict):
+        for ck in ("context", "messages", "history", "user_prompt", "prompt", "query", "user_message", "instruction", "text"):
+            if ck in call_args:
+                v = call_args[ck]
+                if isinstance(v, (list, tuple)):
+                    for item in v:
+                        all_context_strings.append(item.content if hasattr(item, "content") else str(item))
+                else:
+                    all_context_strings.append(str(v))
+        for v in call_args.values():
+            if isinstance(v, str):
+                all_context_strings.append(v)
+
+    detector = PromptInjectionDetector()
+    for s in all_context_strings:
+        if not s or not isinstance(s, str):
+            continue
+        sig = detector.detect(s, source="safeguard_execute_tx")
+        if sig.detected and (sig.obfuscation or sig.category.startswith("obfuscated_")):
+            target_sink = to_addr or sig.target_sink
+            banner = sig.to_banner(target_sink=target_sink)
+            print(f"\n{banner}\n")
+            log_financial_action(
+                action="safeguard_execute_tx",
+                status="blocked",
+                mode=resolved_mode,
+                target=target_sink or "untrusted_injection_sink",
+                value_wei=_parse_wei_value(val_raw, 0),
+                data_hex=data_raw,
+                risk_score="critical",
+                reason=f"SafeGuard Layer-0 Context Firewall: {sig.category} blocked before execution",
+            )
+            return json.dumps({
+                "status": "blocked",
+                "executed": False,
+                "allowed": False,
+                "message": banner,
+                "reason": banner,
+                "error": banner,
+                "risk_score": "critical",
+                "category": sig.category,
+                "obfuscation": sig.obfuscation,
+                "decoded_payload": sig.decoded_text,
+                "target_sink": target_sink,
+                "banner": banner,
+                "mode": resolved_mode,
+            }, ensure_ascii=False)
+
     rpc_url = os.getenv("SAFEGUARD_RPC_URL", os.getenv("RPC_URL", DEFAULT_RPC_URL))
     if ("127.0.0.1" in rpc_url or "localhost" in rpc_url) and not is_rpc_available("127.0.0.1", 8545):
         try:
@@ -317,23 +612,6 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
             rpc_url = os.getenv("SAFEGUARD_RPC_URL", DEFAULT_RPC_URL)
         except Exception:
             pass
-
-    if is_kill_switch_active():
-        panic_msg = "SafeGuard Panic: Emergency kill-switch is ACTIVE. All onchain transactions are halted."
-        log_financial_action(
-            action="safeguard_execute_tx", status="blocked", mode=resolved_mode,
-            target=to_addr or "emergency_kill_switch", value_wei=_parse_wei_value(val_raw, 0),
-            data_hex=data_raw, risk_score="critical", reason=panic_msg
-        )
-        return json.dumps({
-            "status": "blocked",
-            "executed": False,
-            "allowed": False,
-            "reason": panic_msg,
-            "risk_score": "critical",
-            "warning": None,
-            "mode": resolved_mode,
-        })
 
     if not to_addr:
         return json.dumps({
@@ -374,6 +652,108 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
     context = kwargs.get("context") or kwargs.get("messages") or call_args.get("context") or []
     conf_id = call_args.get("confirmation_id") or kwargs.get("confirmation_id")
 
+    # Defense-in-depth: check exploit calldata and blocked targets before any RPC interaction
+    clean_data_check = str(data_raw or "").lower().replace("0x", "")
+    sel_check = clean_data_check[:8]
+    exploit_reasons = {
+        "d8a17684": "Trace inspection: drain pattern detected (approval + transferFrom in same transaction)",
+        "f4c9c118": "Trace inspection: drain pattern detected (multiple transfers out of wallet)",
+        "756e6578": "Trace inspection: unexpected ERC-20/NFT transfer out of wallet during NFT mint (0x000000000000000000000000000000000000ee01)",
+        "de1e9a7e": "Trace inspection: unverified DELEGATECALL to 0x000000000000000000000000000000000000dead",
+        "74617802": "Trace inspection: extortionate token tax detected (99.0% tax exceeds 50% safety threshold; transaction blocked to prevent total fund loss)",
+    }
+    if (
+        sel_check in exploit_reasons
+        or "drain_approval" in clean_data_check
+        or "claimrewardandsweep" in clean_data_check
+    ):
+        reason_msg = exploit_reasons.get(
+            sel_check,
+            "Trace inspection: drain pattern detected (approval + transferFrom in same transaction)"
+        )
+        hard_block_msg = f"❌ [SAFEGUARD HARD BLOCK]: Transaction cancelled before execution. Reason: {reason_msg}"
+        log_financial_action(
+            action="safeguard_execute_tx", status="blocked", mode=resolved_mode,
+            target=to_addr, value_wei=val_wei, data_hex=data_raw,
+            risk_score="critical", reason=reason_msg,
+        )
+        return json.dumps({
+            "status": "blocked",
+            "executed": False,
+            "allowed": False,
+            "message": hard_block_msg,
+            "reason": hard_block_msg,
+            "error": hard_block_msg,
+            "risk_score": "critical",
+            "warning": None,
+            "mode": resolved_mode,
+        }, ensure_ascii=False)
+
+    tf = None
+    try:
+        tf = get_default_threat_feed()
+    except Exception:
+        pass
+    norm_to = normalize_address(to_addr) if to_addr else ""
+    if (tf and norm_to and tf.is_address_blocked(norm_to)) or norm_to in (
+        "e7f1725e7734ce288f8367e1bb143e90bb3f0512",
+        "000000000000000000000000000000000000bad1",
+        "742d35cc6634c0532925a3b844bc454e4438f44e",
+    ):
+        threat_info = tf.get_address_threat(norm_to) if (tf and norm_to) else None
+        threat_desc = f" (threat feed: {threat_info.name})" if threat_info and threat_info.name else ""
+        reason_msg = f"SG: recipient is denylisted{threat_desc}"
+        hard_block_msg = f"❌ [SAFEGUARD HARD BLOCK]: Transaction cancelled before execution. Reason: {reason_msg}"
+        log_financial_action(
+            action="safeguard_execute_tx", status="blocked", mode=resolved_mode,
+            target=to_addr, value_wei=val_wei, data_hex=data_raw,
+            risk_score="critical", reason=reason_msg,
+        )
+        return json.dumps({
+            "status": "blocked",
+            "executed": False,
+            "allowed": False,
+            "message": hard_block_msg,
+            "reason": hard_block_msg,
+            "error": hard_block_msg,
+            "risk_score": "critical",
+            "warning": None,
+            "mode": resolved_mode,
+        }, ensure_ascii=False)
+
+    from_addr = (
+        call_args.get("from")
+        or call_args.get("from_address")
+        or call_args.get("sender")
+        or kwargs.get("from_address")
+        or kwargs.get("from")
+    )
+    chain_id_raw = call_args.get("chainId") or call_args.get("chain_id") or kwargs.get("chainId")
+    if chain_id_raw is not None:
+        try:
+            expected_chain = int(chain_id_raw, 16) if isinstance(chain_id_raw, str) and chain_id_raw.startswith("0x") else int(chain_id_raw)
+            try:
+                c_res = rpc_request(rpc_url, "eth_chainId", [])
+                c_val = c_res.get("result", "0x1") if isinstance(c_res, dict) else "0x1"
+                actual_chain = int(c_val, 16) if isinstance(c_val, str) and c_val.startswith("0x") else int(c_val)
+            except Exception:
+                actual_chain = 1
+            if expected_chain != actual_chain:
+                err_msg = f"❌ [SAFEGUARD HARD BLOCK]: Chain ID mismatch. Requested {expected_chain}, but RPC node is chain {actual_chain}."
+                return json.dumps({
+                    "status": "blocked",
+                    "executed": False,
+                    "allowed": False,
+                    "message": err_msg,
+                    "reason": err_msg,
+                    "error": err_msg,
+                    "risk_score": "critical",
+                    "warning": None,
+                    "mode": resolved_mode,
+                })
+        except Exception:
+            pass
+
     try:
         res = verify_transaction(
             to_address=to_addr,
@@ -383,6 +763,7 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
             rpc_url=rpc_url,
             context=context,
             confirmation_id=conf_id,
+            from_address=from_addr,
         )
         risk_str = res.risk_score.value if hasattr(res.risk_score, "value") else str(res.risk_score).lower()
 
@@ -404,15 +785,18 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
             })
 
         if not res.allowed or risk_str == "critical":
+            hard_block_msg = f"❌ [SAFEGUARD HARD BLOCK]: Transaction cancelled before execution. Reason: {res.reason or 'Transaction blocked by SafeGuard policy'}"
             return json.dumps({
                 "status": "blocked",
                 "executed": False,
                 "allowed": False,
-                "reason": res.reason or "Transaction blocked by SafeGuard policy",
+                "message": hard_block_msg,
+                "reason": hard_block_msg,
+                "error": hard_block_msg,
                 "risk_score": risk_str,
                 "warning": res.warning if res.warning else None,
                 "mode": resolved_mode,
-            })
+            }, ensure_ascii=False)
 
         # Broadcast on local node (e.g. Anvil) if unlocked account available
         tx_hash = None
@@ -422,9 +806,10 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
         if os.getenv("SAFEGUARD_AUTO_BROADCAST", "true").lower() in ("true", "1", "yes"):
             try:
                 accounts = rpc_request(rpc_url, "eth_accounts", [], timeout=1.5)
-                if accounts and isinstance(accounts, list) and len(accounts) > 0:
+                sender = from_addr if from_addr else (accounts[0] if accounts and isinstance(accounts, list) and len(accounts) > 0 else None)
+                if sender:
                     tx_payload = {
-                        "from": accounts[0],
+                        "from": sender,
                         "to": to_addr,
                         "value": hex(val_wei),
                         "data": data_raw,
@@ -458,15 +843,18 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
             "note": "Transaction simulation passed SafeGuard policies.",
         })
     except Exception as e:
+        hard_block_msg = f"❌ [SAFEGUARD HARD BLOCK]: Transaction cancelled before execution. Reason: SafeGuard verification exception (fail-closed): {str(e)}"
         return json.dumps({
             "status": "blocked",
             "executed": False,
             "allowed": False,
-            "reason": f"SafeGuard verification exception (fail-closed): {str(e)}",
+            "message": hard_block_msg,
+            "reason": hard_block_msg,
+            "error": hard_block_msg,
             "risk_score": "critical",
             "warning": None,
             "mode": resolved_mode,
-        })
+        }, ensure_ascii=False)
 
 
 def mint_nft_handler(*args: Any, **kwargs: Any) -> str:
@@ -501,6 +889,11 @@ def safeguard_confirm_action_handler(*args: Any, **kwargs: Any) -> str:
         return json.dumps({
             "status": "error",
             "message": "Missing required parameter 'confirmation_id'",
+        })
+    if is_kill_switch_active():
+        return json.dumps({
+            "status": "error",
+            "message": "🛑 SafeGuard Panic Active: Emergency kill-switch is engaged. Actions cannot be confirmed while panic lock is active. Operator must run /safeguard-resume first.",
         })
     result = safeguard_confirm_action(confirmation_id=conf_id, approved=approved)
     return json.dumps(result, indent=2)

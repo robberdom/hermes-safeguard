@@ -39,6 +39,7 @@ When instructed to execute an on-chain transaction, mint an NFT, swap tokens, or
      `safeguard_execute_tx(to="0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512", data="0xd8a17684")`
 
 ### ⚡ Instant Slash Commands (Zero LLM Overhead):
+- `/safeguard-scan <text>` (Layer-0 Context Firewall scan: decodes Morse/Base64/Hex and checks injection in <1ms)
 - `/safeguard-mint 0x5FbDB2315678afecb367f032d93F642f64180aa3 0.05`
 - `/safeguard-exec 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512 0 0xd8a17684`
 - `/safeguard-mode [strict|balanced|degen]` or shortcuts: `/safeguard-strict`, `/safeguard-balanced`, `/safeguard-degen`

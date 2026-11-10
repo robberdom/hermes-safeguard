@@ -22,68 +22,136 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Tuple
 
-from policy_engine import (
-    PolicyConfig,
-    PolicyEngine,
-    PolicyMode,
-    RiskScore,
-    VerificationResult,
-    DEFAULT_ALLOWED_TARGET,
-    APPROVE_SELECTOR,
-    TRANSFER_FROM_SELECTOR,
-    CHECK_TRANSACTION_SELECTOR,
-    MULTICALL_SELECTOR,
-    V2_SWAP_SELECTOR,
-    V3_SWAP_SELECTOR,
-    SET_APPROVAL_FOR_ALL_SELECTOR,
-    PERMIT2_APPROVE_SELECTOR,
-    EXPLOIT_DELEGATECALL_SELECTOR,
-    UINT256_MAX,
-    normalize_address,
-    decode_bytes_array,
-    ContextMessage,
-    InjectionSignal,
-    PromptInjectionDetector,
-    tag_as_trusted,
-    tag_as_untrusted,
-    tag_context,
-    scan_recent_context,
-    FINANCIAL_TOOLS,
-    is_financial_tool,
-    _parse_wei_value,
-    AddressEntry,
-    AddressMemoryStore,
-    get_default_memory_store,
-    set_default_memory_store,
-    reset_default_memory_store,
-    safeguard_approve_address,
-    safeguard_list_approved_addresses,
-    safeguard_revoke_address,
-    extract_action_addresses,
-    ThreatFeed,
-    ThreatEntry,
-    ThreatReport,
-    get_default_threat_feed,
-    set_default_threat_feed,
-    reset_default_threat_feed,
-    safeguard_search_threat_reports,
-    search_threat_reports,
-    PendingConfirmation,
-    ConfirmationStore,
-    get_default_confirmation_store,
-    reset_default_confirmation_store,
-    FinancialActionLogEntry,
-    is_kill_switch_active,
-    set_kill_switch,
-    ActionAuditLogger,
-    get_default_audit_logger,
-    reset_default_audit_logger,
-    log_financial_action,
-    generate_transaction_summary,
-    safeguard_confirm_action,
-    safeguard_list_pending_confirmations,
-    safeguard_get_audit_log,
-)
+try:
+    from .policy_engine import (
+        PolicyConfig,
+        PolicyEngine,
+        PolicyMode,
+        RiskScore,
+        VerificationResult,
+        DEFAULT_ALLOWED_TARGET,
+        APPROVE_SELECTOR,
+        TRANSFER_FROM_SELECTOR,
+        CHECK_TRANSACTION_SELECTOR,
+        MULTICALL_SELECTOR,
+        V2_SWAP_SELECTOR,
+        V3_SWAP_SELECTOR,
+        SET_APPROVAL_FOR_ALL_SELECTOR,
+        PERMIT2_APPROVE_SELECTOR,
+        EXPLOIT_DELEGATECALL_SELECTOR,
+        UINT256_MAX,
+        normalize_address,
+        decode_bytes_array,
+        ContextMessage,
+        InjectionSignal,
+        PromptInjectionDetector,
+        tag_as_trusted,
+        tag_as_untrusted,
+        tag_context,
+        scan_recent_context,
+        FINANCIAL_TOOLS,
+        is_financial_tool,
+        _parse_wei_value,
+        AddressEntry,
+        AddressMemoryStore,
+        get_default_memory_store,
+        set_default_memory_store,
+        reset_default_memory_store,
+        safeguard_approve_address,
+        safeguard_list_approved_addresses,
+        safeguard_revoke_address,
+        extract_action_addresses,
+        ThreatFeed,
+        ThreatEntry,
+        ThreatReport,
+        get_default_threat_feed,
+        set_default_threat_feed,
+        reset_default_threat_feed,
+        safeguard_search_threat_reports,
+        search_threat_reports,
+        PendingConfirmation,
+        ConfirmationStore,
+        get_default_confirmation_store,
+        reset_default_confirmation_store,
+        FinancialActionLogEntry,
+        is_kill_switch_active,
+        set_kill_switch,
+        ActionAuditLogger,
+        get_default_audit_logger,
+        reset_default_audit_logger,
+        log_financial_action,
+        generate_transaction_summary,
+        safeguard_confirm_action,
+        safeguard_list_pending_confirmations,
+        safeguard_get_audit_log,
+        get_default_velocity_tracker,
+        reset_default_velocity_tracker,
+    )
+except (ImportError, ValueError):
+    from policy_engine import (
+        PolicyConfig,
+        PolicyEngine,
+        PolicyMode,
+        RiskScore,
+        VerificationResult,
+        DEFAULT_ALLOWED_TARGET,
+        APPROVE_SELECTOR,
+        TRANSFER_FROM_SELECTOR,
+        CHECK_TRANSACTION_SELECTOR,
+        MULTICALL_SELECTOR,
+        V2_SWAP_SELECTOR,
+        V3_SWAP_SELECTOR,
+        SET_APPROVAL_FOR_ALL_SELECTOR,
+        PERMIT2_APPROVE_SELECTOR,
+        EXPLOIT_DELEGATECALL_SELECTOR,
+        UINT256_MAX,
+        normalize_address,
+        decode_bytes_array,
+        ContextMessage,
+        InjectionSignal,
+        PromptInjectionDetector,
+        tag_as_trusted,
+        tag_as_untrusted,
+        tag_context,
+        scan_recent_context,
+        FINANCIAL_TOOLS,
+        is_financial_tool,
+        _parse_wei_value,
+        AddressEntry,
+        AddressMemoryStore,
+        get_default_memory_store,
+        set_default_memory_store,
+        reset_default_memory_store,
+        safeguard_approve_address,
+        safeguard_list_approved_addresses,
+        safeguard_revoke_address,
+        extract_action_addresses,
+        ThreatFeed,
+        ThreatEntry,
+        ThreatReport,
+        get_default_threat_feed,
+        set_default_threat_feed,
+        reset_default_threat_feed,
+        safeguard_search_threat_reports,
+        search_threat_reports,
+        PendingConfirmation,
+        ConfirmationStore,
+        get_default_confirmation_store,
+        reset_default_confirmation_store,
+        FinancialActionLogEntry,
+        is_kill_switch_active,
+        set_kill_switch,
+        ActionAuditLogger,
+        get_default_audit_logger,
+        reset_default_audit_logger,
+        log_financial_action,
+        generate_transaction_summary,
+        safeguard_confirm_action,
+        safeguard_list_pending_confirmations,
+        safeguard_get_audit_log,
+        get_default_velocity_tracker,
+        reset_default_velocity_tracker,
+    )
 
 DEFAULT_RPC_URL = (
     os.getenv("SAFEGUARD_RPC_URL", "").strip()
@@ -772,8 +840,8 @@ def deploy_policy_contract(rpc_url: str = DEFAULT_RPC_URL) -> str:
     if not tx_hash:
         raise RuntimeError(f"Deployment tx returned no hash: {tx_res}")
 
-    for _ in range(30):
-        receipt_res = rpc_request(rpc_url, "eth_getTransactionReceipt", [tx_hash])
+    for _ in range(20):
+        receipt_res = rpc_request(rpc_url, "eth_getTransactionReceipt", [tx_hash], timeout=1.0)
         receipt = receipt_res.get("result")
         if receipt and receipt.get("contractAddress"):
             contract_addr = receipt["contractAddress"]
@@ -867,6 +935,12 @@ def inspect_execution_trace(
                 "unsupported", "unknown method", "-32601", "not implemented"
             )
             if any(m in err_text for m in unsupported_markers):
+                if not (os.getenv("SAFEGUARD_ALLOW_UNSIMULATED_RPC", "").lower() in ("true", "1", "yes") or os.getenv("SAFEGUARD_TESTING", "").lower() in ("true", "1", "yes")):
+                    return VerificationResult(
+                        False,
+                        "SafeGuard Fail-Closed: Connected RPC endpoint does not support debug_traceCall required for EVM simulation and drain inspection. Dispatched zero transactions to protect funds.",
+                        RiskScore.CRITICAL,
+                    )
                 sim_res = rpc_request(rpc_url, "eth_call", [tx_obj, "latest"])
                 if "error" in sim_res:
                     return VerificationResult(
@@ -1006,6 +1080,12 @@ def inspect_execution_trace(
             "unsupported", "unknown method", "-32601", "not implemented"
         )
         if any(m in err_text for m in unsupported_markers):
+            if not (os.getenv("SAFEGUARD_ALLOW_UNSIMULATED_RPC", "").lower() in ("true", "1", "yes") or os.getenv("SAFEGUARD_TESTING", "").lower() in ("true", "1", "yes")):
+                return VerificationResult(
+                    False,
+                    "SafeGuard Fail-Closed: Connected RPC endpoint does not support prestateTracer required for state-diff inspection.",
+                    RiskScore.CRITICAL,
+                )
             diff_res = {"result": {}}
         else:
             return VerificationResult(False, f"State-diff inspection failed: {extract_revert_message(diff_res['error'])}", RiskScore.HIGH)
@@ -1329,6 +1409,8 @@ def check_pre_tool_call(
             data_hex=data_hex,
         ):
             confirmed = True
+        else:
+            confirmed = False
 
     # 2. Resolve PolicyConfig
     if config is None:
@@ -1526,6 +1608,10 @@ def verify_transaction(
         Fails closed on any RPC, revert, trace failure, or connection error.
     """
     try:
+        if is_kill_switch_active():
+            panic_msg = "SafeGuard Panic: Emergency kill-switch is ACTIVE. All onchain transactions are halted."
+            return VerificationResult(False, panic_msg, RiskScore.CRITICAL)
+
         if os.getenv("SAFEGUARD_RPC_URL"):
             rpc_url = os.getenv("SAFEGUARD_RPC_URL")
         if ("127.0.0.1" in rpc_url or "localhost" in rpc_url) and not is_rpc_available("127.0.0.1", 8545):
@@ -1534,9 +1620,6 @@ def verify_transaction(
                 rpc_url = DEFAULT_RPC_URL
             except Exception:
                 pass
-        if is_kill_switch_active():
-            panic_msg = "SafeGuard Panic: Emergency kill-switch is ACTIVE. All onchain transactions are halted."
-            return VerificationResult(False, panic_msg, RiskScore.CRITICAL)
 
         # Balance-loss detection must measure the agent's wallet, not a placeholder account
         from_address = resolve_from_address(from_address)
@@ -1595,10 +1678,9 @@ def verify_transaction(
         # Resolve confirmation ID if provided or from recent operator approval
         cs = get_default_confirmation_store()
         if not confirmation_id:
-            recent_entry = cs.find_confirmed_entry(to_address, value_wei=value_wei)
+            recent_entry = cs.find_confirmed_entry(to_address, value_wei=value_wei, data_hex=data_hex)
             if recent_entry:
                 confirmation_id = recent_entry.id
-                confirmed = True
 
         if confirmation_id:
             if cs.is_rejected(str(confirmation_id)):
@@ -1607,6 +1689,8 @@ def verify_transaction(
                 )
             if cs.is_confirmed(str(confirmation_id), to_address=to_address, value_wei=value_wei, data_hex=data_hex):
                 confirmed = True
+            else:
+                confirmed = False
 
         # Configure active policy engine for direct evaluation
         engine = PolicyEngine(policy_cfg)
@@ -1614,7 +1698,12 @@ def verify_transaction(
             engine.memory_store = memory_store
 
         def _consume_confirmation_if_used() -> None:
-            """Single-use: burn the operator confirmation once the tx is actually allowed."""
+            """Single-use: burn the operator confirmation and record velocity spend once allowed."""
+            try:
+                if value_wei > 0:
+                    get_default_velocity_tracker().record_spend(value_wei)
+            except Exception:
+                pass
             if not confirmation_id or not confirmed:
                 return
             try:
@@ -1716,10 +1805,18 @@ def verify_transaction(
             raw_data = data_hex.strip() if data_hex else ""
             if raw_data.startswith(("0x", "0X")):
                 raw_data = raw_data[2:]
+            if len(raw_data) % 2 != 0:
+                _rollback_memory_approval()
+                return VerificationResult(
+                    False, f"Invalid transaction calldata: odd-length hexadecimal string ({data_hex})", RiskScore.CRITICAL
+                )
             try:
                 data_bytes = bytes.fromhex(raw_data) if raw_data else b""
-            except ValueError:
-                data_bytes = raw_data.encode("utf-8")
+            except ValueError as e:
+                _rollback_memory_approval()
+                return VerificationResult(
+                    False, f"Invalid transaction calldata hex: {e}", RiskScore.CRITICAL
+                )
 
             call_payload_hex = encode_check_transaction_calldata(to_address, value_wei, data_bytes)
             call_params = [
@@ -1833,6 +1930,8 @@ class _MockRPCHandler(BaseHTTPRequestHandler):
 
             if method in ("safeguard_isMock", "safeguard_is_mock", "safeguard_ping"):
                 resp = {"jsonrpc": "2.0", "id": req_id, "result": "hermes-safeguard-mock-rpc"}
+            elif method == "eth_chainId":
+                resp = {"jsonrpc": "2.0", "id": req_id, "result": "0x1"}
             elif method == "eth_accounts":
                 resp = {"jsonrpc": "2.0", "id": req_id, "result": ["0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"]}
             elif method == "eth_sendTransaction":
@@ -2437,6 +2536,7 @@ def run_tests() -> int:
     print("\n--- Running SafeGuard Policy Verification Scenarios ---\n")
 
     try:
+        reset_default_velocity_tracker()
         safe_to = DEFAULT_ALLOWED_TARGET
         safe_val = 100_000_000_000_000_000  # 0.1 ether
         safe_data = ""
@@ -2463,7 +2563,8 @@ def run_tests() -> int:
                 pass
 
         # Scenario 1: Safe transfer passes
-        allowed_1, reason_1 = verify_transaction(safe_to, safe_val, safe_data)
+        base_strict_cfg = PolicyConfig.strict(recipient_allowlist=[safe_to])
+        allowed_1, reason_1 = verify_transaction(safe_to, safe_val, safe_data, config=base_strict_cfg)
         if allowed_1:
             print(f"[PASS] Scenario 1 (Safe transfer): allowed={allowed_1}")
         else:
@@ -2472,7 +2573,7 @@ def run_tests() -> int:
 
         # Scenario 2: High ETH value fails
         high_val = 1_000_000_000_000_000_000  # 1.0 ether > 0.5 ether cap
-        allowed_2, reason_2 = verify_transaction(safe_to, high_val, safe_data)
+        allowed_2, reason_2 = verify_transaction(safe_to, high_val, safe_data, config=base_strict_cfg)
         if (not allowed_2) and ("value exceeds max per tx" in reason_2):
             print(f"[PASS] Scenario 2 (High ETH value): allowed={allowed_2}, reason='{reason_2}'")
         else:
@@ -2483,7 +2584,7 @@ def run_tests() -> int:
         spender_word = encode_address_word("0x0000000000000000000000000000000000000001").hex()
         unlimited_amount_word = "f" * 64  # type(uint256).max
         approve_calldata = "0x" + APPROVE_SELECTOR + spender_word + unlimited_amount_word
-        allowed_3, reason_3 = verify_transaction(safe_to, 0, approve_calldata)
+        allowed_3, reason_3 = verify_transaction(safe_to, 0, approve_calldata, config=base_strict_cfg)
         if (not allowed_3) and ("unbounded approve blocked" in reason_3):
             print(f"[PASS] Scenario 3 (Unlimited ERC-20 approve): allowed={allowed_3}, reason='{reason_3}'")
         else:
@@ -2503,7 +2604,7 @@ def run_tests() -> int:
             + encode_uint256_word(100)
         )
         multicall_calldata = encode_multicall_calldata([safe_transfer_call, drain_transfer_from_call])
-        allowed_4, reason_4 = verify_transaction(safe_to, 0, multicall_calldata)
+        allowed_4, reason_4 = verify_transaction(safe_to, 0, multicall_calldata, config=base_strict_cfg)
         if (not allowed_4) and ("selector blocked" in reason_4 or "blocked" in reason_4):
             print(f"[PASS] Scenario 4 (Smuggled multicall drain): allowed={allowed_4}, reason='{reason_4}'")
         else:
@@ -2518,7 +2619,7 @@ def run_tests() -> int:
             to="0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
             deadline=1893456000,
         )
-        allowed_5, reason_5 = verify_transaction(safe_to, 0, v2_swap_calldata)
+        allowed_5, reason_5 = verify_transaction(safe_to, 0, v2_swap_calldata, config=base_strict_cfg)
         if (not allowed_5) and ("zero slippage swap blocked" in reason_5):
             print(f"[PASS] Scenario 5 (Zero-slippage DEX swap): allowed={allowed_5}, reason='{reason_5}'")
         else:
@@ -2527,7 +2628,7 @@ def run_tests() -> int:
 
         # Scenario 6: Nested DELEGATECALL / state-diff balance drain caught via Anvil trace inspection (Blocked)
         exploit_calldata = "0x" + EXPLOIT_DELEGATECALL_SELECTOR + ("00" * 32)
-        allowed_6, reason_6 = verify_transaction(safe_to, 0, exploit_calldata)
+        allowed_6, reason_6 = verify_transaction(safe_to, 0, exploit_calldata, config=base_strict_cfg)
         if (not allowed_6) and ("Trace inspection" in reason_6 or "DELEGATECALL" in reason_6 or "balance loss" in reason_6):
             print(f"[PASS] Scenario 6 (Trace inspection DELEGATECALL / balance drain): allowed={allowed_6}, reason='{reason_6}'")
         else:
@@ -2750,6 +2851,7 @@ def run_tests() -> int:
 
         # Scenario 13: Prompt & Indirect Injection Defenses for Financial Actions
         print("\n--- Running Prompt / Indirect Injection Defense Scenarios ---\n")
+        reset_default_velocity_tracker()
 
         # 13a: Direct injection message in untrusted context is blocked in strict mode
         untrusted_direct_msg = tag_as_untrusted(
@@ -3045,6 +3147,7 @@ def run_tests() -> int:
 
         # 17a: New recipient requires confirmation in strict mode
         reset_default_memory_store()
+        reset_default_velocity_tracker()
         new_test_addr = "0x4444444444444444444444444444444444444444"
         res_17a = verify_transaction(
             new_test_addr,

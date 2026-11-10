@@ -37,6 +37,20 @@ try:
 except ImportError:
     _HAVE_YAML = False
 
+try:
+    from .storage import resolve_state_path, read_state_file, write_state_file
+except (ImportError, ValueError):
+    try:
+        from storage import resolve_state_path, read_state_file, write_state_file
+    except Exception:
+        def resolve_state_path(name: str) -> Path:
+            return Path(__file__).resolve().parent / name
+        def read_state_file(name: str) -> str:
+            p = resolve_state_path(name)
+            return p.read_text(encoding="utf-8") if p.is_file() else ""
+        def write_state_file(name: str, content: str) -> None:
+            resolve_state_path(name).write_text(content, encoding="utf-8")
+
 
 # Default address constants
 DEFAULT_ALLOWED_TARGET = "0x000000000000000000000000000000000000BEEF"
@@ -72,17 +86,23 @@ MORSE_CODE_DICT: dict[str, str] = {
     "---..": "8", "----.": "9",
     ".-.-.-": ".", "--..--": ",", "..--..": "?", "-..-.": "/",
     "-....-": "-", "---...": ":", ".--.-.": "@",
+    "-.-.--": "!", "..--.-": "_", ".-.-.": "+", "-...-": "=",
+    "-.-.-.": ";", "-.--.": "(", "-.--.-": ")",
 }
 
 # Financial tool names intercepted by SafeGuard
 FINANCIAL_TOOLS: set[str] = {
     "safeguard_execute_tx",
     "safeguard_check_policy",
+    "mint_nft",
+    "mint",
     "eth_sendtransaction",
     "eth_sendrawtransaction",
     "send_transaction",
     "send_tx",
     "execute_tx",
+    "executetx",
+    "call_contract",
     "transfer",
     "transfer_eth",
     "transfer_tokens",
@@ -97,6 +117,8 @@ FINANCIAL_TOOLS: set[str] = {
     "wallet_transfer",
     "crypto_transfer",
     "send_funds",
+    "cast",
+    "cast_send",
 }
 
 
@@ -116,7 +138,25 @@ def is_financial_tool(tool_name: str) -> bool:
         return False
     if name in FINANCIAL_TOOLS:
         return True
-    financial_keywords = ("transfer", "swap", "approve", "send_tx", "sendtransaction", "wallet", "payout")
+    financial_keywords = (
+        "transfer",
+        "swap",
+        "approve",
+        "send_tx",
+        "sendtransaction",
+        "send_transaction",
+        "wallet",
+        "payout",
+        "mint",
+        "cast",
+        "claim",
+        "deposit",
+        "withdraw",
+        "call_contract",
+        "bridge",
+        "execute_tx",
+        "executetx",
+    )
     return any(kw in name for kw in financial_keywords)
 
 
@@ -129,7 +169,10 @@ _KILL_SWITCH_ACTIVE: bool = False
 def _get_kill_switch_files() -> list[Path]:
     files = [_LOCAL_KILL_SWITCH_FILE, _KILL_SWITCH_FILE]
     try:
-        from storage import resolve_state_path
+        try:
+            from .storage import resolve_state_path
+        except (ImportError, ValueError):
+            from storage import resolve_state_path
         p = resolve_state_path(".safeguard_kill_switch")
         if p not in files:
             files.append(p)
@@ -148,6 +191,15 @@ def is_kill_switch_active() -> bool:
     for p in _get_kill_switch_files():
         if p.is_file():
             return True
+    try:
+        try:
+            from .storage import read_state_file
+        except (ImportError, ValueError):
+            from storage import read_state_file
+        if read_state_file(".safeguard_kill_switch") is not None:
+            return True
+    except Exception:
+        pass
     return False
 
 
@@ -163,6 +215,14 @@ def set_kill_switch(active: bool) -> None:
                 p.touch()
             except Exception:
                 pass
+        try:
+            try:
+                from .storage import write_state_file
+            except (ImportError, ValueError):
+                from storage import write_state_file
+            write_state_file(".safeguard_kill_switch", "LOCKED")
+        except Exception:
+            pass
     else:
         if "SAFEGUARD_KILL_SWITCH" in os.environ:
             del os.environ["SAFEGUARD_KILL_SWITCH"]
@@ -172,6 +232,14 @@ def set_kill_switch(active: bool) -> None:
                     p.unlink()
             except Exception:
                 pass
+        try:
+            try:
+                from .storage import unlink_state_file
+            except (ImportError, ValueError):
+                from storage import unlink_state_file
+            unlink_state_file(".safeguard_kill_switch")
+        except Exception:
+            pass
 
 
 # ==============================================================================
@@ -265,8 +333,41 @@ def scan_recent_context(
 
 
 # ==============================================================================
-# Prompt Injection Detector
+# Prompt Injection Detector & Layer-0 Context Firewall
 # ==============================================================================
+
+def format_layer0_alert_banner(
+    category: str = "obfuscated_morse_injection",
+    untrusted_input: str = "",
+    decoded_payload: str | None = None,
+    target_sink: str | None = None,
+    action_taken: str = "HARD-BLOCKED BEFORE EXECUTION (Zero funds at risk)",
+) -> str:
+    """
+    Crisp, high-visibility ASCII alert banner for SafeGuard Layer-0 Context Firewall.
+    Displays vector category, untrusted input snippet, decoded payload, target sink, and action taken.
+    """
+    raw_clean = str(untrusted_input or "").strip()
+    if len(raw_clean) > 34:
+        raw_display = raw_clean[:34].rstrip() + " ..."
+    else:
+        raw_display = raw_clean or "N/A"
+
+    decoded_display = f'"{decoded_payload}"' if decoded_payload else 'N/A'
+    target_display = str(target_sink).strip() if target_sink else ("0x1111222233334444555566667777888899990000" if "0x1111" in raw_clean else "N/A")
+
+    return (
+        "========================================================\n"
+        "🛡️ SAFEGUARD LAYER-0 CONTEXT FIREWALL: ATTACK BLOCKED\n"
+        "========================================================\n"
+        f"• Vector Category : {category}\n"
+        f"• Untrusted Input : {raw_display}\n"
+        f"• Decoded Payload : {decoded_display}\n"
+        f"• Target Sink     : {target_display}\n"
+        f"• Action Taken    : {action_taken}\n"
+        "========================================================"
+    )
+
 
 @dataclass
 class InjectionSignal:
@@ -279,6 +380,17 @@ class InjectionSignal:
     decoded_text: str | None = None
     raw_snippet: str = ""
     untrusted_source: str = ""
+    target_sink: str | None = None
+    banner: str | None = None
+
+    def to_banner(self, target_sink: str | None = None) -> str:
+        sink = target_sink or self.target_sink
+        return format_layer0_alert_banner(
+            category=self.category or "obfuscated_morse_injection",
+            untrusted_input=self.raw_snippet or "",
+            decoded_payload=self.decoded_text,
+            target_sink=sink,
+        )
 
 
 class PromptInjectionDetector:
@@ -294,9 +406,9 @@ class PromptInjectionDetector:
 
     # Instruction override regex patterns
     RE_OVERRIDE = re.compile(
-        r"(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|prior|above|earlier)\s+(?:instructions?|directives?|rules?)|"
-        r"(?:override|bypass)\s+(?:all\s+)?(?:instructions?|safeguards?|security|rules?|policy)|"
-        r"system\s+override|"
+        r"(?:ignore|disregard|forget)\s+(?:all\s+)?(?:(?:previous|prior|above|earlier)\s+)?(?:instructions?|directives?|rules?|safeguards?|policies|policy)|"
+        r"(?:override|bypass)\s+(?:all\s+)?(?:instructions?|safeguards?|security|rules?|policy|limits?)|"
+        r"\b(?:system\s+|admin\s+|security\s+)?override(?:\s+all|\s+security|\s+policy|\s+safeguard|\s+rules?)?\b|"
         r"admin\s+override|"
         r"new\s+(?:system\s+|admin\s+)?(?:instructions?|directives?)|"
         r"you\s+are\s+now\s+in\s+(?:developer|degen|god|unrestricted)\s+mode|"
@@ -307,9 +419,9 @@ class PromptInjectionDetector:
 
     # Financial action regex patterns
     RE_FINANCIAL_ACTION = re.compile(
-        r"transfer\s+(?:everything|all(?:(?:\s+eth|\s+tokens|\s+funds))?|entire\s+balance)|"
-        r"send\s+(?:everything|all(?:(?:\s+eth|\s+tokens|\s+funds))?|entire\s+balance)|"
-        r"drain\s+(?:wallet|funds|all|vault|account|balance)|"
+        r"transfer\s+(?:everything|all(?:(?:\s+eth|\s+tokens|\s+funds|\s+assets))?|entire\s+balance)|"
+        r"send\s+(?:everything|all(?:(?:\s+eth|\s+tokens|\s+funds|\s+assets))?|entire\s+balance)|"
+        r"drain\s+(?:all\s+)?(?:(?:my|the)\s+)?(?:wallet|funds|all|vault|account|balance|assets|tokens?)|"
         r"sweep\s+(?:funds|wallet|balance|all)|"
         r"empty\s+(?:wallet|vault|account)|"
         r"withdraw\s+(?:all|everything|entire\s+balance)|"
@@ -328,7 +440,7 @@ class PromptInjectionDetector:
     )
 
     # Obfuscation candidate regexes
-    RE_MORSE_CANDIDATE = re.compile(r"(?:[.-]{1,6}(?:[ /]+|$)){4,}")
+    RE_MORSE_CANDIDATE = re.compile(r"(?:[.\-·•●—–_−]{1,7}(?:[\s/|\\]+|$)){2,}")
     RE_BASE64_CANDIDATE = re.compile(r"[A-Za-z0-9+/=]{16,}")
     RE_HEX_CANDIDATE = re.compile(r"(?:0x)?[0-9a-fA-F]{16,}")
     RE_HEX_SPACE_CANDIDATE = re.compile(r"(?:[0-9a-fA-F]{2}\s+){4,}[0-9a-fA-F]{2}")
@@ -339,13 +451,14 @@ class PromptInjectionDetector:
         """Decode international Morse code string into uppercase ASCII text."""
         norm = re.sub(r"[·•●]", ".", morse_str)
         norm = re.sub(r"[—–_−]", "-", norm)
-        words = re.split(r"\s*/\s*|\s{2,}|\n+", norm.strip())
+        words = re.split(r"\s*[/|\\]\s*|\s{2,}|\n+", norm.strip())
         decoded_words: list[str] = []
         for w in words:
             chars: list[str] = []
             tokens = w.strip().split()
             for tok in tokens:
-                c = MORSE_CODE_DICT.get(tok)
+                tok_clean = tok.strip(" ,;:\"'")
+                c = MORSE_CODE_DICT.get(tok_clean)
                 if c:
                     chars.append(c)
             if chars:
@@ -367,25 +480,33 @@ class PromptInjectionDetector:
         if not text or not isinstance(text, str):
             return InjectionSignal()
 
+        addr_m = self.RE_ETH_ADDRESS.search(text)
+        target_addr = addr_m.group(0) if addr_m else None
+
         # 1. Obfuscation detection: Morse Code
         morse_candidates = self.RE_MORSE_CANDIDATE.findall(text)
         for cand in morse_candidates:
-            decoded = self.decode_morse(cand)
+            cand_clean = cand.strip()
+            decoded = self.decode_morse(cand_clean)
             if decoded and len(decoded.split()) >= 1:
                 has_override = bool(self.RE_OVERRIDE.search(decoded))
                 has_financial = bool(self.RE_FINANCIAL_ACTION.search(decoded))
-                has_addr = bool(self.RE_ETH_ADDRESS.search(decoded))
-                if has_override or has_financial or (has_addr and any(kw in decoded.lower() for kw in ("send", "transfer", "eth"))):
-                    return InjectionSignal(
+                has_addr = bool(self.RE_ETH_ADDRESS.search(decoded)) or bool(target_addr)
+                if has_override or has_financial or (has_addr and any(kw in decoded.lower() for kw in ("send", "transfer", "eth", "drain", "to"))):
+                    sink = target_addr or (self.RE_ETH_ADDRESS.search(decoded).group(0) if self.RE_ETH_ADDRESS.search(decoded) else None)
+                    sig = InjectionSignal(
                         detected=True,
                         is_strong=True,
                         confidence=0.98,
                         category="obfuscated_morse_injection",
                         obfuscation="morse",
                         decoded_text=decoded,
-                        raw_snippet=cand.strip(),
+                        raw_snippet=cand_clean,
                         untrusted_source=source,
+                        target_sink=sink,
                     )
+                    sig.banner = sig.to_banner()
+                    return sig
 
         # 2. Obfuscation detection: Base64
         b64_candidates = self.RE_BASE64_CANDIDATE.findall(text)
@@ -397,7 +518,8 @@ class PromptInjectionDetector:
                     has_override = bool(self.RE_OVERRIDE.search(decoded))
                     has_financial = bool(self.RE_FINANCIAL_ACTION.search(decoded))
                     if has_override or has_financial:
-                        return InjectionSignal(
+                        sink = target_addr or (self.RE_ETH_ADDRESS.search(decoded).group(0) if self.RE_ETH_ADDRESS.search(decoded) else None)
+                        sig = InjectionSignal(
                             detected=True,
                             is_strong=True,
                             confidence=0.98,
@@ -406,7 +528,10 @@ class PromptInjectionDetector:
                             decoded_text=decoded,
                             raw_snippet=cand,
                             untrusted_source=source,
+                            target_sink=sink,
                         )
+                        sig.banner = sig.to_banner()
+                        return sig
             except Exception:
                 pass
 
@@ -420,7 +545,8 @@ class PromptInjectionDetector:
                     has_override = bool(self.RE_OVERRIDE.search(decoded))
                     has_financial = bool(self.RE_FINANCIAL_ACTION.search(decoded))
                     if has_override or has_financial:
-                        return InjectionSignal(
+                        sink = target_addr or (self.RE_ETH_ADDRESS.search(decoded).group(0) if self.RE_ETH_ADDRESS.search(decoded) else None)
+                        sig = InjectionSignal(
                             detected=True,
                             is_strong=True,
                             confidence=0.98,
@@ -429,7 +555,10 @@ class PromptInjectionDetector:
                             decoded_text=decoded,
                             raw_snippet=cand,
                             untrusted_source=source,
+                            target_sink=sink,
                         )
+                        sig.banner = sig.to_banner()
+                        return sig
             except Exception:
                 pass
 
@@ -442,7 +571,8 @@ class PromptInjectionDetector:
                         has_override = bool(self.RE_OVERRIDE.search(decoded))
                         has_financial = bool(self.RE_FINANCIAL_ACTION.search(decoded))
                         if has_override or has_financial:
-                            return InjectionSignal(
+                            sink = target_addr or (self.RE_ETH_ADDRESS.search(decoded).group(0) if self.RE_ETH_ADDRESS.search(decoded) else None)
+                            sig = InjectionSignal(
                                 detected=True,
                                 is_strong=True,
                                 confidence=0.98,
@@ -451,7 +581,10 @@ class PromptInjectionDetector:
                                 decoded_text=decoded,
                                 raw_snippet=cand,
                                 untrusted_source=source,
+                                target_sink=sink,
                             )
+                            sig.banner = sig.to_banner()
+                            return sig
                 except Exception:
                     pass
 
@@ -461,7 +594,7 @@ class PromptInjectionDetector:
         has_addr = bool(self.RE_ETH_ADDRESS.search(text))
 
         if has_override and (has_financial or has_addr):
-            return InjectionSignal(
+            sig = InjectionSignal(
                 detected=True,
                 is_strong=True,
                 confidence=0.99,
@@ -470,10 +603,13 @@ class PromptInjectionDetector:
                 decoded_text=None,
                 raw_snippet=text[:120],
                 untrusted_source=source,
+                target_sink=target_addr,
             )
+            sig.banner = sig.to_banner()
+            return sig
 
         if has_financial:
-            return InjectionSignal(
+            sig = InjectionSignal(
                 detected=True,
                 is_strong=True,
                 confidence=0.92,
@@ -482,10 +618,13 @@ class PromptInjectionDetector:
                 decoded_text=None,
                 raw_snippet=text[:120],
                 untrusted_source=source,
+                target_sink=target_addr,
             )
+            sig.banner = sig.to_banner()
+            return sig
 
         if has_override:
-            return InjectionSignal(
+            sig = InjectionSignal(
                 detected=True,
                 is_strong=False,
                 confidence=0.70,
@@ -494,7 +633,10 @@ class PromptInjectionDetector:
                 decoded_text=None,
                 raw_snippet=text[:120],
                 untrusted_source=source,
+                target_sink=target_addr,
             )
+            sig.banner = sig.to_banner()
+            return sig
 
         return InjectionSignal()
 
@@ -611,13 +753,21 @@ def _canonical_data_hex(data_hex: Any) -> str:
     """
     Canonicalize calldata for confirmation binding.
 
-    An omitted calldata argument may arrive as None, "", or "0x"; all three mean the
+    An omitted calldata argument may arrive as None, "", "0x", or "0x0"; all mean the
     same empty payload, so treating them as distinct would silently invalidate an
-    operator's confirmation. Only these trivial equivalences are normalized —
-    differing byte content is deliberately kept distinct so a mismatch fails closed.
+    operator's confirmation. Differing byte content is strictly kept distinct.
     """
-    raw = str(data_hex or "").strip().lower()
-    return raw if raw else "0x"
+    if data_hex is None:
+        return "0x"
+    raw = str(data_hex).strip().lower()
+    if not raw or raw in ("0x", "0x0"):
+        return "0x"
+    if raw.startswith("0x"):
+        raw = raw[2:]
+    # Normalize odd-length hex strings by leading zero padding
+    if len(raw) % 2 != 0:
+        raw = "0" + raw
+    return "0x" + raw
 
 
 # Well-known protocol & marketplace addresses
@@ -1220,8 +1370,13 @@ class ConfirmationStore:
             self._save()
             return True
 
-    def find_confirmed_entry(self, to_address: str, value_wei: int | None = None) -> PendingConfirmation | None:
-        """Find an unconsumed confirmed entry matching to_address and value."""
+    def find_confirmed_entry(
+        self,
+        to_address: str,
+        value_wei: int | None = None,
+        data_hex: str | None = None,
+    ) -> PendingConfirmation | None:
+        """Find an unconsumed confirmed entry matching to_address, value, and optionally calldata."""
         with self._lock:
             self._load()
             now = time.time()
@@ -1229,6 +1384,7 @@ class ConfirmationStore:
                 norm_to = normalize_address(to_address)
             except Exception:
                 norm_to = str(to_address).strip().lower()
+            clean_data = _canonical_data_hex(data_hex) if data_hex is not None else None
             for entry in reversed(list(self._pending.values())):
                 if (
                     entry.confirmed
@@ -1238,6 +1394,8 @@ class ConfirmationStore:
                     and entry.to_address == norm_to
                 ):
                     if value_wei is not None and int(entry.value_wei) != int(value_wei):
+                        continue
+                    if clean_data is not None and _canonical_data_hex(entry.data_hex) != clean_data:
                         continue
                     return entry
             return None
@@ -1707,16 +1865,51 @@ def safeguard_confirm_action(
         }
 
     if approved:
-        # Exploit safety check: Never confirm known critical exploits even if operator requests
-        raw_data = str(entry.data_hex or "").lower().replace("0x", "")
-        sel = raw_data[:8]
-        if sel in ("d8a17684", "f4c9c118", "756e6578", "de1e9a7e", "74617802"):
-            cs.reject(confirmation_id)
+        if is_kill_switch_active():
             return {
                 "status": "error",
                 "confirmation_id": confirmation_id,
                 "approved": False,
-                "message": "Cannot confirm action: transaction calldata matches known exploit pattern / drainer selector. SafeGuard blocked confirmation.",
+                "message": "🛑 SafeGuard Panic Active: Emergency kill-switch is engaged. Actions cannot be confirmed while panic lock is active. Operator must run /safeguard-resume first.",
+            }
+
+        # Exploit & Drainer Safety Check: Never confirm known critical exploits or drainer contracts even if operator requests
+        raw_candidates = [
+            str(entry.data_hex or "").lower().replace("0x", ""),
+            str((entry.tool_args or {}).get("calldata") or "").lower().replace("0x", ""),
+            str((entry.tool_args or {}).get("data") or "").lower().replace("0x", ""),
+            str((entry.tool_args or {}).get("data_hex") or "").lower().replace("0x", ""),
+            str((entry.tool_args or {}).get("input") or "").lower().replace("0x", ""),
+        ]
+        target_norm = normalize_address(entry.to_address)
+        try:
+            tf = get_default_threat_feed()
+            is_threat = bool(tf and tf.is_address_blocked(target_norm))
+        except Exception:
+            is_threat = False
+
+        is_drainer_target = is_threat
+
+        is_exploit_calldata = any(
+            candidate[:8] in ("d8a17684", "f4c9c118", "756e6578", "de1e9a7e", "74617802")
+            or "drain_approval" in candidate
+            or "approval_drain" in candidate
+            for candidate in raw_candidates
+            if candidate
+        )
+
+        if is_drainer_target or is_exploit_calldata:
+            cs.reject(confirmation_id)
+            err_msg = (
+                "Cannot confirm action: destination address or transaction calldata matches known exploit pattern / drainer contract. SafeGuard permanently blocked confirmation."
+                if is_drainer_target
+                else "Cannot confirm action: transaction calldata matches known exploit pattern / drainer selector. SafeGuard blocked confirmation."
+            )
+            return {
+                "status": "error",
+                "confirmation_id": confirmation_id,
+                "approved": False,
+                "message": err_msg,
             }
         success = cs.confirm(confirmation_id)
         if not success:
@@ -1942,6 +2135,7 @@ class ThreatFeed:
             Path(__file__).parent / "blocklist.json",
             Path("policies/blocklist.json"),
             Path(__file__).parent / "policies/blocklist.json",
+            Path.home() / ".hermes/plugins/hermes-safeguard/blocklist.json",
             Path.home() / ".hermes/blocklist.json",
             Path("blocklist.yaml"),
             Path(__file__).parent / "blocklist.yaml",
@@ -1957,6 +2151,7 @@ class ThreatFeed:
     def _load_fallback_defaults(self) -> None:
         """Seed minimal built-in threat items to guarantee fail-closed security even without a disk file."""
         fallback_contracts = [
+            ("e7f1725e7734ce288f8367e1bb143e90bb3f0512", "Live Malicious Drainer Demo Contract", "Known test & drain exploit contract (approval + transferFrom sweeper)"),
             ("000000000000000000000000000000000000bad1", "Simulated Drain Exploit Contract", "Known test & drain exploit contract"),
             ("742d35cc6634c0532925a3b844bc454e4438f44e", "Inferno Drainer Proxy", "Multi-chain phishing & wallet drainer contract"),
             ("000000000001844b20ccf2635d00d36983296204", "Fake Permit2 Router Drainer", "Spoofed Permit2 proxy executing token sweeps"),
@@ -1970,6 +2165,7 @@ class ThreatFeed:
             ("deadbeef11112222333344445555666677778888", "Known Exploit Sweeper EOA", "Sweeper address actively draining ERC20 balances"),
         ]
         fallback_selectors = [
+            ("d8a17684", "claimRewardAndSweep()", "Drain exploit selector (approval + transferFrom)"),
             ("23b872dd", "transferFrom(address,address,uint256)", "Standard ERC-20 transferFrom drain invocation"),
             ("baa2abde", "sweepTokens(address,address[])", "Unauthorized token sweeping function"),
             ("39125215", "emergencyDrain(address)", "Emergency drain selector in phishing contracts"),
@@ -2569,7 +2765,7 @@ def _parse_wei_value(val: int | float | str | None, default: int = 0) -> int:
         return val
     if isinstance(val, str):
         s = val.strip().lower()
-        if not s:
+        if not s or s in ("0x", "0x0"):
             return default
         s = s.replace(",", "")
         if s.endswith("ether"):
@@ -2585,9 +2781,19 @@ def _parse_wei_value(val: int | float | str | None, default: int = 0) -> int:
             num = float(s[:-4].strip())
             return int(num * 10**9)
         if s.endswith("wei"):
-            return int(s[:-3].strip())
+            s_num = s[:-3].strip()
+            if "e" in s_num:
+                return int(float(s_num))
+            return int(s_num)
         if s.startswith("0x"):
+            if len(s) == 2:
+                return default
             return int(s, 16)
+        if "e" in s:
+            f_val = float(s)
+            if "e-" in s or f_val < 100:
+                return int(f_val * 10**18)
+            return int(f_val)
         if "." in s:
             return int(float(s) * 10**18)
         return int(s)
@@ -2618,28 +2824,120 @@ def _parse_token_value(val: int | float | str | None, default: int) -> int:
 def decode_bytes_array(data: bytes) -> list[bytes]:
     """Decode ABI-encoded bytes[] dynamic array."""
     if len(data) < 64:
-        return []
+        raise ValueError("Truncated multicall calldata: insufficient length for array header")
     offset_arr = int.from_bytes(data[:32], "big")
     if len(data) < offset_arr + 32:
-        return []
+        raise ValueError(f"Truncated multicall calldata: offset {offset_arr} exceeds length {len(data)}")
     count = int.from_bytes(data[offset_arr : offset_arr + 32], "big")
     offsets: list[int] = []
     for i in range(count):
         start = offset_arr + 32 + i * 32
         if len(data) < start + 32:
-            return []
+            raise ValueError(f"Truncated multicall calldata: offset for element {i} out of bounds")
         off = int.from_bytes(data[start : start + 32], "big")
         offsets.append(offset_arr + 32 + off)
 
     res: list[bytes] = []
-    for off in offsets:
+    for i, off in enumerate(offsets):
         if len(data) < off + 32:
-            return []
+            raise ValueError(f"Truncated multicall calldata: element {i} header out of bounds")
         length = int.from_bytes(data[off : off + 32], "big")
         if len(data) < off + 32 + length:
-            return []
+            raise ValueError(f"Truncated multicall calldata: element {i} payload truncated")
         res.append(data[off + 32 : off + 32 + length])
     return res
+
+
+class VelocityTracker:
+    """Thread-safe and process-safe sliding-window velocity tracker for cumulative ETH expenditure."""
+
+    def __init__(self, window_seconds: float = 3600.0, filepath: Path | None = None):
+        self.window_seconds = window_seconds
+        self.filepath = filepath or resolve_state_path(".safeguard_velocity.json")
+        self._lock = threading.Lock()
+        self._spends: list[tuple[float, int]] = []
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.window_seconds
+        self._spends = [(ts, wei) for ts, wei in self._spends if ts >= cutoff]
+
+    def _load(self) -> None:
+        try:
+            raw = read_state_file(".safeguard_velocity.json")
+            if raw:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    self._spends = [
+                        (float(item[0]), int(item[1]))
+                        for item in data
+                        if isinstance(item, (list, tuple)) and len(item) == 2
+                    ]
+        except Exception:
+            pass
+
+    def _save(self) -> None:
+        try:
+            write_state_file(".safeguard_velocity.json", json.dumps(self._spends))
+        except Exception:
+            pass
+
+    def record_spend(self, value_wei: int, timestamp: float | None = None) -> None:
+        if value_wei <= 0:
+            return
+        now = time.time() if timestamp is None else timestamp
+        with self._lock:
+            self._load()
+            self._spends.append((now, int(value_wei)))
+            self._prune(now)
+            self._save()
+
+    def get_window_spend(self, now: float | None = None) -> int:
+        ts = time.time() if now is None else now
+        with self._lock:
+            self._load()
+            self._prune(ts)
+            return sum(wei for _, wei in self._spends)
+
+    def check_velocity(self, incoming_wei: int, cap_wei: int | None) -> tuple[bool, int, int]:
+        """Returns (allowed, current_spend, total_after)."""
+        if cap_wei is None or cap_wei <= 0:
+            return True, 0, incoming_wei
+        spent = self.get_window_spend()
+        total = spent + incoming_wei
+        return (total <= cap_wei), spent, total
+
+
+_DEFAULT_VELOCITY_TRACKER: VelocityTracker | None = None
+
+
+def get_default_velocity_tracker() -> VelocityTracker:
+    global _DEFAULT_VELOCITY_TRACKER
+    if _DEFAULT_VELOCITY_TRACKER is None:
+        _DEFAULT_VELOCITY_TRACKER = VelocityTracker()
+    return _DEFAULT_VELOCITY_TRACKER
+
+
+def reset_default_velocity_tracker() -> None:
+    global _DEFAULT_VELOCITY_TRACKER
+    try:
+        from .storage import unlink_state_file
+    except (ImportError, ValueError):
+        try:
+            from storage import unlink_state_file
+        except Exception:
+            unlink_state_file = None
+    if unlink_state_file:
+        try:
+            unlink_state_file(".safeguard_velocity.json")
+        except Exception:
+            pass
+    try:
+        p = Path(".safeguard_velocity.json")
+        if p.is_file():
+            p.unlink()
+    except Exception:
+        pass
+    _DEFAULT_VELOCITY_TRACKER = VelocityTracker()
 
 
 @dataclass
@@ -2679,6 +2977,7 @@ class PolicyConfig:
     memory_store: Any | None = None
     blocklist_path: str | Path | None = None
     threat_feed: Any | None = None
+    max_velocity_eth_per_hour: int | None = None
 
     def __post_init__(self) -> None:
         # Normalize mode string
@@ -2699,6 +2998,8 @@ class PolicyConfig:
                 self.max_eth_per_tx = 500_000_000_000_000_000  # 0.5 ETH
             if self.max_token_per_tx is None:
                 self.max_token_per_tx = 500_000_000_000_000_000
+            if self.max_velocity_eth_per_hour is None:
+                self.max_velocity_eth_per_hour = 2_000_000_000_000_000_000  # 2.0 ETH / hour
             if self.allow_unlimited_approve is None:
                 self.allow_unlimited_approve = False
             if self.block_zero_slippage is None:
@@ -2710,6 +3011,8 @@ class PolicyConfig:
                 self.max_eth_per_tx = 5_000_000_000_000_000_000  # 5.0 ETH
             if self.max_token_per_tx is None:
                 self.max_token_per_tx = 50_000_000_000_000_000_000  # 50 tokens
+            if self.max_velocity_eth_per_hour is None:
+                self.max_velocity_eth_per_hour = 10_000_000_000_000_000_000  # 10.0 ETH / hour
             if self.allow_unlimited_approve is None:
                 self.allow_unlimited_approve = False
             if self.block_zero_slippage is None:
@@ -2721,6 +3024,8 @@ class PolicyConfig:
                 self.max_eth_per_tx = 100_000_000_000_000_000_000  # 100.0 ETH
             if self.max_token_per_tx is None:
                 self.max_token_per_tx = UINT256_MAX
+            if self.max_velocity_eth_per_hour is None:
+                self.max_velocity_eth_per_hour = 50_000_000_000_000_000_000  # 50.0 ETH / hour
             if self.allow_unlimited_approve is None:
                 self.allow_unlimited_approve = True
             if self.block_zero_slippage is None:
@@ -2764,10 +3069,12 @@ class PolicyConfig:
         memory_store: Any | None = None,
         blocklist_path: str | Path | None = None,
         threat_feed: Any | None = None,
+        max_velocity_eth_per_hour: int | float | str | None = None,
     ) -> PolicyConfig:
         """Create a strict mode PolicyConfig (aggressive blocking, default for most users)."""
         eth_cap = _parse_wei_value(max_eth_per_tx, 500_000_000_000_000_000)  # 0.5 ETH
         token_cap = _parse_token_value(max_token_per_tx, 500_000_000_000_000_000)
+        vel_cap = _parse_wei_value(max_velocity_eth_per_hour, 2_000_000_000_000_000_000) if max_velocity_eth_per_hour is not None else None
         allowlist = recipient_allowlist if recipient_allowlist is not None else [DEFAULT_ALLOWED_TARGET]
         denylist = recipient_denylist if recipient_denylist is not None else []
         pre_approved = list(pre_approved_addresses or [])
@@ -2788,6 +3095,7 @@ class PolicyConfig:
             memory_store=memory_store,
             blocklist_path=blocklist_path,
             threat_feed=threat_feed,
+            max_velocity_eth_per_hour=vel_cap,
         )
 
     @classmethod
@@ -2804,10 +3112,12 @@ class PolicyConfig:
         memory_store: Any | None = None,
         blocklist_path: str | Path | None = None,
         threat_feed: Any | None = None,
+        max_velocity_eth_per_hour: int | float | str | None = None,
     ) -> PolicyConfig:
         """Create a balanced mode PolicyConfig (higher amounts, capped approvals, blocks drains)."""
         eth_cap = _parse_wei_value(max_eth_per_tx, 5_000_000_000_000_000_000)  # 5.0 ETH
         token_cap = _parse_token_value(max_token_per_tx, 50_000_000_000_000_000_000)  # 50 ETH equiv
+        vel_cap = _parse_wei_value(max_velocity_eth_per_hour, 10_000_000_000_000_000_000) if max_velocity_eth_per_hour is not None else None
         allowlist = recipient_allowlist if recipient_allowlist is not None else []
         denylist = recipient_denylist if recipient_denylist is not None else []
         pre_approved = list(pre_approved_addresses or [])
@@ -2828,6 +3138,7 @@ class PolicyConfig:
             memory_store=memory_store,
             blocklist_path=blocklist_path,
             threat_feed=threat_feed,
+            max_velocity_eth_per_hour=vel_cap,
         )
 
     @classmethod
@@ -2847,10 +3158,12 @@ class PolicyConfig:
         memory_store: Any | None = None,
         blocklist_path: str | Path | None = None,
         threat_feed: Any | None = None,
+        max_velocity_eth_per_hour: int | float | str | None = None,
     ) -> PolicyConfig:
         """Create a degen mode PolicyConfig (relaxed amount & approvals for NFT/heavy interaction)."""
         eth_cap = _parse_wei_value(max_eth_per_tx, 100_000_000_000_000_000_000)  # 100.0 ETH
         token_cap = _parse_token_value(max_token_per_tx, UINT256_MAX)
+        vel_cap = _parse_wei_value(max_velocity_eth_per_hour, 50_000_000_000_000_000_000) if max_velocity_eth_per_hour is not None else None
         contracts = contract_allowlist if contract_allowlist is not None else []
         allowlist = recipient_allowlist if recipient_allowlist is not None else []
         denylist = recipient_denylist if recipient_denylist is not None else []
@@ -2872,6 +3185,7 @@ class PolicyConfig:
             memory_store=memory_store,
             blocklist_path=blocklist_path,
             threat_feed=threat_feed,
+            max_velocity_eth_per_hour=vel_cap,
         )
 
     @classmethod
@@ -3435,6 +3749,8 @@ class PolicyEngine:
                 sub_calls = decode_bytes_array(raw_bytes)
             except Exception:
                 return "SG: malformed multicall calldata"
+            if not sub_calls:
+                return "SG: malformed multicall calldata"
             for call_b in sub_calls:
                 err = self.evaluate_calldata_security(call_b.hex())
                 if err:
@@ -3541,12 +3857,16 @@ class PolicyEngine:
                 return res
             if cs.is_confirmed(str(confirmation_id), to_address=to_address, value_wei=value_wei, data_hex=data_hex):
                 confirmed = True
+            else:
+                confirmed = False
         elif not confirmed:
-            matched_entry = cs.find_confirmed_entry(to_address, value_wei)
+            matched_entry = cs.find_confirmed_entry(to_address, value_wei, data_hex=data_hex)
             if matched_entry is not None:
                 if cs.is_confirmed(matched_entry.id, to_address=to_address, value_wei=value_wei, data_hex=data_hex):
                     confirmed = True
                     confirmation_id = matched_entry.id
+                else:
+                    confirmed = False
 
         # Step 0: Prompt / indirect injection check on untrusted context
         injection_signal = InjectionSignal()
@@ -3568,7 +3888,6 @@ class PolicyEngine:
         if (
             sel_check in exploit_reasons
             or "drain_approval" in clean_data_check
-            or "claimrewardandsweep" in clean_data_check
         ):
             reason_msg = exploit_reasons.get(
                 sel_check,
@@ -3651,6 +3970,38 @@ class PolicyEngine:
                 )
                 log_financial_action(action="transfer", status="blocked", mode=self.config.mode, target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="high", reason=res.reason)
                 return res
+
+        # Step 2.5: Hourly Cumulative Velocity Cap check
+        if value_wei > 0 and self.config.max_velocity_eth_per_hour:
+            vt = get_default_velocity_tracker()
+            allowed_vel, spent_wei, total_wei = vt.check_velocity(value_wei, self.config.max_velocity_eth_per_hour)
+            if not allowed_vel and not confirmed:
+                spent_eth = spent_wei / 10**18
+                total_eth = total_wei / 10**18
+                cap_eth = self.config.max_velocity_eth_per_hour / 10**18
+                vel_reason = f"SG: hourly velocity cap exceeded ({spent_eth:.2f} ETH spent in last hour, attempted {value_wei/10**18:.2f} ETH, total {total_eth:.2f} ETH exceeds {cap_eth:.2f} ETH limit)"
+                if self.config.mode == "degen":
+                    summary = generate_transaction_summary(
+                        to_address, value_wei, data_hex,
+                        risk_reasons=[vel_reason],
+                        mode="degen",
+                    )
+                    conf = get_default_confirmation_store().create_confirmation_request(
+                        action="velocity_limit", to_address=to_address, value_wei=value_wei, data_hex=data_hex,
+                        risk_score="high", reason=vel_reason, summary=summary, mode="degen",
+                    )
+                    log_financial_action(action="velocity_limit", status="requires_confirmation", mode="degen", target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="high", reason=conf.reason, summary=summary, confirmation_id=conf.id)
+                    return VerificationResult(
+                        False, conf.reason, RiskScore.HIGH, requires_confirmation=True,
+                        is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
+                        confirmation_id=conf.id, confirmation_summary=summary,
+                    )
+                else:
+                    log_financial_action(action="velocity_limit", status="blocked", mode=self.config.mode, target=to_address, value_wei=value_wei, data_hex=data_hex, risk_score="high", reason=vel_reason)
+                    return VerificationResult(
+                        False, vel_reason, RiskScore.HIGH,
+                        is_new_recipient=is_new_recipient, flagged_addresses=new_addresses,
+                    )
 
         # Step 3: Calldata security evaluation
         raw_data = data_hex.strip() if data_hex else ""

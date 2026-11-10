@@ -36,6 +36,16 @@ from typing import Any, Callable
 
 # Import SafeGuard threat feed primitives
 try:
+    from .policy_engine import (
+        DEFAULT_ALLOWED_TARGET,
+        ThreatEntry,
+        ThreatFeed,
+        get_default_threat_feed,
+        normalize_address,
+    )
+    from .verifier import KNOWN_VERIFIED_PROTOCOLS
+    from .storage import get_plugin_data_dir, resolve_state_path
+except (ImportError, ValueError):
     from policy_engine import (
         DEFAULT_ALLOWED_TARGET,
         ThreatEntry,
@@ -44,17 +54,7 @@ try:
         normalize_address,
     )
     from verifier import KNOWN_VERIFIED_PROTOCOLS
-except ImportError:
-    # Standalone fallback if invoked without policy_engine in sys.path
-    sys.path.insert(0, str(Path(__file__).parent))
-    from policy_engine import (
-        DEFAULT_ALLOWED_TARGET,
-        ThreatEntry,
-        ThreatFeed,
-        get_default_threat_feed,
-        normalize_address,
-    )
-    from verifier import KNOWN_VERIFIED_PROTOCOLS
+    from storage import get_plugin_data_dir, resolve_state_path
 
 logger = logging.getLogger("safeguard.threat_stream")
 
@@ -461,11 +461,10 @@ class ThreatStreamSyncer:
         auto_save: bool = True,
     ) -> None:
         self.threat_feed: ThreatFeed = threat_feed or get_default_threat_feed()
-        self.blocklist_path: Path | None = (
-            Path(blocklist_path)
-            if blocklist_path
-            else (self.threat_feed.filepath or Path("blocklist.json"))
-        )
+        if blocklist_path:
+            self.blocklist_path = Path(blocklist_path)
+        else:
+            self.blocklist_path = resolve_state_path("blocklist_overlay.json")
         self.poll_interval: int = max(5, int(poll_interval))
         self.auto_save = auto_save
 
@@ -658,8 +657,8 @@ class ThreatStreamSyncer:
         self._poll_thread = t
         t.start()
 
-    def start_webhook_server(self, port: int = DEFAULT_WEBHOOK_PORT, host: str = "0.0.0.0") -> None:
-        """Start dynamic webhook server receiving live Web3 alerts."""
+    def start_webhook_server(self, port: int = DEFAULT_WEBHOOK_PORT, host: str = "127.0.0.1") -> None:
+        """Start dynamic webhook server receiving live Web3 alerts. Default bind to 127.0.0.1 for local isolation."""
         if self._webhook_server is not None:
             return
 
@@ -690,6 +689,18 @@ class ThreatStreamSyncer:
                     self.send_error(404, "Not Found")
 
             def do_POST(self) -> None:
+                # Security gate: require shared secret / HMAC token if SAFEGUARD_WEBHOOK_SECRET is configured
+                shared_secret = os.getenv("SAFEGUARD_WEBHOOK_SECRET", "").strip()
+                if shared_secret:
+                    provided = (
+                        self.headers.get("X-SafeGuard-Secret", "")
+                        or self.headers.get("X-Webhook-Secret", "")
+                        or self.headers.get("Authorization", "").replace("Bearer ", "")
+                    ).strip()
+                    if not secrets.compare_digest(provided, shared_secret):
+                        self.send_error(401, "Unauthorized: Invalid or missing webhook secret")
+                        return
+
                 # Parse route: /webhook/<provider> or /webhook/threat
                 parsed = urllib.parse.urlparse(self.path)
                 path = parsed.path.rstrip("/")

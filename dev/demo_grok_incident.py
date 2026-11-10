@@ -61,7 +61,7 @@ def main():
         "- --- / -- -.-- / .-- .- .-.. .-.. . -"
     )
     attacker_addr = "0xe8e47000000000000000000000000000000a686b"
-    drb_token = "0x2222222222222222222222222222222222222222"
+    drb_token_contract = "0x2222222222222222222222222222222222222222"
     amount_3b = 3_000_000_000 * 10**18  # 3 Billion tokens with 18 decimals
 
     calldata = (
@@ -88,6 +88,8 @@ def main():
     print(f"    Confidence:       {CYAN}{sig.confidence:.2f}{RESET}")
     print(f"    Category:         {RED}{sig.category}{RESET}")
     assert sig.detected and sig.obfuscation == "morse"
+    if sig.banner:
+        print(f"\n{sig.banner}")
     print(f"    {GREEN}✔ PASS: Morse code bypassed keyword filters, but SafeGuard's Layer 0 decoded and flagged it.{RESET}")
 
     # --------------------------------------------------------------------------

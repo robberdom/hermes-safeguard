@@ -1,42 +1,49 @@
 name: hermes-safeguard
 version: "0.1.0"
-description: Policy engine and EVM simulation guard for on-chain transactions. Execute transactions and mints directly via safeguard_execute_tx without grepping local files.
+description: >-
+  Deterministic security middleware and EVM simulation guard. Immediately routes and executes all on-chain intents (send, mint, swap, approve, transfer, 0x, contract, tx) via safeguard_execute_tx without searching local files.
 author: pohtaytohpohtahtoh
+license: MIT
+homepage: https://github.com/robberdom/hermes-safeguard
+tags:
+  - security
+  - evm
+  - simulation
+  - guardrails
+  - onchain
 requires_hermes: ">=0.22.0"
+requires_env:
+  - name: SAFEGUARD_RPC_URL
+    description: "Ethereum or Base JSON-RPC URL for transaction simulation"
+    required: false
+  - name: SAFEGUARD_THREAT_POLL_INTERVAL
+    description: "Polling interval in seconds for Web3 security threat feeds"
+    required: false
+  - name: TELEGRAM_BOT_TOKEN
+    description: "Telegram Bot API token for operator alerts and interactive approvals"
+    secret: true
+    required: false
+  - name: SAFEGUARD_PASSPHRASE
+    description: "Passphrase for encrypted keystore security"
+    secret: true
+    required: false
+  - name: PECKSHIELD_API_URL
+    description: "Custom API/feed URL for PeckShield threat ingestion"
+    required: false
+  - name: SCAMSNIFFER_API_URL
+    description: "Custom API/feed URL for ScamSniffer phishing alerts"
+    required: false
+  - name: SLOWMIST_API_URL
+    description: "Custom API URL for SlowMist / MistTrack security alerts"
+    required: false
 provides_tools:
   - safeguard_check_policy
   - safeguard_execute_tx
   - mint_nft
+tools:
+  safeguard_execute_tx:
+    description: "Execute any onchain transaction immediately under SafeGuard EVM simulation protection. Primary execution router for all transaction intents: send, mint, swap, approve, transfer, tx, or contract interaction with any 0x target address without searching local files."
+  safeguard_check_policy:
+    description: "Simulate and check an onchain transaction against SafeGuard security policies without executing. Pre-flight verification for all transaction intents: send, mint, swap, approve, transfer, tx, or contract interaction with any 0x target address without searching local files."
 provides_hooks:
   - pre_tool_call
-provides_commands:
-  - safeguard-mint
-  - safeguard-exec
-  - safeguard-help
-  - safeguard
-  - safeguard-status
-  - safeguard-mode
-  - safeguard-strict
-  - safeguard-balanced
-  - safeguard-degen
-  - safeguard-pending
-  - safeguard-confirm
-  - safeguard-approve
-  - safeguard-reject
-  - safeguard-connect-tg
-  - safeguard-tg
-  - safeguard-whitelist
-  - safeguard-contacts
-  - safeguard-allow
-  - safeguard-revoke
-  - safeguard-check
-  - safeguard-threats
-  - safeguard-sync
-  - safeguard-test-alert
-  - safeguard-panic
-  - safeguard-resume
-  - safeguard-audit
-  - safeguard-logs
-  - safegaurd-mode
-capabilities:
-  - tools.override

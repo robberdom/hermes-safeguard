@@ -16,6 +16,7 @@ import os
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import __init__ as safeguard
 from policy_engine import (
@@ -150,7 +151,7 @@ def run_comprehensive_tests():
     assert res_exec_ok["executed"] is False  # nothing is signed or broadcast by this handler
     assert res_exec_ok["broadcast"] is False
     assert res_exec_ok["status"] == "success"
-    assert res_exec_ok["tx"]["to"] == DEFAULT_ALLOWED_TARGET
+    assert res_exec_ok["tx"]["to"].lower() == DEFAULT_ALLOWED_TARGET.lower()
     assert res_exec_ok["tx"]["gas"] == 21000
     print("[PASS] 2c: Approved transaction returns execution payload with gas parameters.")
 

@@ -49,6 +49,8 @@ class TestTraceInspection(unittest.TestCase):
         ensure_test_rpc_server()
 
     def setUp(self):
+        from policy_engine import reset_default_velocity_tracker
+        reset_default_velocity_tracker()
         self.degen_contract = "0x000000000000000000000000000000000000C001"
         self.agent_wallet = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
 

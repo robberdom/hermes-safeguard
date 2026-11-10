@@ -4,6 +4,10 @@ test_plugin.py — Verify Hermes SafeGuard plugin registration, tools, and hooks
 """
 
 import json
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import __init__ as safeguard
 from verifier import (
     ensure_test_rpc_server,

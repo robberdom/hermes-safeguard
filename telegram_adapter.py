@@ -40,6 +40,7 @@ from policy_engine import (
     DEFAULT_ALLOWED_TARGET,
     get_default_confirmation_store,
     get_default_memory_store,
+    is_kill_switch_active,
     safeguard_confirm_action,
     safeguard_list_pending_confirmations,
 )
@@ -283,7 +284,11 @@ class TelegramBot:
     def get_updates(self, offset: int = 0, timeout: int = 25) -> List[Dict[str, Any]]:
         res = self.api_call("getUpdates", {"offset": offset, "timeout": timeout, "allowed_updates": ["message", "callback_query"]}, timeout=timeout + 10)
         if res.get("ok"):
+            self.last_error_code = None
             return res.get("result", [])
+        if res.get("error_code") == 409:
+            logger.warning("Telegram Bot 409 Conflict: another bot instance or Hermes Telegram Gateway is already polling this token. Backing off.")
+            self.last_error_code = 409
         return []
 
     def send_message(
@@ -510,13 +515,13 @@ class SafeGuardTelegramBridge:
         }
         return self.bot.send_message(chat_id, text, reply_markup=reply_markup)
 
-    def is_authorized(self, chat_id: str | int) -> bool:
-        cid = str(chat_id)
+    def is_authorized(self, user_or_chat_id: str | int) -> bool:
+        cid = str(user_or_chat_id)
         if self.operator_chat_id and cid == self.operator_chat_id:
             return True
         pairings = load_pairings()
         for v in pairings.values():
-            if str(v.get("chat_id")) == cid:
+            if str(v.get("chat_id")) == cid or str(v.get("user_id", "")) == cid:
                 return True
         return False
 
@@ -524,6 +529,7 @@ class SafeGuardTelegramBridge:
         chat = message.get("chat", {})
         chat_id = str(chat.get("id"))
         user = message.get("from", {})
+        user_id = str(user.get("id"))
         username = user.get("username") or user.get("first_name", "Operator")
         text = message.get("text", "").strip()
 
@@ -587,13 +593,23 @@ class SafeGuardTelegramBridge:
             return
 
         # Access control: only authorized paired users can execute console commands
-        if not self.is_authorized(chat_id):
-            self.bot.send_message(
-                chat_id,
-                "⛔ <b>Access Denied:</b> This SafeGuard bot is not paired with your Telegram account.\n\n"
-                "To connect your agent, type <code>/connect-tg</code> in your Hermes session, then send: <code>/pair &lt;CODE&gt;</code>",
-            )
-            return
+        is_group = chat_id.startswith("-") or chat.get("type") in ("group", "supergroup")
+        if is_group:
+            # In group chats, verify both the group is paired AND the specific sender is authorized
+            if not self.is_authorized(chat_id) or not self.is_authorized(user_id):
+                self.bot.send_message(
+                    chat_id,
+                    f"⛔ <b>Access Denied:</b> User @{username} (<code>{user_id}</code>) is not an authorized operator for this agent.",
+                )
+                return
+        else:
+            if not self.is_authorized(chat_id) and not self.is_authorized(user_id):
+                self.bot.send_message(
+                    chat_id,
+                    "⛔ <b>Access Denied:</b> This SafeGuard bot is not paired with your Telegram account.\n\n"
+                    "To connect your agent, type <code>/connect-tg</code> in your Hermes session, then send: <code>/pair &lt;CODE&gt;</code>",
+                )
+                return
 
         if cmd in ("/start", "/help"):
             mode = os.getenv("SAFEGUARD_MODE", "balanced").upper()
@@ -693,9 +709,16 @@ class SafeGuardTelegramBridge:
         user_id = str(user.get("id"))
         username = user.get("username") or user.get("first_name", "Operator")
 
-        if not self.is_authorized(user_id):
-            self.bot.answer_callback_query(query_id, "⛔ Access denied.", show_alert=True)
-            return
+        # In callback queries, verify user_id is authorized; if message was in a group, verify both group and user
+        is_group_msg = chat_id.startswith("-") or message.get("chat", {}).get("type") in ("group", "supergroup")
+        if is_group_msg:
+            if not self.is_authorized(chat_id) or not self.is_authorized(user_id):
+                self.bot.answer_callback_query(query_id, "⛔ Access denied.", show_alert=True)
+                return
+        else:
+            if not self.is_authorized(user_id) and not self.is_authorized(chat_id):
+                self.bot.answer_callback_query(query_id, "⛔ Access denied.", show_alert=True)
+                return
 
         parts = data.split(":", 1)
         if len(parts) != 2:
@@ -703,6 +726,14 @@ class SafeGuardTelegramBridge:
             return
 
         action, conf_id = parts
+
+        if action == "approve" and is_kill_switch_active():
+            self.bot.answer_callback_query(
+                query_id,
+                "🛑 [SAFEGUARD PANIC LOCK ACTIVE]: Cannot confirm action while emergency kill-switch is engaged.",
+                show_alert=True,
+            )
+            return
 
         if action in ("approve", "reject"):
             approved = (action == "approve")
@@ -1355,6 +1386,10 @@ class SafeGuardTelegramBridge:
         while self.running:
             try:
                 updates = self.bot.get_updates(offset=offset, timeout=20)
+                if getattr(self.bot, "last_error_code", None) == 409:
+                    self.bot.last_error_code = None
+                    time.sleep(15)
+                    continue
                 for update in updates:
                     update_id = update.get("update_id", 0)
                     offset = max(offset, update_id + 1)

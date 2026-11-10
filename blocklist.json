@@ -4,6 +4,14 @@
   "description": "Hermes SafeGuard local threat feed and security blocklist",
   "malicious_contracts": [
     {
+      "address": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512",
+      "name": "Live Malicious Drainer Demo Contract",
+      "category": "malicious_contract",
+      "description": "Known test & drain exploit contract (approval + transferFrom sweeper)",
+      "severity": "CRITICAL",
+      "date_added": "2026-11-09"
+    },
+    {
       "address": "0x000000000000000000000000000000000000bad1",
       "name": "Simulated Drain Exploit Contract",
       "category": "malicious_contract",

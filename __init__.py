@@ -16,92 +16,143 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Ensure local imports work when loaded as a Hermes plugin directory
-_PLUGIN_DIR = str(Path(__file__).resolve().parent)
-if _PLUGIN_DIR not in sys.path:
-    sys.path.insert(0, _PLUGIN_DIR)
-
+# Schemas, Tools, Hooks, Commands & Helpers
 try:
-    from telegram_adapter import load_dotenv
-    load_dotenv(Path(__file__).resolve().parent / ".env")
-    load_dotenv(Path.cwd() / ".env")
-except Exception:
-    pass
-
-# Schemas
-from schemas import (
-    ALL_TOOL_SCHEMAS,
-    MINT_NFT_SCHEMA,
-    SAFEGUARD_CHECK_POLICY_SCHEMA,
-    SAFEGUARD_EXECUTE_TX_SCHEMA,
-)
-
-# Tools & Execution Logic
-from tools import (
-    _get_policy_config,
-    _notify_telegram_operator,
-    is_kill_switch_active,
-    mint_nft_handler,
-    safeguard_check_policy_handler,
-    safeguard_confirm_action_handler,
-    safeguard_execute_tx_handler,
-    set_kill_switch,
-)
-
-# Hooks & Interception
-from hooks import (
-    FINANCIAL_NAME_KEYWORDS,
-    PROTECTED_BASENAMES,
-    SAFEGUARD_INTERNAL_TOOLS,
-    _COMMAND_VERBS,
-    _ETH_ADDRESS_REGEX,
-    _MUTATING_VERBS,
-    _extract_tx_params,
-    _is_contract_search_attempt,
-    _is_financial_tool_call,
-    _is_policy_tampering_attempt,
-    _iter_strings,
-    _references_protected_path,
-    on_pre_tool_call,
-)
-
-# Slash Command Handlers
-from commands import (
-    _parse_command_args,
-    safeguard_allow_command_handler,
-    safeguard_audit_command_handler,
-    safeguard_balanced_command_handler,
-    safeguard_check_command_handler,
-    safeguard_confirm_command_handler,
-    safeguard_connect_tg_command_handler,
-    safeguard_degen_command_handler,
-    safeguard_exec_command_handler,
-    safeguard_help_command_handler,
-    safeguard_mint_command_handler,
-    safeguard_mode_command_handler,
-    safeguard_panic_command_handler,
-    safeguard_pending_command_handler,
-    safeguard_reject_command_handler,
-    safeguard_resume_command_handler,
-    safeguard_revoke_command_handler,
-    safeguard_status_handler,
-    safeguard_strict_command_handler,
-    safeguard_sync_command_handler,
-    safeguard_test_alert_command_handler,
-    safeguard_threats_command_handler,
-    safeguard_whitelist_command_handler,
-)
-
-# Storage & Persistence
-from storage import (
-    get_plugin_data_dir,
-    read_state_file,
-    resolve_state_path,
-    unlink_state_file,
-    write_state_file,
-)
-
-from verifier import ensure_test_rpc_server
+    from .schemas import (
+        ALL_TOOL_SCHEMAS,
+        MINT_NFT_SCHEMA,
+        SAFEGUARD_CHECK_POLICY_SCHEMA,
+        SAFEGUARD_EXECUTE_TX_SCHEMA,
+    )
+    from .tools import (
+        _get_policy_config,
+        _notify_telegram_operator,
+        is_kill_switch_active,
+        mint_nft_handler,
+        safeguard_check_policy_handler,
+        safeguard_confirm_action_handler,
+        safeguard_execute_tx_handler,
+        set_kill_switch,
+    )
+    from .hooks import (
+        FINANCIAL_NAME_KEYWORDS,
+        PROTECTED_BASENAMES,
+        SAFEGUARD_INTERNAL_TOOLS,
+        _COMMAND_VERBS,
+        _ETH_ADDRESS_REGEX,
+        _MUTATING_VERBS,
+        _extract_tx_params,
+        _is_contract_search_attempt,
+        _is_financial_tool_call,
+        _is_policy_tampering_attempt,
+        _iter_strings,
+        _references_protected_path,
+        on_pre_tool_call,
+    )
+    from .commands import (
+        _parse_command_args,
+        safeguard_allow_command_handler,
+        safeguard_audit_command_handler,
+        safeguard_balanced_command_handler,
+        safeguard_check_command_handler,
+        safeguard_confirm_command_handler,
+        safeguard_connect_tg_command_handler,
+        safeguard_degen_command_handler,
+        safeguard_exec_command_handler,
+        safeguard_help_command_handler,
+        safeguard_mint_command_handler,
+        safeguard_mode_command_handler,
+        safeguard_panic_command_handler,
+        safeguard_pending_command_handler,
+        safeguard_reject_command_handler,
+        safeguard_resume_command_handler,
+        safeguard_revoke_command_handler,
+        safeguard_status_handler,
+        safeguard_strict_command_handler,
+        safeguard_sync_command_handler,
+        safeguard_test_alert_command_handler,
+        safeguard_threats_command_handler,
+        safeguard_tx_command_handler,
+        safeguard_whitelist_command_handler,
+        safeguard_scan_command_handler,
+        safeguard_ingest_command_handler,
+    )
+    from .storage import (
+        get_plugin_data_dir,
+        read_state_file,
+        resolve_state_path,
+        unlink_state_file,
+        write_state_file,
+    )
+    from .verifier import ensure_test_rpc_server
+except (ImportError, ValueError):
+    from schemas import (
+        ALL_TOOL_SCHEMAS,
+        MINT_NFT_SCHEMA,
+        SAFEGUARD_CHECK_POLICY_SCHEMA,
+        SAFEGUARD_EXECUTE_TX_SCHEMA,
+    )
+    from tools import (
+        _get_policy_config,
+        _notify_telegram_operator,
+        is_kill_switch_active,
+        mint_nft_handler,
+        safeguard_check_policy_handler,
+        safeguard_confirm_action_handler,
+        safeguard_execute_tx_handler,
+        set_kill_switch,
+    )
+    from hooks import (
+        FINANCIAL_NAME_KEYWORDS,
+        PROTECTED_BASENAMES,
+        SAFEGUARD_INTERNAL_TOOLS,
+        _COMMAND_VERBS,
+        _ETH_ADDRESS_REGEX,
+        _MUTATING_VERBS,
+        _extract_tx_params,
+        _is_contract_search_attempt,
+        _is_financial_tool_call,
+        _is_policy_tampering_attempt,
+        _iter_strings,
+        _references_protected_path,
+        on_pre_tool_call,
+    )
+    from commands import (
+        _parse_command_args,
+        safeguard_allow_command_handler,
+        safeguard_audit_command_handler,
+        safeguard_balanced_command_handler,
+        safeguard_check_command_handler,
+        safeguard_confirm_command_handler,
+        safeguard_connect_tg_command_handler,
+        safeguard_degen_command_handler,
+        safeguard_exec_command_handler,
+        safeguard_help_command_handler,
+        safeguard_mint_command_handler,
+        safeguard_mode_command_handler,
+        safeguard_panic_command_handler,
+        safeguard_pending_command_handler,
+        safeguard_reject_command_handler,
+        safeguard_resume_command_handler,
+        safeguard_revoke_command_handler,
+        safeguard_status_handler,
+        safeguard_strict_command_handler,
+        safeguard_sync_command_handler,
+        safeguard_test_alert_command_handler,
+        safeguard_threats_command_handler,
+        safeguard_tx_command_handler,
+        safeguard_whitelist_command_handler,
+        safeguard_scan_command_handler,
+        safeguard_ingest_command_handler,
+    )
+    from storage import (
+        get_plugin_data_dir,
+        read_state_file,
+        resolve_state_path,
+        unlink_state_file,
+        write_state_file,
+    )
+    from verifier import ensure_test_rpc_server
 
 logger = logging.getLogger("hermes-safeguard")
 
@@ -223,12 +274,8 @@ def register(ctx: Any) -> None:
     """
     Official Hermes Agent plugin registration entrypoint.
     Wires tools, hooks, and slash commands into the Hermes context.
+    Registration runs without starting threads, daemons, or network calls.
     """
-    try:
-        ensure_test_rpc_server("127.0.0.1", 8545)
-    except Exception:
-        pass
-
     # 1. Register tool: safeguard_check_policy
     _register_tool_safely(
         ctx=ctx,
@@ -265,10 +312,14 @@ def register(ctx: Any) -> None:
     # 5. Register slash commands
     cmd_handlers = {
         # Direct execution commands
+        "safeguard-tx": safeguard_tx_command_handler,
+        "safegaurd-tx": safeguard_tx_command_handler,
         "safeguard-mint": safeguard_mint_command_handler,
         "safegaurd-mint": safeguard_mint_command_handler,
         "safeguard-exec": safeguard_exec_command_handler,
         "safegaurd-exec": safeguard_exec_command_handler,
+        "safeguard-scan": safeguard_scan_command_handler,
+        "safeguard-ingest": safeguard_ingest_command_handler,
 
         # Core mode commands
         "safeguard-mode": safeguard_mode_command_handler,
@@ -296,7 +347,6 @@ def register(ctx: Any) -> None:
         "safeguard-approve": safeguard_confirm_command_handler,
         "safeguard-reject": safeguard_reject_command_handler,
         "confirm": safeguard_confirm_command_handler,
-        "approve": safeguard_confirm_command_handler,
         "reject": safeguard_reject_command_handler,
         "safeguard-connect-tg": safeguard_connect_tg_command_handler,
         "connect-tg": safeguard_connect_tg_command_handler,
@@ -329,6 +379,8 @@ def register(ctx: Any) -> None:
         "safegaurd": safeguard_help_command_handler,
     }
     cmd_descriptions = {
+        "safeguard-tx": "Zero-overhead instant on-chain execution under SafeGuard EVM simulation (e.g. /safeguard-tx <addr> <eth> [data_hex]).",
+        "safegaurd-tx": "Zero-overhead instant on-chain execution under SafeGuard EVM simulation (alias).",
         "safeguard-mint": "Directly mint NFT under SafeGuard EVM simulation protection (e.g. /safeguard-mint <addr> [eth]).",
         "safegaurd-mint": "Directly mint NFT under SafeGuard EVM simulation protection (alias).",
         "safeguard-exec": "Directly execute on-chain transaction under SafeGuard EVM simulation (e.g. /safeguard-exec <addr> [eth] [hex]).",
@@ -378,45 +430,73 @@ def register(ctx: Any) -> None:
         reg_fn = getattr(ctx, reg_method_name, None)
         if callable(reg_fn):
             for cmd_base, handler in cmd_handlers.items():
+                if cmd_base in registered_cmds:
+                    continue
                 desc = cmd_descriptions.get(cmd_base, "")
-                for cmd_name in (cmd_base, f"/{cmd_base}"):
-                    if (reg_method_name, cmd_name) in registered_cmds:
-                        continue
+                cmd_name = cmd_base
+                try:
+                    reg_fn(
+                        name=cmd_name,
+                        handler=handler,
+                        description=desc,
+                    )
+                    registered_cmds.add(cmd_base)
+                except TypeError:
                     try:
-                        reg_fn(
-                            name=cmd_name,
-                            handler=handler,
-                            description=desc,
-                        )
-                        registered_cmds.add((reg_method_name, cmd_name))
+                        reg_fn(cmd_name, handler, desc)
+                        registered_cmds.add(cmd_base)
                     except TypeError:
                         try:
-                            reg_fn(cmd_name, handler, desc)
-                            registered_cmds.add((reg_method_name, cmd_name))
-                        except TypeError:
-                            try:
-                                reg_fn(cmd_name, handler)
-                                registered_cmds.add((reg_method_name, cmd_name))
-                            except Exception:
-                                pass
+                            reg_fn(cmd_name, handler)
+                            registered_cmds.add(cmd_base)
+                        except Exception:
+                            pass
                         except Exception:
                             pass
                     except Exception:
                         pass
 
-    for dict_attr in ("slash_commands", "commands"):
+    for dict_attr in ("slash_commands", "commands", "registered_commands"):
         d = getattr(ctx, dict_attr, None)
         if isinstance(d, dict):
             for cmd_base, handler in cmd_handlers.items():
                 d[cmd_base] = handler
                 d[f"/{cmd_base}"] = handler
 
-    # 6. Register system prompt section so Hermes Agent avoids searching codebase for policy modes
+    # 6. Register one-line routing rule instructing the agent to route all 0x and transaction intents straight to safeguard_execute_tx
+    routing_rule = (
+        "Route all 0x addresses and transaction intents (send, mint, swap, approve, transfer, tx, contract) "
+        "directly to `safeguard_execute_tx` without searching, reading, or inspecting local codebase files."
+    )
+    for rule_fn_name in ("register_routing_rule", "register_rule", "register_prompt_rule", "add_rule"):
+        rule_fn = getattr(ctx, rule_fn_name, None)
+        if callable(rule_fn):
+            try:
+                rule_fn("safeguard.onchain_routing", routing_rule)
+                break
+            except TypeError:
+                try:
+                    rule_fn(routing_rule)
+                    break
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    if hasattr(ctx, "rules") and isinstance(ctx.rules, list):
+        if routing_rule not in ctx.rules:
+            ctx.rules.append(routing_rule)
+    elif hasattr(ctx, "rules") and isinstance(ctx.rules, dict):
+        ctx.rules["safeguard.onchain_routing"] = routing_rule
+
+    # 7. Register system prompt section so Hermes Agent avoids searching codebase for policy modes
     sys_prompt_fn = getattr(ctx, "register_system_prompt_section", None)
     if callable(sys_prompt_fn):
         prompt_content = (
             "Hermes SafeGuard security middleware is ACTIVE. "
             "Policy mode is operator-controlled via instant slash commands.\n\n"
+            "MANDATORY ROUTING RULE:\n"
+            f"{routing_rule}\n\n"
             "DIRECT ON-CHAIN TRANSACTION EXECUTION DIRECTIVE:\n"
             "When the user asks to mint an NFT, transfer tokens, swap, or execute any transaction:\n"
             "1. NEVER use search_files, read_file, grep, or terminal tools to inspect workspace files or find contracts.\n"
@@ -424,6 +504,7 @@ def register(ctx: Any) -> None:
             "3. For NFT mints: call safeguard_execute_tx directly with the specified contract address and value in wei (or ether string like '0.05 ether'). If calldata is not specified, use data='0xa0712d680000000000000000000000000000000000000000000000000000000000000001' (mint(1)).\n\n"
             "When the user asks to switch policy modes, view security status, or confirm transactions, "
             "guide them to use SafeGuard slash commands instead of searching files or running scripts:\n"
+            "  /safeguard-tx <to> <eth> [data] - Instant zero-overhead on-chain transaction execution\n"
             "  /safeguard-mode [strict|balanced|degen|next] - Cycle or switch policy modes instantly\n"
             "  /safeguard-strict, /safeguard-balanced, /safeguard-degen - Quick mode switches\n"
             "  /safeguard-status - View current mode, limits, and RPC connection\n"
@@ -448,18 +529,5 @@ def register(ctx: Any) -> None:
                 pass
         except Exception:
             pass
-
-    # 7. Auto-start Dynamic Threat Stream Syncer in background
-    if os.getenv("SAFEGUARD_AUTO_STREAM", "true").lower() in ("true", "1", "yes"):
-        try:
-            from threat_stream import get_default_threat_stream_syncer
-            syncer = get_default_threat_stream_syncer()
-            syncer.start_polling_worker()
-            webhook_port_env = os.getenv("SAFEGUARD_WEBHOOK_PORT")
-            if webhook_port_env:
-                try:
-                    syncer.start_webhook_server(port=int(webhook_port_env))
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.debug("SafeGuard: Auto-stream startup skipped: %s", e)
+    # Threat stream sync and servers remain lazy: initialized on explicit command (/safeguard-sync)
+    # or on first policy check, preserving zero side-effects during registration.

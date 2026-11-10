@@ -13,9 +13,12 @@ contract SafeGuardPolicy {
     bytes4 private constant APPROVE_SELECTOR = 0x095ea7b3;
     bytes4 private constant MULTICALL_SELECTOR = 0xac9650d8;
     bytes4 private constant V2_SWAP_SELECTOR = 0x38ed1739;
+    bytes4 private constant V2_SWAP_EXACT_ETH_FOR_TOKENS = 0x7ff36ab5;
+    bytes4 private constant V2_SWAP_EXACT_TOKENS_FOR_ETH = 0x18cbafe5;
     bytes4 private constant V3_SWAP_SELECTOR = 0x414bf389;
     bytes4 private constant SET_APPROVAL_FOR_ALL_SELECTOR = 0xa22cb465;
     bytes4 private constant PERMIT2_APPROVE_SELECTOR = 0x87517c45;
+    bytes4 private constant ERC20_TRANSFER_SELECTOR = 0xa9059cbb;
 
     /// @param _maxValuePerTx Maximum native asset (wei) allowed per transaction.
     /// @param _whitelist Array of allowed target addresses.
@@ -77,13 +80,28 @@ contract SafeGuardPolicy {
                 uint256 amountOutMin = abi.decode(data[36:68], (uint256));
                 require(amountOutMin > 0, "SG: zero slippage swap blocked");
             }
+            if (sel == V2_SWAP_EXACT_ETH_FOR_TOKENS) {
+                require(data.length >= 36, "SG: malformed swap calldata");
+                uint256 amountOutMin = abi.decode(data[4:36], (uint256));
+                require(amountOutMin > 0, "SG: zero slippage swap blocked");
+            }
+            if (sel == V2_SWAP_EXACT_TOKENS_FOR_ETH) {
+                require(data.length >= 68, "SG: malformed swap calldata");
+                uint256 amountOutMin = abi.decode(data[36:68], (uint256));
+                require(amountOutMin > 0, "SG: zero slippage swap blocked");
+            }
             if (sel == V3_SWAP_SELECTOR) {
                 require(data.length >= 228, "SG: malformed swap calldata");
                 uint256 amountOutMin = abi.decode(data[196:228], (uint256));
                 require(amountOutMin > 0, "SG: zero slippage swap blocked");
             }
 
-            // 3d. Modern Drainer Selectors
+            // 3d. Modern Drainer & ERC20 Selectors
+            if (sel == ERC20_TRANSFER_SELECTOR) {
+                require(data.length >= 68, "SG: malformed transfer calldata");
+                uint256 amount = abi.decode(data[36:68], (uint256));
+                require(amount <= maxValuePerTx, "SG: token transfer amount exceeds token cap");
+            }
             if (sel == SET_APPROVAL_FOR_ALL_SELECTOR) {
                 require(data.length >= 68, "SG: malformed approval calldata");
                 bool approved = abi.decode(data[36:68], (bool));

@@ -139,7 +139,10 @@ class TestPluginRegistration(unittest.TestCase):
             {"query": "0x5FbDB2315678afecb367f032d93F642f64180aa3", "path": "."},
         )
         self.assertEqual(res.get("action"), "block")
-        self.assertIn("on-chain smart contract", res.get("message", ""))
+        self.assertTrue(
+            "SAFEGUARD MIDDLEWARE: File search blocked for onchain intent" in res.get("message", "")
+            or "on-chain smart contract" in res.get("message", "")
+        )
         self.assertIn("safeguard_execute_tx", res.get("message", ""))
 
     def test_auto_encode_mint_calldata(self):

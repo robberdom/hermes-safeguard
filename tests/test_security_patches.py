@@ -28,6 +28,7 @@ from policy_engine import (
     get_default_confirmation_store,
     reset_default_confirmation_store,
     reset_default_memory_store,
+    reset_default_velocity_tracker,
 )
 from verifier import (
     DEFAULT_FROM_ADDRESS,
@@ -46,6 +47,7 @@ class SecurityPatchTestBase(unittest.TestCase):
     def setUp(self):
         reset_default_confirmation_store()
         reset_default_memory_store()
+        reset_default_velocity_tracker()
         ensure_test_rpc_server()
         self._env_backup = {k: os.environ.get(k) for k in (
             "SAFEGUARD_MODE",
@@ -54,6 +56,7 @@ class SecurityPatchTestBase(unittest.TestCase):
         )}
 
     def tearDown(self):
+        reset_default_velocity_tracker()
         for key, value in self._env_backup.items():
             if value is None:
                 os.environ.pop(key, None)

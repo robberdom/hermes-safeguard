@@ -91,27 +91,50 @@ def read_state_file(filename: str) -> str | None:
     Read content from a persistent state file.
     Checks canonical data directory first, then falls back to legacy/local path.
     """
+    import fcntl
+
+    def _safe_read(p: Path) -> str | None:
+        if not p.is_file():
+            return None
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                except (OSError, AttributeError):
+                    pass
+                data = f.read()
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except (OSError, AttributeError):
+                    pass
+                return data
+        except Exception:
+            return None
+
     # 1. Canonical data directory
     try:
         canonical = resolve_state_path(filename)
-        if canonical.is_file():
-            return canonical.read_text(encoding="utf-8")
+        res = _safe_read(canonical)
+        if res is not None:
+            return res
     except Exception:
         pass
 
     # 2. Fallback to local repo directory (for tests & pre-migration setups)
     try:
         local_path = _LOCAL_REPO_DIR / filename
-        if local_path.is_file():
-            return local_path.read_text(encoding="utf-8")
+        res = _safe_read(local_path)
+        if res is not None:
+            return res
     except Exception:
         pass
 
     # 3. Fallback to ~/.hermes / filename
     try:
         hermes_root_file = Path.home() / ".hermes" / filename
-        if hermes_root_file.is_file():
-            return hermes_root_file.read_text(encoding="utf-8")
+        res = _safe_read(hermes_root_file)
+        if res is not None:
+            return res
     except Exception:
         pass
 
@@ -120,14 +143,32 @@ def read_state_file(filename: str) -> str | None:
 
 def write_state_file(filename: str, content: str) -> None:
     """
-    Write content to a persistent state file in the sanctioned data root.
+    Write content to a persistent state file in the sanctioned data root atomically with file locking.
     Also syncs to local repo directory if the file already exists there (e.g. during test suite runs).
     """
+    import fcntl
+
+    def _atomic_write(dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except (OSError, AttributeError):
+                pass
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except (OSError, AttributeError):
+                pass
+        tmp.replace(dest)
+
     # 1. Write to canonical location
     try:
         canonical = resolve_state_path(filename)
-        canonical.parent.mkdir(parents=True, exist_ok=True)
-        canonical.write_text(content, encoding="utf-8")
+        _atomic_write(canonical)
     except Exception:
         pass
 
@@ -135,7 +176,7 @@ def write_state_file(filename: str, content: str) -> None:
     try:
         local_path = _LOCAL_REPO_DIR / filename
         if local_path.is_file() and canonical != local_path:
-            local_path.write_text(content, encoding="utf-8")
+            _atomic_write(local_path)
     except Exception:
         pass
 
@@ -143,7 +184,7 @@ def write_state_file(filename: str, content: str) -> None:
     try:
         hermes_file = Path.home() / ".hermes" / filename
         if hermes_file.is_file() and canonical != hermes_file:
-            hermes_file.write_text(content, encoding="utf-8")
+            _atomic_write(hermes_file)
     except Exception:
         pass
 
