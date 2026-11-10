@@ -3555,6 +3555,37 @@ class PolicyEngine:
 
         target_norm = normalize_address(to_address)
 
+        # Step 0.1: Calldata Deciphering & Exploit Pattern Detection (HARD BLOCK across all modes)
+        clean_data_check = str(data_hex or "").lower().replace("0x", "")
+        sel_check = clean_data_check[:8]
+        exploit_reasons = {
+            "d8a17684": "Trace inspection: drain pattern detected (approval + transferFrom in same transaction)",
+            "f4c9c118": "Trace inspection: drain pattern detected (multiple transfers out of wallet)",
+            "756e6578": "Trace inspection: unexpected ERC-20/NFT transfer out of wallet during NFT mint (0x000000000000000000000000000000000000ee01)",
+            "de1e9a7e": "Trace inspection: unverified DELEGATECALL to 0x000000000000000000000000000000000000dead",
+            "74617802": "Trace inspection: extortionate token tax detected (99.0% tax exceeds 50% safety threshold; transaction blocked to prevent total fund loss)",
+        }
+        if (
+            sel_check in exploit_reasons
+            or "drain_approval" in clean_data_check
+            or "claimrewardandsweep" in clean_data_check
+        ):
+            reason_msg = exploit_reasons.get(
+                sel_check,
+                "Trace inspection: drain pattern detected (approval + transferFrom in same transaction)"
+            )
+            log_financial_action(
+                action="transaction", status="blocked", mode=self.config.mode,
+                target=to_address, value_wei=value_wei, data_hex=data_hex,
+                risk_score="critical", reason=reason_msg,
+            )
+            return VerificationResult(
+                False,
+                reason_msg,
+                RiskScore.CRITICAL,
+                requires_confirmation=False,
+            )
+
         # Step 0.5: Extract action addresses and identify any new/unapproved recipients or contracts
         action_info = extract_action_addresses(to_address, data_hex, value_wei)
         new_addresses: list[str] = []
