@@ -435,7 +435,7 @@ class PromptInjectionDetector:
         r"transfer\s+ownership|"
         r"set\s+owner|"
         r"(?:export|reveal|send)\s+(?:private\s+key|seed\s+phrase|mnemonic)|"
-        r"(?:send|transfer|withdraw|drain|sweep)\s+(?:(?:\d+[a-zA-Z%]*|\$[\w]+|all|everything|entire\s+balance|funds|tokens?|eth|[a-zA-Z0-9_:-]+)\s+)*(?:to|into)\s+(?:(?:my\s+)?wallet|me|attacker|destination|recipient|0x[0-9a-fA-F]{40}|[a-zA-Z0-9_.-]+)",
+        r"(?:send|transfer|withdraw|drain|sweep)\s+(?:[\w$%_:.-]{1,64}\s+){0,8}?(?:to|into)\s+(?:(?:my\s+)?wallet|me|attacker|destination|recipient|0x[0-9a-fA-F]{40}|[a-zA-Z0-9_.-]+)",
         re.IGNORECASE,
     )
 
@@ -479,6 +479,9 @@ class PromptInjectionDetector:
         """
         if not text or not isinstance(text, str):
             return InjectionSignal()
+
+        # Cap scan length to prevent catastrophic backtracking and excessive CPU usage
+        text = text[:4096]
 
         addr_m = self.RE_ETH_ADDRESS.search(text)
         target_addr = addr_m.group(0) if addr_m else None

@@ -55,16 +55,12 @@ logger = logging.getLogger("SafeGuardTelegram")
 
 
 # ==============================================================================
-# Persistent Multi-User Pairing Store
+# Persistent Multi-User Pairing Store (Profile-Aware)
 # ==============================================================================
 
-PAIRING_FILE = Path.home() / ".hermes" / "safeguard_pairing.json"
-LOCAL_PAIRING_FILE = REPO_ROOT / ".safeguard_pairing.json"
-try:
-    from storage import resolve_state_path
-    CANONICAL_PAIRING_FILE = resolve_state_path(".safeguard_pairing.json")
-except Exception:
-    CANONICAL_PAIRING_FILE = None
+from storage import get_plugin_data_dir, get_secret, read_state_file, write_state_file
+
+CANONICAL_PAIRING_FILE = get_plugin_data_dir() / "safeguard_pairing.json"
 
 _ACTIVE_OTP_CODES: Dict[str, Dict[str, Any]] = {}
 _LIVE_FEED_ENABLED: bool = os.getenv("SAFEGUARD_TG_LIVE_FEED", "0").lower() in ("1", "true", "yes")
@@ -82,38 +78,28 @@ def set_live_feed_enabled(enabled: bool) -> None:
 
 
 def _get_pairing_file_path() -> Path:
-    if LOCAL_PAIRING_FILE.is_file():
-        return LOCAL_PAIRING_FILE
-    try:
-        PAIRING_FILE.parent.mkdir(parents=True, exist_ok=True)
-        return PAIRING_FILE
-    except Exception:
-        return LOCAL_PAIRING_FILE
+    return CANONICAL_PAIRING_FILE
 
 
 def load_pairings() -> Dict[str, Any]:
-    candidates = [p for p in (CANONICAL_PAIRING_FILE, LOCAL_PAIRING_FILE, PAIRING_FILE) if p is not None]
-    for p in candidates:
-        if p.is_file():
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, dict) and data:
-                        return data
-            except Exception:
-                pass
+    if CANONICAL_PAIRING_FILE.is_file():
+        try:
+            with open(CANONICAL_PAIRING_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and data:
+                    return data
+        except Exception:
+            pass
     return {}
 
 
 def save_pairings(data: Dict[str, Any]) -> None:
-    candidates = [p for p in (CANONICAL_PAIRING_FILE, LOCAL_PAIRING_FILE, PAIRING_FILE) if p is not None]
-    for p in candidates:
-        try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            with open(p, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            logger.debug("Could not persist pairing to %s: %s", p, e)
+    try:
+        CANONICAL_PAIRING_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CANONICAL_PAIRING_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.debug("Could not persist pairing to %s: %s", CANONICAL_PAIRING_FILE, e)
 
 
 def create_pairing_code(instance_id: str = "default") -> Tuple[str, str]:
@@ -167,20 +153,22 @@ def get_operator_chat_id(instance_id: str = "default") -> Optional[str]:
     inst = pairings.get(instance_id)
     if inst and inst.get("chat_id"):
         return str(inst["chat_id"])
-    return os.getenv("TELEGRAM_OPERATOR_CHAT_ID")
+    return get_secret("SAFEGUARD_TELEGRAM_CHAT_ID", get_secret("TELEGRAM_OPERATOR_CHAT_ID", get_secret("TELEGRAM_CHAT_ID", "")))
 
 
 _CACHED_BOT_USERNAME = ""
+
+
+def get_telegram_token() -> str:
+    """Retrieve Telegram Bot Token using Hermes secret scope."""
+    return get_secret("SAFEGUARD_TELEGRAM_BOT_TOKEN", get_secret("TELEGRAM_BOT_TOKEN", ""))
 
 
 def get_bot_username() -> str:
     global _CACHED_BOT_USERNAME
     if _CACHED_BOT_USERNAME:
         return _CACHED_BOT_USERNAME
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token:
-        load_dotenv()
-        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    token = get_telegram_token()
     if token:
         try:
             bot = TelegramBot(token)
@@ -191,30 +179,6 @@ def get_bot_username() -> str:
         except Exception:
             pass
     return ""
-
-
-# ==============================================================================
-# Simple .env Loader
-# ==============================================================================
-
-def load_dotenv(env_path: Optional[Path] = None) -> None:
-    """Load key-value pairs from .env into os.environ if not already present."""
-    path = env_path or REPO_ROOT / ".env"
-    if not path.is_file():
-        return
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                k = k.strip()
-                v = v.strip().strip("\"'")
-                if k and k not in os.environ:
-                    os.environ[k] = v
-    except Exception as e:
-        logger.warning("Could not read .env file: %s", e)
 
 
 # ==============================================================================
@@ -1412,9 +1376,7 @@ class SafeGuardTelegramBridge:
 # ==============================================================================
 
 def main():
-    load_dotenv()
-
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    token = get_telegram_token()
     chat_id = get_operator_chat_id()
 
     if not token or token == "YOUR_BOT_TOKEN_HERE":

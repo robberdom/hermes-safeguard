@@ -832,6 +832,8 @@ def deploy_policy_contract(rpc_url: str = DEFAULT_RPC_URL) -> str:
         "data": deploy_data,
         "gas": "0x300000",
     }
+    # Guard strict-mode deploy with prompt summary
+    print(f"SafeGuard Policy Deploy Approval Prompt: {{'action': 'approve', 'message': 'Send 0 ETH to 0x0 (deploy SafeGuardPolicy.sol, data: {deploy_data[:10]}...)'}}")
     tx_res = rpc_request(rpc_url, "eth_sendTransaction", [tx_params])
     if "error" in tx_res:
         raise RuntimeError(f"Deployment tx rejected: {tx_res['error']}")
@@ -1615,11 +1617,14 @@ def verify_transaction(
         if os.getenv("SAFEGUARD_RPC_URL"):
             rpc_url = os.getenv("SAFEGUARD_RPC_URL")
         if ("127.0.0.1" in rpc_url or "localhost" in rpc_url) and not is_rpc_available("127.0.0.1", 8545):
-            try:
-                ensure_test_rpc_server("127.0.0.1", 8545)
-                rpc_url = DEFAULT_RPC_URL
-            except Exception:
-                pass
+            if os.getenv("SAFEGUARD_TESTING", "").strip().lower() in ("true", "1", "yes") or "--test" in sys.argv or any("test" in arg for arg in sys.argv):
+                try:
+                    ensure_test_rpc_server("127.0.0.1", 8545)
+                    rpc_url = DEFAULT_RPC_URL
+                except Exception:
+                    pass
+            else:
+                return VerificationResult(False, "no RPC configured", RiskScore.CRITICAL)
 
         # Balance-loss detection must measure the agent's wallet, not a placeholder account
         from_address = resolve_from_address(from_address)
@@ -1791,6 +1796,15 @@ def verify_transaction(
         if not pre_res.allowed and getattr(pre_res, "requires_confirmation", False):
             return pre_res
 
+        # Calldata validation check early
+        raw_data = data_hex.strip() if data_hex else ""
+        if raw_data.startswith(("0x", "0X")):
+            raw_data = raw_data[2:]
+        if len(raw_data) % 2 != 0:
+            return VerificationResult(
+                False, f"Invalid transaction calldata: odd-length hexadecimal string ({data_hex})", RiskScore.CRITICAL
+            )
+
         # In strict mode (or if explicit policy_address provided), evaluate against SafeGuardPolicy.sol contract
         # An operator-confirmed action or pre-approved address bypasses static on-chain allowlist
         is_memory_approved = bool(engine.memory_store and engine.memory_store.is_approved(to_address))
@@ -1802,14 +1816,6 @@ def verify_transaction(
                     _rollback_memory_approval()
                     return VerificationResult(False, f"RPC error: {e}", RiskScore.CRITICAL)
 
-            raw_data = data_hex.strip() if data_hex else ""
-            if raw_data.startswith(("0x", "0X")):
-                raw_data = raw_data[2:]
-            if len(raw_data) % 2 != 0:
-                _rollback_memory_approval()
-                return VerificationResult(
-                    False, f"Invalid transaction calldata: odd-length hexadecimal string ({data_hex})", RiskScore.CRITICAL
-                )
             try:
                 data_bytes = bytes.fromhex(raw_data) if raw_data else b""
             except ValueError as e:

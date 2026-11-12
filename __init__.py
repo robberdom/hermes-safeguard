@@ -201,14 +201,6 @@ def _register_tool_safely(
         except Exception:
             pass
 
-        try:
-            reg_fn(name=name, toolset=ts, schema=full_schema, handler=handler, override=True)
-            return
-        except TypeError:
-            pass
-        except Exception:
-            pass
-
     # 2. Positional Hermes Agent signature: reg_fn(name, toolset, schema, handler)
     for ts in (toolset, "safeguard", "default"):
         try:
@@ -430,43 +422,36 @@ def register(ctx: Any) -> None:
         reg_fn = getattr(ctx, reg_method_name, None)
         if callable(reg_fn):
             for cmd_base, handler in cmd_handlers.items():
-                if cmd_base in registered_cmds:
-                    continue
-                desc = cmd_descriptions.get(cmd_base, "")
-                cmd_name = cmd_base
-                try:
-                    reg_fn(
-                        name=cmd_name,
-                        handler=handler,
-                        description=desc,
-                    )
-                    registered_cmds.add(cmd_base)
-                except TypeError:
+                for cmd_name in (cmd_base, f"/{cmd_base}"):
+                    if cmd_name in registered_cmds:
+                        continue
+                    desc = cmd_descriptions.get(cmd_base, "")
                     try:
-                        reg_fn(cmd_name, handler, desc)
-                        registered_cmds.add(cmd_base)
+                        reg_fn(
+                            name=cmd_name,
+                            handler=handler,
+                            description=desc,
+                        )
+                        registered_cmds.add(cmd_name)
                     except TypeError:
                         try:
-                            reg_fn(cmd_name, handler)
-                            registered_cmds.add(cmd_base)
-                        except Exception:
-                            pass
+                            reg_fn(cmd_name, handler, desc)
+                            registered_cmds.add(cmd_name)
+                        except TypeError:
+                            try:
+                                reg_fn(cmd_name, handler)
+                                registered_cmds.add(cmd_name)
+                            except Exception:
+                                pass
                         except Exception:
                             pass
                     except Exception:
                         pass
 
-    for dict_attr in ("slash_commands", "commands", "registered_commands"):
-        d = getattr(ctx, dict_attr, None)
-        if isinstance(d, dict):
-            for cmd_base, handler in cmd_handlers.items():
-                d[cmd_base] = handler
-                d[f"/{cmd_base}"] = handler
-
-    # 6. Register one-line routing rule instructing the agent to route all 0x and transaction intents straight to safeguard_execute_tx
+    # 6. Register one-line routing rule instructing the agent to route transactions cleanly
     routing_rule = (
         "Route all 0x addresses and transaction intents (send, mint, swap, approve, transfer, tx, contract) "
-        "directly to `safeguard_execute_tx` without searching, reading, or inspecting local codebase files."
+        "directly to `safeguard_execute_tx` without searching local files, and request operator approval before broadcast."
     )
     for rule_fn_name in ("register_routing_rule", "register_rule", "register_prompt_rule", "add_rule"):
         rule_fn = getattr(ctx, rule_fn_name, None)
@@ -483,38 +468,28 @@ def register(ctx: Any) -> None:
             except Exception:
                 pass
 
-    if hasattr(ctx, "rules") and isinstance(ctx.rules, list):
-        if routing_rule not in ctx.rules:
-            ctx.rules.append(routing_rule)
-    elif hasattr(ctx, "rules") and isinstance(ctx.rules, dict):
-        ctx.rules["safeguard.onchain_routing"] = routing_rule
-
-    # 7. Register system prompt section so Hermes Agent avoids searching codebase for policy modes
+    # 7. Register system prompt section so Hermes Agent simulates transactions and asks for approval
     sys_prompt_fn = getattr(ctx, "register_system_prompt_section", None)
     if callable(sys_prompt_fn):
         prompt_content = (
-            "Hermes SafeGuard security middleware is ACTIVE. "
-            "Policy mode is operator-controlled via instant slash commands.\n\n"
-            "MANDATORY ROUTING RULE:\n"
-            f"{routing_rule}\n\n"
-            "DIRECT ON-CHAIN TRANSACTION EXECUTION DIRECTIVE:\n"
-            "When the user asks to mint an NFT, transfer tokens, swap, or execute any transaction:\n"
-            "1. NEVER use search_files, read_file, grep, or terminal tools to inspect workspace files or find contracts.\n"
-            "2. Immediately call `safeguard_execute_tx(to=..., value=..., data=...)`.\n"
-            "3. For NFT mints: call safeguard_execute_tx directly with the specified contract address and value in wei (or ether string like '0.05 ether'). If calldata is not specified, use data='0xa0712d680000000000000000000000000000000000000000000000000000000000000001' (mint(1)).\n\n"
-            "When the user asks to switch policy modes, view security status, or confirm transactions, "
-            "guide them to use SafeGuard slash commands instead of searching files or running scripts:\n"
-            "  /safeguard-tx <to> <eth> [data] - Instant zero-overhead on-chain transaction execution\n"
-            "  /safeguard-mode [strict|balanced|degen|next] - Cycle or switch policy modes instantly\n"
-            "  /safeguard-strict, /safeguard-balanced, /safeguard-degen - Quick mode switches\n"
-            "  /safeguard-status - View current mode, limits, and RPC connection\n"
-            "  /safeguard-pending - View transactions awaiting human confirmation\n"
+            "Hermes SafeGuard security middleware is active. "
+            "SafeGuard simulates EVM transactions and requests operator approval before broadcast.\n\n"
+            "TRANSACTION SIMULATION & APPROVAL WORKFLOW:\n"
+            "When executing an on-chain transaction or minting:\n"
+            "1. Invoke `safeguard_execute_tx(to=..., value=..., data=...)` to simulate the transaction.\n"
+            "2. SafeGuard evaluates the transaction and requests operator approval.\n\n"
+            "SafeGuard Slash Commands:\n"
+            "  /safeguard-tx <to> <eth> [data] - Execute on-chain transaction under SafeGuard protection\n"
+            "  /safeguard-mode [strict|balanced] - View or switch policy mode\n"
+            "  /safeguard-strict, /safeguard-balanced - Quick mode switch\n"
+            "  /safeguard-status - View current mode, limits, and connection status\n"
+            "  /safeguard-pending - View pending confirmations\n"
             "  /safeguard-confirm <id> - Approve held transaction\n"
             "  /safeguard-reject <id> - Reject held transaction\n"
-            "  /safeguard-whitelist - View approved contacts/addresses\n"
-            "  /safeguard-allow <addr> [label] - Pre-approve trusted address\n"
-            "  /safeguard-check <addr> - Check address reputation against threat feeds\n"
-            "  /safeguard-help - View complete SafeGuard command reference"
+            "  /safeguard-whitelist - View approved addresses\n"
+            "  /safeguard-allow <addr> [label] - Pre-approve address\n"
+            "  /safeguard-check <addr> - Check address reputation\n"
+            "  /safeguard-help - View command help"
         )
         try:
             sys_prompt_fn(

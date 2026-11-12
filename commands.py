@@ -40,7 +40,14 @@ try:
         format_layer0_alert_banner,
         InjectionSignal,
     )
-    from .storage import get_plugin_data_dir, read_state_file, write_state_file, unlink_state_file, resolve_state_path
+    from .storage import (
+        get_plugin_data_dir,
+        get_secret,
+        read_state_file,
+        write_state_file,
+        unlink_state_file,
+        resolve_state_path,
+    )
     from .tools import (
         _get_policy_config,
         _notify_telegram_operator,
@@ -76,7 +83,14 @@ except (ImportError, ValueError):
         format_layer0_alert_banner,
         InjectionSignal,
     )
-    from storage import get_plugin_data_dir, read_state_file, write_state_file, unlink_state_file, resolve_state_path
+    from storage import (
+        get_plugin_data_dir,
+        get_secret,
+        read_state_file,
+        write_state_file,
+        unlink_state_file,
+        resolve_state_path,
+    )
     from tools import (
         _get_policy_config,
         _notify_telegram_operator,
@@ -136,18 +150,18 @@ def safeguard_mode_command_handler(*args: Any, **kwargs: Any) -> str:
     raw_arg = _parse_command_args(*args, **kwargs).strip().lower()
 
     current_mode = os.getenv("SAFEGUARD_MODE", "balanced").strip().lower()
-    if current_mode not in ("strict", "balanced", "degen"):
+    if current_mode not in ("strict", "balanced"):
         current_mode = "balanced"
 
-    mode_cycle = ["strict", "balanced", "degen"]
-    number_map = {"1": "strict", "2": "balanced", "3": "degen"}
+    mode_cycle = ["strict", "balanced"]
+    number_map = {"1": "strict", "2": "balanced"}
 
     target_mode = None
     if raw_arg in number_map:
         target_mode = number_map[raw_arg]
     else:
         # Check if any recognized token appears in the argument text
-        tokens = [t for t in raw_arg.split() if t in ("strict", "balanced", "degen")]
+        tokens = [t for t in raw_arg.split() if t in ("strict", "balanced")]
         if tokens:
             target_mode = tokens[-1]
 
@@ -162,13 +176,12 @@ def safeguard_mode_command_handler(*args: Any, **kwargs: Any) -> str:
         return (
             f"⚠️ Unknown mode: '{raw_arg}'.\n"
             f"Current active mode: {current_mode.upper()}\n"
-            f"Valid modes: strict (1), balanced (2), degen (3)\n\n"
+            f"Valid modes: strict (1), balanced (2)\n\n"
             f"Usage:\n"
             f"  /safeguard-mode              - Cycle to next mode\n"
-            f"  /safeguard-mode <mode>       - Switch directly (strict, balanced, degen)\n"
+            f"  /safeguard-mode <mode>       - Switch directly (strict, balanced)\n"
             f"  /safeguard-strict            - Shortcut for strict mode\n"
-            f"  /safeguard-balanced          - Shortcut for balanced mode\n"
-            f"  /safeguard-degen             - Shortcut for degen mode"
+            f"  /safeguard-balanced          - Shortcut for balanced mode"
         )
 
     # Set active mode in environment and persistent state file
@@ -177,21 +190,6 @@ def safeguard_mode_command_handler(*args: Any, **kwargs: Any) -> str:
         write_state_file(".safeguard_mode", target_mode)
     except Exception:
         pass
-    try:
-        (Path(__file__).resolve().parent / ".safeguard_mode").write_text(target_mode, encoding="utf-8")
-    except Exception:
-        pass
-    env_file = Path(__file__).resolve().parent / ".env"
-    if env_file.is_file():
-        try:
-            content = env_file.read_text(encoding="utf-8")
-            if re.search(r"^SAFEGUARD_MODE=.*$", content, flags=re.MULTILINE):
-                content = re.sub(r"^SAFEGUARD_MODE=.*$", f"SAFEGUARD_MODE={target_mode}", content, flags=re.MULTILINE)
-            else:
-                content = content.rstrip() + f"\nSAFEGUARD_MODE={target_mode}\n"
-            env_file.write_text(content, encoding="utf-8")
-        except Exception:
-            pass
     if "SAFEGUARD_POLICY_PATH" in os.environ:
         del os.environ["SAFEGUARD_POLICY_PATH"]
 
@@ -215,15 +213,13 @@ def safeguard_mode_command_handler(*args: Any, **kwargs: Any) -> str:
     ]
     if target_mode == "strict":
         lines.append("  • Unknown Recipients:      Requires operator confirmation (standing trust granted upon confirm)")
-    elif target_mode == "balanced":
-        lines.append("  • Unknown Recipients:      Permitted with EVM simulation & trace inspection")
     else:
-        lines.append("  • High Token Tax:          Honeypots (>50% tax) blocked; degen tokens (<=50%) permitted with warning")
+        lines.append("  • Unknown Recipients:      Permitted with EVM simulation & trace inspection")
 
     lines.extend([
         "=" * 50,
         f"💡 Tip: Run /safeguard-mode to cycle to {next_mode_name.upper()} mode,",
-        f"   or use shortcuts: /safeguard-strict, /safeguard-balanced, /safeguard-degen",
+        f"   or use shortcuts: /safeguard-strict, /safeguard-balanced",
     ])
     return "\n".join(lines)
 
@@ -239,8 +235,8 @@ def safeguard_balanced_command_handler(*args: Any, **kwargs: Any) -> str:
 
 
 def safeguard_degen_command_handler(*args: Any, **kwargs: Any) -> str:
-    """Operator shortcut: switch SafeGuard to degen mode."""
-    return safeguard_mode_command_handler("degen")
+    """Deprecated alias: defaults to balanced mode."""
+    return safeguard_mode_command_handler("balanced")
 
 
 # ==============================================================================
@@ -710,8 +706,8 @@ def send_safeguard_alert(message: str, title: str = "SafeGuard Alert") -> dict[s
     Dispatch an alert to configured Telegram bot or webhook URL.
     Returns status dict indicating delivery or configuration status.
     """
-    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("SAFEGUARD_TELEGRAM_BOT_TOKEN", "")).strip()
-    telegram_chat = os.getenv("TELEGRAM_CHAT_ID", os.getenv("SAFEGUARD_TELEGRAM_CHAT_ID", "")).strip()
+    telegram_token = get_secret("SAFEGUARD_TELEGRAM_BOT_TOKEN", get_secret("TELEGRAM_BOT_TOKEN", ""))
+    telegram_chat = get_secret("SAFEGUARD_TELEGRAM_CHAT_ID", get_secret("TELEGRAM_OPERATOR_CHAT_ID", get_secret("TELEGRAM_CHAT_ID", "")))
     webhook_url = os.getenv("SAFEGUARD_WEBHOOK_URL", os.getenv("WEBHOOK_URL", "")).strip()
 
     if telegram_token and telegram_chat:

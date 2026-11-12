@@ -56,6 +56,9 @@ def run_tests(pattern: str = "test*.py", filter_str: str | None = None, verbose:
     failures = result.failures
     errors = result.errors
 
+    if verbose:
+        print(stream.getvalue())
+
     if not failures and not errors:
         print(f"✅ All {result.testsRun} tests passed cleanly! (0 failures, 0 errors)")
         return 0

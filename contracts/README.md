@@ -26,3 +26,28 @@ forge snapshot
 ```
 
 The compiled artifact is cached at `contracts/out/SafeGuardPolicy.sol/SafeGuardPolicy.json` for use by `verifier.py`.
+
+## Solidity Bytecode Reproducibility & Build Settings
+
+To independently reproduce and verify the deployed bytecode for `SafeGuardPolicy`:
+
+- **Solidity Compiler (`solc`) Version:** `0.8.38+commit.1835d247`
+- **EVM Target Version:** `osaka`
+- **Optimizer:** `enabled: false` (`runs: 200`)
+- **Language / Input:** Solidity `^0.8.20`
+- **Source File:** `contracts/src/SafeGuardPolicy.sol`
+- **Output Artifact:** `contracts/out/SafeGuardPolicy.sol/SafeGuardPolicy.json`
+
+### CI Build & Verification Command
+
+```shell
+cd contracts
+forge build --extra-output-files metadata abi bytecode
+```
+
+Or using standalone `solc`:
+
+```shell
+solc --evm-version osaka --bin --abi contracts/src/SafeGuardPolicy.sol -o contracts/out/
+```
+

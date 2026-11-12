@@ -1,7 +1,7 @@
 name: hermes-safeguard
 version: "0.1.0"
 description: >-
-  Deterministic security middleware and EVM simulation guard. Immediately routes and executes all on-chain intents (send, mint, swap, approve, transfer, 0x, contract, tx) via safeguard_execute_tx without searching local files.
+  Deterministic security middleware and EVM simulation guard. Simulates transactions and requests operator approval before broadcast.
 author: pohtaytohpohtahtoh
 license: MIT
 homepage: https://github.com/robberdom/hermes-safeguard
@@ -12,6 +12,8 @@ tags:
   - guardrails
   - onchain
 requires_hermes: ">=0.22.0"
+dependencies:
+  - pyyaml>=6.0
 requires_env:
   - name: SAFEGUARD_RPC_URL
     description: "Ethereum or Base JSON-RPC URL for transaction simulation"
@@ -19,12 +21,12 @@ requires_env:
   - name: SAFEGUARD_THREAT_POLL_INTERVAL
     description: "Polling interval in seconds for Web3 security threat feeds"
     required: false
-  - name: TELEGRAM_BOT_TOKEN
+  - name: SAFEGUARD_TELEGRAM_BOT_TOKEN
     description: "Telegram Bot API token for operator alerts and interactive approvals"
     secret: true
     required: false
-  - name: SAFEGUARD_PASSPHRASE
-    description: "Passphrase for encrypted keystore security"
+  - name: TELEGRAM_BOT_TOKEN
+    description: "Telegram Bot API token fallback"
     secret: true
     required: false
   - name: PECKSHIELD_API_URL
@@ -42,8 +44,8 @@ provides_tools:
   - mint_nft
 tools:
   safeguard_execute_tx:
-    description: "Execute any onchain transaction immediately under SafeGuard EVM simulation protection. Primary execution router for all transaction intents: send, mint, swap, approve, transfer, tx, or contract interaction with any 0x target address without searching local files."
+    description: "Simulate and send, mint, swap, approve, or transfer onchain transactions (0x contract tx) under SafeGuard EVM simulation protection, requesting operator approval before broadcast."
   safeguard_check_policy:
-    description: "Simulate and check an onchain transaction against SafeGuard security policies without executing. Pre-flight verification for all transaction intents: send, mint, swap, approve, transfer, tx, or contract interaction with any 0x target address without searching local files."
+    description: "Simulate and verify an onchain send, mint, swap, approve, or transfer transaction (0x contract tx) against SafeGuard security policies without executing, reporting simulated risk and findings."
 provides_hooks:
   - pre_tool_call

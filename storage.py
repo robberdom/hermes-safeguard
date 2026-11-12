@@ -12,16 +12,31 @@ import os
 from pathlib import Path
 
 _PLUGIN_NAME = "hermes-safeguard"
-_LOCAL_REPO_DIR = Path(__file__).resolve().parent
 _RESOLVED_DATA_DIR: Path | None = None
+
+
+def get_hermes_home() -> Path:
+    """
+    Returns the profile-aware Hermes home directory.
+    Respects HERMES_HOME, HERMES_PROFILE, or ~/.hermes by default.
+    """
+    env_home = os.getenv("HERMES_HOME")
+    if env_home and env_home.strip():
+        base = Path(env_home.strip())
+    else:
+        base = Path.home() / ".hermes"
+
+    profile = os.getenv("HERMES_PROFILE")
+    if profile and profile.strip():
+        return base / "profiles" / profile.strip()
+    return base
 
 
 def get_plugin_data_dir() -> Path:
     """
     Returns the official persistent data directory for hermes-safeguard.
     Prioritizes official hermes_agent plugin_storage API, falling back to
-    $HERMES_HOME/plugins_data/<plugin>, ~/.hermes/plugins_data/<plugin>,
-    or a resilient local fallback in test / sandboxed environments.
+    profile-aware get_hermes_home() / "plugins_data" / <plugin>.
     """
     global _RESOLVED_DATA_DIR
     if _RESOLVED_DATA_DIR is not None and _is_dir_writable(_RESOLVED_DATA_DIR):
@@ -42,28 +57,28 @@ def get_plugin_data_dir() -> Path:
         except Exception:
             pass
 
-    # 2. HERMES_HOME env var or ~/.hermes default
-    hermes_home = os.getenv("HERMES_HOME")
-    if hermes_home and hermes_home.strip():
-        candidates = [Path(hermes_home.strip()) / "plugins_data" / _PLUGIN_NAME]
-    else:
-        candidates = [Path.home() / ".hermes" / "plugins_data" / _PLUGIN_NAME]
+    # 2. Profile-aware hermes home plugins_data directory
+    hermes_data_dir = get_hermes_home() / "plugins_data" / _PLUGIN_NAME
+    try:
+        hermes_data_dir.mkdir(parents=True, exist_ok=True)
+        if _is_dir_writable(hermes_data_dir):
+            _RESOLVED_DATA_DIR = hermes_data_dir
+            return hermes_data_dir
+    except Exception:
+        pass
 
-    # Add resilient fallbacks for sandboxes/test harnesses
-    candidates.append(_LOCAL_REPO_DIR)
-    candidates.append(Path("/tmp") / "hermes" / "plugins_data" / _PLUGIN_NAME)
+    # Fallback only when home filesystem is non-writable (e.g. read-only container sandbox)
+    local_data_dir = Path(__file__).resolve().parent / ".safeguard_data"
+    try:
+        local_data_dir.mkdir(parents=True, exist_ok=True)
+        if _is_dir_writable(local_data_dir):
+            _RESOLVED_DATA_DIR = local_data_dir
+            return local_data_dir
+    except Exception:
+        pass
 
-    for cand in candidates:
-        try:
-            cand.mkdir(parents=True, exist_ok=True)
-            if _is_dir_writable(cand):
-                _RESOLVED_DATA_DIR = cand
-                return cand
-        except Exception:
-            continue
-
-    _RESOLVED_DATA_DIR = _LOCAL_REPO_DIR
-    return _LOCAL_REPO_DIR
+    _RESOLVED_DATA_DIR = hermes_data_dir
+    return hermes_data_dir
 
 
 def _is_dir_writable(path: Path) -> bool:
@@ -88,8 +103,7 @@ def resolve_state_path(filename: str) -> Path:
 
 def read_state_file(filename: str) -> str | None:
     """
-    Read content from a persistent state file.
-    Checks canonical data directory first, then falls back to legacy/local path.
+    Read content from a persistent state file in the sanctioned data root.
     """
     import fcntl
 
@@ -111,28 +125,9 @@ def read_state_file(filename: str) -> str | None:
         except Exception:
             return None
 
-    # 1. Canonical data directory
     try:
         canonical = resolve_state_path(filename)
         res = _safe_read(canonical)
-        if res is not None:
-            return res
-    except Exception:
-        pass
-
-    # 2. Fallback to local repo directory (for tests & pre-migration setups)
-    try:
-        local_path = _LOCAL_REPO_DIR / filename
-        res = _safe_read(local_path)
-        if res is not None:
-            return res
-    except Exception:
-        pass
-
-    # 3. Fallback to ~/.hermes / filename
-    try:
-        hermes_root_file = Path.home() / ".hermes" / filename
-        res = _safe_read(hermes_root_file)
         if res is not None:
             return res
     except Exception:
@@ -143,8 +138,7 @@ def read_state_file(filename: str) -> str | None:
 
 def write_state_file(filename: str, content: str) -> None:
     """
-    Write content to a persistent state file in the sanctioned data root atomically with file locking.
-    Also syncs to local repo directory if the file already exists there (e.g. during test suite runs).
+    Write content to a persistent state file in the sanctioned profile-aware data root atomically with file locking.
     """
     import fcntl
 
@@ -165,32 +159,15 @@ def write_state_file(filename: str, content: str) -> None:
                 pass
         tmp.replace(dest)
 
-    # 1. Write to canonical location
     try:
         canonical = resolve_state_path(filename)
         _atomic_write(canonical)
     except Exception:
         pass
 
-    # 2. Sync to local repo file if it exists or in test mode so legacy tests remain 100% compatible
-    try:
-        local_path = _LOCAL_REPO_DIR / filename
-        if local_path.is_file() and canonical != local_path:
-            _atomic_write(local_path)
-    except Exception:
-        pass
-
-    # 3. Also sync to ~/.hermes / filename if it exists
-    try:
-        hermes_file = Path.home() / ".hermes" / filename
-        if hermes_file.is_file() and canonical != hermes_file:
-            _atomic_write(hermes_file)
-    except Exception:
-        pass
-
 
 def unlink_state_file(filename: str) -> None:
-    """Delete a persistent state file across canonical and legacy locations."""
+    """Delete a persistent state file from the sanctioned data root."""
     try:
         canonical = resolve_state_path(filename)
         if canonical.is_file():
@@ -198,16 +175,23 @@ def unlink_state_file(filename: str) -> None:
     except Exception:
         pass
 
-    try:
-        local_path = _LOCAL_REPO_DIR / filename
-        if local_path.is_file():
-            local_path.unlink(missing_ok=True)
-    except Exception:
-        pass
 
-    try:
-        hermes_file = Path.home() / ".hermes" / filename
-        if hermes_file.is_file():
-            hermes_file.unlink(missing_ok=True)
-    except Exception:
-        pass
+def get_secret(key: str, default: str = "") -> str:
+    """
+    Retrieve a secret using Hermes's secret scope (agent.secret_scope.get_secret).
+    Falls back gracefully to os.environ when running in test harnesses or outside Hermes.
+    """
+    for scope_holder in ("hermes_agent", "agent", "ctx"):
+        try:
+            import sys
+            mod = sys.modules.get(scope_holder)
+            if mod:
+                scope = getattr(mod, "secret_scope", None)
+                if scope and hasattr(scope, "get_secret"):
+                    val = scope.get_secret(key)
+                    if val is not None and str(val).strip():
+                        return str(val).strip()
+        except Exception:
+            pass
+    return os.getenv(key, default).strip()
+

@@ -88,8 +88,8 @@ class TestSafeGuardSlashCommands(unittest.TestCase):
     # 1. Mode Cycling & Switching
     # --------------------------------------------------------------------------
 
-    def test_mode_cycling_strict_balanced_degen(self):
-        """Typing /safeguard-mode with no args cycles through strict -> balanced -> degen -> strict."""
+    def test_mode_cycling_strict_balanced(self):
+        """Typing /safeguard-mode with no args cycles between strict and balanced."""
         # Start at strict
         safeguard.safeguard_mode_command_handler("strict")
         self.assertEqual(os.environ["SAFEGUARD_MODE"], "strict")
@@ -99,23 +99,13 @@ class TestSafeGuardSlashCommands(unittest.TestCase):
         self.assertEqual(os.environ["SAFEGUARD_MODE"], "balanced")
         self.assertIn("BALANCED", res1)
 
-        # 2nd cycle: balanced -> degen
+        # 2nd cycle: balanced -> strict
         res2 = safeguard.safeguard_mode_command_handler()
-        self.assertEqual(os.environ["SAFEGUARD_MODE"], "degen")
-        self.assertIn("DEGEN", res2)
-
-        # 3rd cycle: degen -> strict
-        res3 = safeguard.safeguard_mode_command_handler()
         self.assertEqual(os.environ["SAFEGUARD_MODE"], "strict")
-        self.assertIn("STRICT", res3)
+        self.assertIn("STRICT", res2)
 
     def test_mode_direct_switching(self):
-        """Setting mode directly via /safeguard-mode <strict|balanced|degen>."""
-        res_degen = safeguard.safeguard_mode_command_handler("degen")
-        self.assertEqual(os.environ["SAFEGUARD_MODE"], "degen")
-        self.assertIn("DEGEN", res_degen)
-        self.assertIn("Unlimited", res_degen)
-
+        """Setting mode directly via /safeguard-mode <strict|balanced>."""
         res_strict = safeguard.safeguard_mode_command_handler("strict")
         self.assertEqual(os.environ["SAFEGUARD_MODE"], "strict")
         self.assertIn("STRICT", res_strict)
@@ -127,34 +117,28 @@ class TestSafeGuardSlashCommands(unittest.TestCase):
         self.assertIn("5.00 ETH", res_balanced)
 
     def test_mode_conversational_and_number_arguments(self):
-        """Handles conversational text and 1/2/3 numbers gracefully."""
-        # Conversational text like "switch to degen mode"
-        safeguard.safeguard_mode_command_handler("switch to degen mode")
-        self.assertEqual(os.environ["SAFEGUARD_MODE"], "degen")
+        """Handles conversational text and 1/2 numbers gracefully."""
+        # Conversational text like "switch to strict mode"
+        safeguard.safeguard_mode_command_handler("switch to strict mode")
+        self.assertEqual(os.environ["SAFEGUARD_MODE"], "strict")
 
-        # Numeric map: 1=strict, 2=balanced, 3=degen
+        # Numeric map: 1=strict, 2=balanced
         safeguard.safeguard_mode_command_handler("1")
         self.assertEqual(os.environ["SAFEGUARD_MODE"], "strict")
 
         safeguard.safeguard_mode_command_handler("2")
         self.assertEqual(os.environ["SAFEGUARD_MODE"], "balanced")
 
-        safeguard.safeguard_mode_command_handler("3")
-        self.assertEqual(os.environ["SAFEGUARD_MODE"], "degen")
-
     def test_mode_unknown_argument(self):
         """Unknown mode argument displays error and helpful syntax instructions."""
         res = safeguard.safeguard_mode_command_handler("super_ultra_mode")
         self.assertIn("Unknown mode", res)
-        self.assertIn("Valid modes: strict (1), balanced (2), degen (3)", res)
+        self.assertIn("Valid modes: strict (1), balanced (2)", res)
 
     def test_mode_shortcut_commands(self):
-        """Direct shortcut commands /safeguard-strict, /safeguard-balanced, /safeguard-degen."""
+        """Direct shortcut commands /safeguard-strict, /safeguard-balanced."""
         safeguard.safeguard_strict_command_handler()
         self.assertEqual(os.environ["SAFEGUARD_MODE"], "strict")
-
-        safeguard.safeguard_degen_command_handler()
-        self.assertEqual(os.environ["SAFEGUARD_MODE"], "degen")
 
         safeguard.safeguard_balanced_command_handler()
         self.assertEqual(os.environ["SAFEGUARD_MODE"], "balanced")

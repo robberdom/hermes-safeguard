@@ -87,10 +87,10 @@ class TestPanicKillSwitchBeat4(unittest.TestCase):
         self.assertIn("Policy Limits:", status_out)
         self.assertIn("Max ETH per Tx:", status_out)
 
-    def test_panic_overrides_degen_mode_and_whitelist(self):
-        """Panic overrides degen mode and whitelisted address across all entry points."""
-        safeguard.safeguard_degen_command_handler()
-        self.assertEqual(os.getenv("SAFEGUARD_MODE"), "degen")
+    def test_panic_overrides_mode_and_whitelist(self):
+        """Panic overrides active mode and whitelisted address across all entry points."""
+        safeguard.safeguard_balanced_command_handler()
+        self.assertEqual(os.getenv("SAFEGUARD_MODE"), "balanced")
 
         whitelisted_target = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
         safeguard.safeguard_allow_command_handler(f"{whitelisted_target} DemoNFT")

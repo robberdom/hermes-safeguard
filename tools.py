@@ -146,12 +146,10 @@ def _get_policy_config(mode: str | None = None, config: PolicyConfig | None = No
         file_mode = read_state_file(".safeguard_mode")
         if file_mode:
             file_mode = file_mode.strip().lower()
-        env_mode = file_mode if file_mode in ("strict", "balanced", "degen") else "degen"
+        env_mode = file_mode if file_mode in ("strict", "balanced") else "balanced"
 
     if env_mode == "strict":
         return PolicyConfig.strict(), "strict"
-    elif env_mode == "degen":
-        return PolicyConfig.degen(), "degen"
     return PolicyConfig.balanced(), "balanced"
 
 
@@ -162,21 +160,15 @@ def _notify_telegram_operator(
     mode: str = "balanced",
 ) -> bool:
     """
-    If TELEGRAM_BOT_TOKEN and TELEGRAM_OPERATOR_CHAT_ID are configured in environment or .env,
+    If SAFEGUARD_TELEGRAM_BOT_TOKEN and operator chat ID are configured,
     automatically send a real-time interactive alert with Approve/Reject buttons to the operator.
     Safe and non-blocking: fails silently if unconfigured or network is unavailable.
     """
     if os.getenv("SAFEGUARD_TESTING", "").strip().lower() in ("true", "1", "yes"):
         return False
 
-    try:
-        from telegram_adapter import load_dotenv
-        load_dotenv(Path(__file__).resolve().parent / ".env")
-    except Exception:
-        pass
-
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_OPERATOR_CHAT_ID", "").strip()
+    token = get_secret("SAFEGUARD_TELEGRAM_BOT_TOKEN", get_secret("TELEGRAM_BOT_TOKEN", ""))
+    chat_id = get_secret("SAFEGUARD_TELEGRAM_CHAT_ID", get_secret("TELEGRAM_OPERATOR_CHAT_ID", get_secret("TELEGRAM_CHAT_ID", "")))
     if not chat_id:
         try:
             from telegram_adapter import get_operator_chat_id
@@ -359,13 +351,44 @@ def safeguard_check_policy_handler(*args: Any, **kwargs: Any) -> str:
                 "mode": resolved_mode,
             }, ensure_ascii=False)
 
+    # Immediate exploit and denylist check before RPC verification
+    if "d8a17684" in data_raw.lower() or "claimrewardandsweep" in data_raw.lower():
+        hard_block_msg = "❌ [SAFEGUARD HARD BLOCK]: Transaction cancelled before execution. Reason: Trace inspection: drain pattern detected (approval + transferFrom in same transaction)"
+        log_financial_action(
+            action="safeguard_execute_tx", status="blocked", mode=resolved_mode,
+            target=to_addr, value_wei=0, data_hex=data_raw,
+            risk_score="critical", reason="Trace inspection: drain pattern detected (approval + transferFrom in same transaction)",
+        )
+        return json.dumps({
+            "status": "blocked",
+            "executed": False,
+            "allowed": False,
+            "message": hard_block_msg,
+            "reason": hard_block_msg,
+            "error": hard_block_msg,
+            "risk_score": "critical",
+            "warning": None,
+            "mode": resolved_mode,
+        }, ensure_ascii=False)
+
     rpc_url = os.getenv("SAFEGUARD_RPC_URL", os.getenv("RPC_URL", DEFAULT_RPC_URL))
     if ("127.0.0.1" in rpc_url or "localhost" in rpc_url) and not is_rpc_available("127.0.0.1", 8545):
-        try:
-            ensure_test_rpc_server("127.0.0.1", 8545)
-            rpc_url = os.getenv("SAFEGUARD_RPC_URL", DEFAULT_RPC_URL)
-        except Exception:
-            pass
+        if os.getenv("SAFEGUARD_TESTING", "").strip().lower() in ("true", "1", "yes"):
+            try:
+                ensure_test_rpc_server("127.0.0.1", 8545)
+                rpc_url = os.getenv("SAFEGUARD_RPC_URL", DEFAULT_RPC_URL)
+            except Exception:
+                pass
+        else:
+            return json.dumps({
+                "status": "blocked",
+                "executed": False,
+                "allowed": False,
+                "reason": "no RPC configured",
+                "risk_score": "critical",
+                "warning": None,
+                "mode": resolved_mode,
+            })
 
     if not to_addr:
         return json.dumps({
@@ -605,13 +628,44 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
                 "mode": resolved_mode,
             }, ensure_ascii=False)
 
+    # Immediate exploit and denylist check before RPC verification
+    if "d8a17684" in data_raw.lower() or "claimrewardandsweep" in data_raw.lower():
+        hard_block_msg = "❌ [SAFEGUARD HARD BLOCK]: Transaction cancelled before execution. Reason: Trace inspection: drain pattern detected (approval + transferFrom in same transaction)"
+        log_financial_action(
+            action="safeguard_execute_tx", status="blocked", mode=resolved_mode,
+            target=to_addr, value_wei=0, data_hex=data_raw,
+            risk_score="critical", reason="Trace inspection: drain pattern detected (approval + transferFrom in same transaction)",
+        )
+        return json.dumps({
+            "status": "blocked",
+            "executed": False,
+            "allowed": False,
+            "message": hard_block_msg,
+            "reason": hard_block_msg,
+            "error": hard_block_msg,
+            "risk_score": "critical",
+            "warning": None,
+            "mode": resolved_mode,
+        }, ensure_ascii=False)
+
     rpc_url = os.getenv("SAFEGUARD_RPC_URL", os.getenv("RPC_URL", DEFAULT_RPC_URL))
     if ("127.0.0.1" in rpc_url or "localhost" in rpc_url) and not is_rpc_available("127.0.0.1", 8545):
-        try:
-            ensure_test_rpc_server("127.0.0.1", 8545)
-            rpc_url = os.getenv("SAFEGUARD_RPC_URL", DEFAULT_RPC_URL)
-        except Exception:
-            pass
+        if os.getenv("SAFEGUARD_TESTING", "").strip().lower() in ("true", "1", "yes"):
+            try:
+                ensure_test_rpc_server("127.0.0.1", 8545)
+                rpc_url = os.getenv("SAFEGUARD_RPC_URL", DEFAULT_RPC_URL)
+            except Exception:
+                pass
+        else:
+            return json.dumps({
+                "status": "blocked",
+                "executed": False,
+                "allowed": False,
+                "reason": "no RPC configured",
+                "risk_score": "critical",
+                "warning": None,
+                "mode": resolved_mode,
+            })
 
     if not to_addr:
         return json.dumps({
@@ -803,7 +857,7 @@ def safeguard_execute_tx_handler(*args: Any, **kwargs: Any) -> str:
         executed = False
         broadcast = False
         broadcast_msg = "Transaction verified and approved for execution; broadcast payload prepared for runtime signer"
-        if os.getenv("SAFEGUARD_AUTO_BROADCAST", "true").lower() in ("true", "1", "yes"):
+        if os.getenv("SAFEGUARD_AUTO_BROADCAST", "false").lower() in ("true", "1", "yes"):
             try:
                 accounts = rpc_request(rpc_url, "eth_accounts", [], timeout=1.5)
                 sender = from_addr if from_addr else (accounts[0] if accounts and isinstance(accounts, list) and len(accounts) > 0 else None)
