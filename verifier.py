@@ -153,6 +153,16 @@ except (ImportError, ValueError):
         reset_default_velocity_tracker,
     )
 
+
+def _stored_mode() -> str:
+    """Active policy mode from the sanctioned plugin data root (PR review — Issue 6)."""
+    try:
+        from .storage import get_mode
+    except (ImportError, ValueError):
+        from storage import get_mode
+    return get_mode()
+
+
 DEFAULT_RPC_URL = (
     os.getenv("SAFEGUARD_RPC_URL", "").strip()
     or os.getenv("RPC_URL", "").strip()
@@ -787,7 +797,16 @@ def find_contract_artifact() -> Path:
 
 
 def deploy_policy_contract(rpc_url: str = DEFAULT_RPC_URL) -> str:
-    """Deploy SafeGuardPolicy.sol bytecode to the local RPC node and return its address."""
+    """
+    Deploy SafeGuardPolicy.sol bytecode to the local RPC node and return its address.
+
+    .. warning::
+        This function MUST only be called from an explicit operator slash command
+        (e.g. ``/safeguard-deploy``).  It is never invoked automatically.  Strict-mode
+        policy evaluation uses ``eth_call`` against a *pre-deployed* contract whose address
+        is passed in via ``policy_address`` or ``SAFEGUARD_POLICY_ADDRESS``.  Calling this
+        function without an explicit operator trigger is a security violation.
+    """
     global _CACHED_POLICY_ADDRESSES
     if os.getenv("SAFEGUARD_RPC_URL"):
         rpc_url = os.getenv("SAFEGUARD_RPC_URL")
@@ -832,8 +851,6 @@ def deploy_policy_contract(rpc_url: str = DEFAULT_RPC_URL) -> str:
         "data": deploy_data,
         "gas": "0x300000",
     }
-    # Guard strict-mode deploy with prompt summary
-    print(f"SafeGuard Policy Deploy Approval Prompt: {{'action': 'approve', 'message': 'Send 0 ETH to 0x0 (deploy SafeGuardPolicy.sol, data: {deploy_data[:10]}...)'}}")
     tx_res = rpc_request(rpc_url, "eth_sendTransaction", [tx_params])
     if "error" in tx_res:
         raise RuntimeError(f"Deployment tx rejected: {tx_res['error']}")
@@ -1595,7 +1612,8 @@ def verify_transaction(
         to_address: Destination address for the transaction.
         value_wei: Value in wei being transferred.
         data_hex: Calldata in hex format (with or without '0x').
-        policy_address: Address of deployed SafeGuardPolicy. If None, auto-deploys.
+        policy_address: Address of a pre-deployed SafeGuardPolicy contract.  If None and
+            mode is strict, returns a hard error; use ``/safeguard-deploy`` to deploy first.
         rpc_url: JSON-RPC endpoint.
         from_address: Sender address.
         whitelist: Whitelisted target addresses (used if config allowlist not specified).
@@ -1617,7 +1635,11 @@ def verify_transaction(
         if os.getenv("SAFEGUARD_RPC_URL"):
             rpc_url = os.getenv("SAFEGUARD_RPC_URL")
         if ("127.0.0.1" in rpc_url or "localhost" in rpc_url) and not is_rpc_available("127.0.0.1", 8545):
-            if os.getenv("SAFEGUARD_TESTING", "").strip().lower() in ("true", "1", "yes") or "--test" in sys.argv or any("test" in arg for arg in sys.argv):
+            # Mock RPC is gated strictly on SAFEGUARD_TESTING env var (PR review – Issue 5).
+            # sys.argv inspection ("--test", any "test" in arg) has been removed: it caused
+            # the mock server to auto-start whenever any test runner was in the process tree,
+            # silently leaking test infrastructure into production policy evaluation.
+            if os.environ.get("SAFEGUARD_TESTING", "").strip().lower() in ("true", "1", "yes"):
                 try:
                     ensure_test_rpc_server("127.0.0.1", 8545)
                     rpc_url = DEFAULT_RPC_URL
@@ -1631,30 +1653,8 @@ def verify_transaction(
 
         # Resolve PolicyConfig
         if config is None:
-            env_var = os.getenv("SAFEGUARD_MODE")
-            if env_var and env_var.strip():
-                active_m = env_var.strip().lower()
-            else:
-                active_m = None
-                try:
-                    from storage import read_state_file
-                    content = read_state_file(".safeguard_mode")
-                    if content and content.strip().lower() in ("strict", "balanced", "degen"):
-                        active_m = content.strip().lower()
-                except Exception:
-                    pass
-                if not active_m:
-                    for p in [Path(".safeguard_mode"), Path(__file__).resolve().parent / ".safeguard_mode"]:
-                        if p.is_file():
-                            try:
-                                content = p.read_text(encoding="utf-8").strip().lower()
-                                if content in ("strict", "balanced", "degen"):
-                                    active_m = content
-                                    break
-                            except Exception:
-                                pass
-                if not active_m:
-                    active_m = "degen"
+            # Mode lives only in the sanctioned plugin data root (PR review — Issue 6)
+            active_m = _stored_mode()
             if active_m == "strict":
                 policy_cfg = PolicyConfig.strict(recipient_allowlist=whitelist)
             elif active_m == "degen":
@@ -1810,11 +1810,21 @@ def verify_transaction(
         is_memory_approved = bool(engine.memory_store and engine.memory_store.is_approved(to_address))
         if (policy_cfg.mode == "strict" or policy_address) and not confirmed and not is_memory_approved:
             if not policy_address:
-                try:
-                    policy_address = deploy_policy_contract(rpc_url)
-                except Exception as e:
+                # Auto-deploy is PROHIBITED: policy contracts must be pre-deployed by an
+                # operator via the '/safeguard-deploy' slash command.  Pass the resulting
+                # address as `policy_address` or set SAFEGUARD_POLICY_ADDRESS.
+                env_addr = os.environ.get("SAFEGUARD_POLICY_ADDRESS", "").strip()
+                if env_addr:
+                    policy_address = env_addr
+                else:
                     _rollback_memory_approval()
-                    return VerificationResult(False, f"RPC error: {e}", RiskScore.CRITICAL)
+                    return VerificationResult(
+                        False,
+                        "SafeGuard [STRICT]: no policy_address supplied and auto-deploy is disabled. "
+                        "Run the '/safeguard-deploy' operator command to deploy SafeGuardPolicy.sol "
+                        "and set SAFEGUARD_POLICY_ADDRESS, or switch to balanced/degen mode.",
+                        RiskScore.CRITICAL,
+                    )
 
             try:
                 data_bytes = bytes.fromhex(raw_data) if raw_data else b""
@@ -1966,24 +1976,7 @@ class _MockRPCHandler(BaseHTTPRequestHandler):
                     inner_len = int(data[8 + offset : 8 + offset + 64], 16) * 2
                     inner_data = data[8 + offset + 64 : 8 + offset + 64 + inner_len]
 
-                    active_m = None
-                    try:
-                        from storage import read_state_file
-                        content = read_state_file(".safeguard_mode")
-                        if content and content.strip().lower() in ("strict", "balanced", "degen"):
-                            active_m = content.strip().lower()
-                    except Exception:
-                        pass
-                    if not active_m:
-                        for p in [Path(".safeguard_mode"), Path(__file__).resolve().parent / ".safeguard_mode"]:
-                            if p.is_file():
-                                try:
-                                    active_m = p.read_text(encoding="utf-8").strip().lower()
-                                    if active_m in ("strict", "balanced", "degen"):
-                                        break
-                                except Exception:
-                                    pass
-                    active_m = (active_m or os.getenv("SAFEGUARD_MODE", "degen")).strip().lower()
+                    active_m = _stored_mode()
                     if active_m == "degen":
                         mock_cfg = PolicyConfig.degen()
                     elif active_m == "balanced":
@@ -2568,9 +2561,16 @@ def run_tests() -> int:
             except Exception:
                 pass
 
-        # Scenario 1: Safe transfer passes
+        # Scenario 1: Safe transfer passes.
+        # Strict mode requires an operator-deployed SafeGuardPolicy.sol (auto-deploy was
+        # removed), so this scenario supplies a placeholder policy address. The bundled
+        # mock RPC returns an allow verdict for the policy eth_call.
         base_strict_cfg = PolicyConfig.strict(recipient_allowlist=[safe_to])
-        allowed_1, reason_1 = verify_transaction(safe_to, safe_val, safe_data, config=base_strict_cfg)
+        allowed_1, reason_1 = verify_transaction(
+            safe_to, safe_val, safe_data,
+            policy_address="0x000000000000000000000000000000000000dEaD",
+            config=base_strict_cfg,
+        )
         if allowed_1:
             print(f"[PASS] Scenario 1 (Safe transfer): allowed={allowed_1}")
         else:
@@ -3244,7 +3244,7 @@ def run_tests() -> int:
         if all_passed:
             print("  Total Verification Suites : 18 suites (38 scenarios)")
             print("  Result                    : 100% PASSED (0 failures)")
-            print("  Policy Engines Verified   : strict, balanced, degen")
+            print("  Policy Engines Verified   : strict, balanced")
             print("  Simulation & Trace Layer  : OK")
             print("  Threat Feed & Blocklist   : OK")
             print("  Injection Defense Layer   : OK")
@@ -3272,7 +3272,7 @@ def main() -> int:
     parser.add_argument("--to", type=str, default=DEFAULT_ALLOWED_TARGET, help="Destination target address")
     parser.add_argument("--value", type=str, default="0", help="Value in wei or ETH (e.g. 0.1, 1.0 eth, or 100000000000000000)")
     parser.add_argument("--data", type=str, default="", help="Calldata in hex format")
-    parser.add_argument("--policy-address", type=str, default=None, help="Policy contract address (auto-deploys if omitted)")
+    parser.add_argument("--policy-address", type=str, default=None, help="Pre-deployed SafeGuardPolicy contract address (required for strict mode; use /safeguard-deploy to create one)")
     parser.add_argument("--network", type=str, choices=["eth", "ethereum", "base", "local"], default=None, help="Preset network target (eth, base, local)")
     parser.add_argument("--rpc-url", type=str, default=DEFAULT_RPC_URL, help="JSON-RPC endpoint URL")
     parser.add_argument("--from-address", type=str, default="0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266", help="Sender address")

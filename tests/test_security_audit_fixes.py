@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import __init__ as safeguard
+import storage
 from policy_engine import (
     DEFAULT_ALLOWED_TARGET,
     ConfirmationStore,
@@ -138,7 +139,7 @@ class TestSecurityAuditFixes(unittest.TestCase):
 
     def test_c5_agent_cannot_pick_police_tier(self):
         """C5: Agent supplying mode in tool_args cannot override operator policy mode."""
-        os.environ["SAFEGUARD_MODE"] = "strict"
+        storage.set_mode("strict")
         try:
             # Under strict mode, transfer of 10 ETH exceeds cap of 0.5 ETH
             hook_res = safeguard.on_pre_tool_call(
@@ -152,11 +153,11 @@ class TestSecurityAuditFixes(unittest.TestCase):
             self.assertEqual(hook_res["action"], "block")
             self.assertEqual(hook_res["mode"], "strict")
         finally:
-            os.environ["SAFEGUARD_MODE"] = "balanced"
+            storage.set_mode("balanced")
 
     def test_c6_degen_branch_ordering(self):
         """C6: Rule returning allowed=False, risk=medium is BLOCKED, not inverted to approve."""
-        os.environ["SAFEGUARD_MODE"] = "degen"
+        storage.set_mode("degen")
         try:
             # Custom policy capping approve tokens at 10
             cfg = PolicyConfig.degen(max_token_per_tx=10)
@@ -178,7 +179,7 @@ class TestSecurityAuditFixes(unittest.TestCase):
             # Must be BLOCKED, not approved
             self.assertEqual(hook_res["action"], "block")
         finally:
-            os.environ["SAFEGUARD_MODE"] = "balanced"
+            storage.set_mode("balanced")
 
     def test_c7_erc20_transfer_and_swap_caps(self):
         """C7: max_token_per_tx applied to a9059cbb transfer and swap selectors."""

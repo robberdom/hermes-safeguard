@@ -181,20 +181,45 @@ class TestTraceInspection(unittest.TestCase):
         self.assertTrue("Trace inspection" in res.reason or "balance loss" in res.reason)
 
     def test_newly_deployed_contract_blocked_in_strict_allowed_in_degen(self):
-        """CALL to newly deployed contract is blocked in strict, allowed with warning in degen."""
+        """
+        CALL to a newly deployed contract under the current mode model.
+
+        * strict: refuses to run at all without an operator-deployed SafeGuardPolicy.sol
+          (auto-deploy was removed) — CRITICAL. With a policy address configured, the
+          trace inspector still flags the new-contract CALL and blocks it as HIGH risk.
+        * degen is no longer an operator mode (stored "degen" resolves to balanced).
+          The programmatic PolicyConfig.degen() preset with an explicit allowlist
+          still lets this through with a MEDIUM-risk warning.
+        """
+        import storage
+
         new_deploy_calldata = "0x" + NEW_DEPLOY_SELECTOR + ("00" * 32)
 
-        # In strict mode: blocked as high risk
+        # strict without a deployed policy contract: fail closed, CRITICAL
+        res_no_policy = verify_transaction(
+            DEFAULT_ALLOWED_TARGET, 0, new_deploy_calldata, config=PolicyConfig.strict(),
+        )
+        self.assertFalse(res_no_policy.allowed)
+        self.assertEqual(res_no_policy.risk_score, RiskScore.CRITICAL.value)
+        self.assertIn("no policy_address supplied", res_no_policy.reason)
+
+        # strict with an operator-supplied policy address: trace inspection blocks as HIGH
         res_strict = verify_transaction(
             DEFAULT_ALLOWED_TARGET,
             0,
             new_deploy_calldata,
+            policy_address="0x000000000000000000000000000000000000dEaD",
             config=PolicyConfig.strict(),
         )
         self.assertFalse(res_strict.allowed)
-        self.assertIn(res_strict.risk_score, (RiskScore.HIGH.value, RiskScore.MEDIUM.value))
+        self.assertEqual(res_strict.risk_score, RiskScore.HIGH.value)
+        self.assertIn("newly deployed contract", res_strict.reason)
 
-        # In degen mode: allowed with warning as medium risk
+        # degen is retired as an operator mode
+        self.assertEqual(storage.set_mode("degen"), "balanced")
+        self.assertEqual(storage.get_mode(), "balanced")
+
+        # explicit library preset still permits it with a warning
         res_degen = verify_transaction(
             DEFAULT_ALLOWED_TARGET,
             0,

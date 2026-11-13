@@ -21,6 +21,7 @@ import unittest
 from typing import Any, Callable
 
 import __init__ as safeguard
+import storage
 from policy_engine import (
     AddressMemoryStore,
     ConfirmationStore,
@@ -57,26 +58,18 @@ class MockHermesContext:
 
 class TestSafeGuardSlashCommands(unittest.TestCase):
     def setUp(self):
-        self._orig_env_mode = os.environ.get("SAFEGUARD_MODE")
-        self._mode_file = safeguard.Path(__file__).resolve().parent.parent / ".safeguard_mode"
-        self._orig_file_mode = self._mode_file.read_text(encoding="utf-8") if self._mode_file.is_file() else None
+        # Mode lives only in the plugin data root (storage), never os.environ or the repo tree
+        self._orig_mode = storage.get_mode()
         self._env_file = safeguard.Path(__file__).resolve().parent.parent / ".env"
         self._orig_env_content = self._env_file.read_text(encoding="utf-8") if self._env_file.is_file() else None
-        os.environ["SAFEGUARD_MODE"] = "balanced"
+        storage.set_mode("balanced")
         if "SAFEGUARD_POLICY_PATH" in os.environ:
             del os.environ["SAFEGUARD_POLICY_PATH"]
         reset_default_confirmation_store()
         reset_default_memory_store()
 
     def tearDown(self):
-        if self._orig_env_mode is not None:
-            os.environ["SAFEGUARD_MODE"] = self._orig_env_mode
-        elif "SAFEGUARD_MODE" in os.environ:
-            del os.environ["SAFEGUARD_MODE"]
-        if self._orig_file_mode is not None:
-            self._mode_file.write_text(self._orig_file_mode, encoding="utf-8")
-        elif self._mode_file.is_file():
-            self._mode_file.unlink(missing_ok=True)
+        storage.set_mode(self._orig_mode)
         if self._orig_env_content is not None:
             self._env_file.write_text(self._orig_env_content, encoding="utf-8")
         if "SAFEGUARD_POLICY_PATH" in os.environ:
@@ -92,27 +85,27 @@ class TestSafeGuardSlashCommands(unittest.TestCase):
         """Typing /safeguard-mode with no args cycles between strict and balanced."""
         # Start at strict
         safeguard.safeguard_mode_command_handler("strict")
-        self.assertEqual(os.environ["SAFEGUARD_MODE"], "strict")
+        self.assertEqual(storage.get_mode(), "strict")
 
         # 1st cycle: strict -> balanced
         res1 = safeguard.safeguard_mode_command_handler()
-        self.assertEqual(os.environ["SAFEGUARD_MODE"], "balanced")
+        self.assertEqual(storage.get_mode(), "balanced")
         self.assertIn("BALANCED", res1)
 
         # 2nd cycle: balanced -> strict
         res2 = safeguard.safeguard_mode_command_handler()
-        self.assertEqual(os.environ["SAFEGUARD_MODE"], "strict")
+        self.assertEqual(storage.get_mode(), "strict")
         self.assertIn("STRICT", res2)
 
     def test_mode_direct_switching(self):
         """Setting mode directly via /safeguard-mode <strict|balanced>."""
         res_strict = safeguard.safeguard_mode_command_handler("strict")
-        self.assertEqual(os.environ["SAFEGUARD_MODE"], "strict")
+        self.assertEqual(storage.get_mode(), "strict")
         self.assertIn("STRICT", res_strict)
         self.assertIn("0.50 ETH", res_strict)
 
         res_balanced = safeguard.safeguard_mode_command_handler("balanced")
-        self.assertEqual(os.environ["SAFEGUARD_MODE"], "balanced")
+        self.assertEqual(storage.get_mode(), "balanced")
         self.assertIn("BALANCED", res_balanced)
         self.assertIn("5.00 ETH", res_balanced)
 
@@ -120,14 +113,14 @@ class TestSafeGuardSlashCommands(unittest.TestCase):
         """Handles conversational text and 1/2 numbers gracefully."""
         # Conversational text like "switch to strict mode"
         safeguard.safeguard_mode_command_handler("switch to strict mode")
-        self.assertEqual(os.environ["SAFEGUARD_MODE"], "strict")
+        self.assertEqual(storage.get_mode(), "strict")
 
         # Numeric map: 1=strict, 2=balanced
         safeguard.safeguard_mode_command_handler("1")
-        self.assertEqual(os.environ["SAFEGUARD_MODE"], "strict")
+        self.assertEqual(storage.get_mode(), "strict")
 
         safeguard.safeguard_mode_command_handler("2")
-        self.assertEqual(os.environ["SAFEGUARD_MODE"], "balanced")
+        self.assertEqual(storage.get_mode(), "balanced")
 
     def test_mode_unknown_argument(self):
         """Unknown mode argument displays error and helpful syntax instructions."""
@@ -138,10 +131,10 @@ class TestSafeGuardSlashCommands(unittest.TestCase):
     def test_mode_shortcut_commands(self):
         """Direct shortcut commands /safeguard-strict, /safeguard-balanced."""
         safeguard.safeguard_strict_command_handler()
-        self.assertEqual(os.environ["SAFEGUARD_MODE"], "strict")
+        self.assertEqual(storage.get_mode(), "strict")
 
         safeguard.safeguard_balanced_command_handler()
-        self.assertEqual(os.environ["SAFEGUARD_MODE"], "balanced")
+        self.assertEqual(storage.get_mode(), "balanced")
 
     # --------------------------------------------------------------------------
     # 2. Status Command
@@ -149,7 +142,7 @@ class TestSafeGuardSlashCommands(unittest.TestCase):
 
     def test_status_command(self):
         """Status command output contains all required health metrics."""
-        os.environ["SAFEGUARD_MODE"] = "strict"
+        storage.set_mode("strict")
         output = safeguard.safeguard_status_handler()
         self.assertIn("SafeGuard Status", output)
         self.assertIn("Mode: strict", output)
@@ -326,7 +319,7 @@ class TestSafeGuardSlashCommands(unittest.TestCase):
         self.assertIn("EMERGENCY KILL-SWITCH: ACTIVE", status_msg)
 
         # 3. Verify pre_tool_call hard-blocks transactions across all modes (even degen!)
-        os.environ["SAFEGUARD_MODE"] = "degen"
+        storage.set_mode("degen")
         hook_res = safeguard.on_pre_tool_call(
             "send_transaction",
             {"to": "0x1111111111111111111111111111111111111111", "value": 10**17},

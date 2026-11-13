@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import __init__ as safeguard
+import storage
 from policy_engine import (
     ConfirmationStore,
     DEFAULT_ALLOWED_TARGET,
@@ -48,13 +49,13 @@ class TestChatAdapterPromptExtraction(unittest.TestCase):
     """
 
     def setUp(self):
-        os.environ["SAFEGUARD_MODE"] = "balanced"
+        storage.set_mode("balanced")
         reset_default_confirmation_store()
         reset_default_memory_store()
         ensure_test_rpc_server("127.0.0.1", 8545)
 
     def tearDown(self):
-        os.environ["SAFEGUARD_MODE"] = "balanced"
+        storage.set_mode("balanced")
         reset_default_confirmation_store()
         reset_default_memory_store()
 
@@ -100,7 +101,7 @@ class TestChatAdapterPromptExtraction(unittest.TestCase):
 
     def test_prompt_extraction_strict_mode_new_recipient(self):
         """In strict mode, novel recipients require confirmation with clear financial impact."""
-        os.environ["SAFEGUARD_MODE"] = "strict"
+        storage.set_mode("strict")
         new_target = "0x9876543210987654321098765432109876543210"
 
         result = safeguard.on_pre_tool_call(
@@ -121,7 +122,7 @@ class TestChatAdapterPromptExtraction(unittest.TestCase):
 
     def test_chat_adapter_card_builder_simulation(self):
         """Simulate how a chat adapter parses hook output to build an interactive chat UI card."""
-        os.environ["SAFEGUARD_MODE"] = "strict"
+        storage.set_mode("strict")
         result = safeguard.on_pre_tool_call(
             "send_transaction",
             {
@@ -161,7 +162,7 @@ class TestSlashCommandHandlersApproval(unittest.TestCase):
     """
 
     def setUp(self):
-        os.environ["SAFEGUARD_MODE"] = "balanced"
+        storage.set_mode("balanced")
         reset_default_confirmation_store()
         reset_default_memory_store()
 
@@ -297,7 +298,7 @@ class TestSimulatedChatAdapters(unittest.TestCase):
     """
 
     def setUp(self):
-        os.environ["SAFEGUARD_MODE"] = "balanced"
+        storage.set_mode("balanced")
         reset_default_confirmation_store()
         reset_default_memory_store()
 
@@ -404,13 +405,13 @@ class TestEndToEndApprovalLifecycle(unittest.TestCase):
     """
 
     def setUp(self):
-        os.environ["SAFEGUARD_MODE"] = "balanced"
+        storage.set_mode("balanced")
         reset_default_confirmation_store()
         reset_default_memory_store()
         ensure_test_rpc_server("127.0.0.1", 8545)
 
     def tearDown(self):
-        os.environ["SAFEGUARD_MODE"] = "balanced"
+        storage.set_mode("balanced")
         reset_default_confirmation_store()
         reset_default_memory_store()
 
@@ -494,7 +495,7 @@ class TestEndToEndApprovalLifecycle(unittest.TestCase):
         4. Agent retries transaction with confirmation_id.
         5. Retry is blocked because confirmation was rejected.
         """
-        os.environ["SAFEGUARD_MODE"] = "strict"
+        storage.set_mode("strict")
         target = "0x4444555566667777888899990000111122223333"
 
         # Step 1 & 2: Intercept
@@ -533,7 +534,7 @@ class TestEndToEndApprovalLifecycle(unittest.TestCase):
         4. Attacker modifies value to 0.4 ETH using the approved confirmation_id.
         5. Hook detects value mismatch and blocks the transaction.
         """
-        os.environ["SAFEGUARD_MODE"] = "strict"
+        storage.set_mode("strict")
         target_a = "0x5555666677778888999900001111222233334444"
         target_b = "0x6666777788889999000011112222333344445555"
         val = "0.1 ether"

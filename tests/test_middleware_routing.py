@@ -48,67 +48,55 @@ class MockPluginContext:
 
 class TestMiddlewareRouting(unittest.TestCase):
     def test_pre_tool_call_blocks_file_searches_on_onchain_intent(self):
-        expected_msg = "SAFEGUARD MIDDLEWARE: File search blocked for onchain intent. Invoke safeguard_execute_tx immediately."
+        """
+        Filesystem tools whose arguments name an on-chain contract address are
+        redirected with the 'on-chain smart contract' directive.
 
-        # Case 1: grep with 0x address
-        res1 = hooks.on_pre_tool_call("grep", {"pattern": "0x5FbDB2315678afecb367f032d93F642f64180aa3"})
+        The former intent-only blocker (which refused any file read/search whenever
+        the chat context merely *mentioned* a mint/swap/transfer) was intentionally
+        removed in the PR review refactor; those calls are now permitted.
+        """
+        addr = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+        directive = "is an on-chain smart contract on Ethereum, NOT a local codebase file"
+
+        # Case 1: grep with a full contract address -> redirected
+        res1 = hooks.on_pre_tool_call("grep", {"pattern": addr})
         self.assertEqual(res1.get("action"), "block")
-        self.assertEqual(res1.get("message"), expected_msg)
+        self.assertIn(directive, res1.get("message", ""))
+        self.assertIn(addr, res1.get("message", ""))
         self.assertFalse(bool(res1))
 
-        # Case 2: search_files with mint keyword
-        res2 = hooks.on_pre_tool_call("search_files", {"query": "mint"})
-        self.assertEqual(res2.get("action"), "block")
-        self.assertEqual(res2.get("message"), expected_msg)
-
-        # Case 3: read_file with user context containing onchain mint intent
-        res3 = hooks.on_pre_tool_call(
+        # Case 2: read_file while the user context names the contract -> redirected
+        res2 = hooks.on_pre_tool_call(
             "read_file",
             {"path": "contracts/DegenNFT.sol"},
-            context=[{"role": "user", "content": "Mint 1 NFT from 0x5FbDB2315678afecb367f032d93F642f64180aa3 for 0.05 ETH"}],
+            context=[{"role": "user", "content": f"Mint 1 NFT from {addr} for 0.05 ETH"}],
         )
-        self.assertEqual(res3.get("action"), "block")
-        self.assertEqual(res3.get("message"), expected_msg)
+        self.assertEqual(res2.get("action"), "block")
+        self.assertIn(directive, res2.get("message", ""))
 
-        # Case 4: list_dir with user context containing transfer intent
+        # Case 3: intent keywords alone no longer block ordinary filesystem work
+        intent_only = [
+            (("search_files", {"query": "mint"}), {}),
+            (("list_dir", {"path": "contracts"}),
+             {"context": [{"role": "user", "content": "Transfer 1 ETH to 0x1111222233334444555566667777888899990000"}]}),
+            (("find", {"name": "*.sol"}),
+             {"context": [{"role": "user", "content": "Swap 0.5 ETH on Uniswap"}]}),
+            (("bash", {"command": "grep -rn 0x5FbDB ."}), {}),
+            (("terminal", {"command": "cat contracts/DegenNFT.sol"}),
+             {"context": [{"role": "user", "content": f"Approve {addr} for 1000 tokens"}]}),
+        ]
+        for (tool, args), kw in intent_only:
+            with self.subTest(tool=tool, args=args):
+                self.assertEqual(hooks.on_pre_tool_call(tool, args, **kw).get("action"), "allow")
+
+        # Case 4: Non-onchain file read is permitted
         res4 = hooks.on_pre_tool_call(
-            "list_dir",
-            {"path": "contracts"},
-            context=[{"role": "user", "content": "Transfer 1 ETH to 0x1111222233334444555566667777888899990000"}],
-        )
-        self.assertEqual(res4.get("action"), "block")
-        self.assertEqual(res4.get("message"), expected_msg)
-
-        # Case 5: find with user context containing swap intent
-        res5 = hooks.on_pre_tool_call(
-            "find",
-            {"name": "*.sol"},
-            context=[{"role": "user", "content": "Swap 0.5 ETH on Uniswap"}],
-        )
-        self.assertEqual(res5.get("action"), "block")
-        self.assertEqual(res5.get("message"), expected_msg)
-
-        # Case 6: bash running grep with 0x address
-        res6 = hooks.on_pre_tool_call("bash", {"command": "grep -rn 0x5FbDB ."})
-        self.assertEqual(res6.get("action"), "block")
-        self.assertEqual(res6.get("message"), expected_msg)
-
-        # Case 7: terminal running cat with approve intent in context
-        res7 = hooks.on_pre_tool_call(
-            "terminal",
-            {"command": "cat contracts/DegenNFT.sol"},
-            context=[{"role": "user", "content": "Approve 0x5FbDB2315678afecb367f032d93F642f64180aa3 for 1000 tokens"}],
-        )
-        self.assertEqual(res7.get("action"), "block")
-        self.assertEqual(res7.get("message"), expected_msg)
-
-        # Case 8: Non-onchain file read is permitted
-        res8 = hooks.on_pre_tool_call(
             "read_file",
             {"path": "README.md"},
             context=[{"role": "user", "content": "Explain project architecture and docs"}],
         )
-        self.assertEqual(res8.get("action"), "allow")
+        self.assertEqual(res4.get("action"), "allow")
 
     def test_tool_schema_descriptions_and_routing_rule(self):
         # 1. Check schemas.py descriptions contain required triggers

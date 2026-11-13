@@ -66,7 +66,15 @@ class TestHermesPluginCompliance(unittest.TestCase):
         env_list = data.get("requires_env", [])
         env_names = [e["name"] if isinstance(e, dict) else e for e in env_list]
         self.assertIn("SAFEGUARD_RPC_URL", env_names)
-        self.assertIn("TELEGRAM_BOT_TOKEN", env_names)
+        # Bot token is namespaced and declared secret so Hermes routes it via the secret scope
+        self.assertIn("SAFEGUARD_TELEGRAM_BOT_TOKEN", env_names)
+        self.assertNotIn("TELEGRAM_BOT_TOKEN", env_names)
+        token_entry = next(e for e in env_list if isinstance(e, dict) and e.get("name") == "SAFEGUARD_TELEGRAM_BOT_TOKEN")
+        self.assertTrue(token_entry.get("secret"))
+
+        # Hermes reads Python requirements from python_dependencies (PR review — Issue 8)
+        self.assertIn("pyyaml>=6.0", data.get("python_dependencies", []))
+        self.assertNotIn("dependencies", data)
 
     def test_schemas_match_declared_tools(self):
         """Verify schemas.py defines schemas for all declared tools with valid JSON schema properties."""

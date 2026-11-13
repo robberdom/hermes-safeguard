@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 import os
 import unittest
+
+import storage
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -50,14 +52,14 @@ class TestPhase2SecurityFixes(unittest.TestCase):
         reset_default_confirmation_store()
         reset_default_velocity_tracker()
         tools.set_kill_switch(False)
-        self.orig_mode = os.environ.get("SAFEGUARD_MODE", "balanced")
-        os.environ["SAFEGUARD_MODE"] = "strict"
+        self.orig_mode = storage.get_mode()
+        storage.set_mode("strict")
 
     def tearDown(self):
         tools.set_kill_switch(False)
         reset_default_confirmation_store()
         reset_default_velocity_tracker()
-        os.environ["SAFEGUARD_MODE"] = self.orig_mode
+        storage.set_mode(self.orig_mode)
 
     def test_calldata_swap_toctou_prevention(self):
         """1. Swapped calldata must NOT inherit confirmation from a different transaction."""

@@ -34,16 +34,17 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import __init__ as safeguard
+import storage
 
 
 class TestPanicKillSwitchBeat4(unittest.TestCase):
     def setUp(self):
         safeguard.set_kill_switch(False)
-        self.initial_mode = os.getenv("SAFEGUARD_MODE", "balanced")
+        self.initial_mode = storage.get_mode()
 
     def tearDown(self):
         safeguard.set_kill_switch(False)
-        os.environ["SAFEGUARD_MODE"] = self.initial_mode
+        storage.set_mode(self.initial_mode)
 
     def test_step_a_panic_lockdown_banner(self):
         """Step A: /safeguard-panic outputs structured banner with required fields."""
@@ -90,7 +91,7 @@ class TestPanicKillSwitchBeat4(unittest.TestCase):
     def test_panic_overrides_mode_and_whitelist(self):
         """Panic overrides active mode and whitelisted address across all entry points."""
         safeguard.safeguard_balanced_command_handler()
-        self.assertEqual(os.getenv("SAFEGUARD_MODE"), "balanced")
+        self.assertEqual(storage.get_mode(), "balanced")
 
         whitelisted_target = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
         safeguard.safeguard_allow_command_handler(f"{whitelisted_target} DemoNFT")

@@ -160,86 +160,40 @@ def is_financial_tool(tool_name: str) -> bool:
     return any(kw in name for kw in financial_keywords)
 
 
-# Emergency Kill-Switch State (Shared across processes via file and env)
-_KILL_SWITCH_FILE = Path.home() / ".hermes" / ".safeguard_kill_switch"
-_LOCAL_KILL_SWITCH_FILE = Path(__file__).resolve().parent / ".safeguard_kill_switch"
-_KILL_SWITCH_ACTIVE: bool = False
+# Emergency Kill-Switch State
+#
+# The switch lives exclusively in the sanctioned per-plugin data root
+# (PR review — Issue 6). It is intentionally NOT mirrored into os.environ:
+# anything able to write the agent's environment must not be able to release
+# the panic lockdown. Each check re-reads the state file, so a release (or an
+# engagement) performed by another process takes effect immediately.
 
 
-def _get_kill_switch_files() -> list[Path]:
-    files = [_LOCAL_KILL_SWITCH_FILE, _KILL_SWITCH_FILE]
+def _storage_helpers():
+    """Import the storage module lazily (package or flat layout)."""
     try:
-        try:
-            from .storage import resolve_state_path
-        except (ImportError, ValueError):
-            from storage import resolve_state_path
-        p = resolve_state_path(".safeguard_kill_switch")
-        if p not in files:
-            files.append(p)
-    except Exception:
-        pass
-    return files
+        from . import storage as _storage
+    except (ImportError, ValueError):
+        import storage as _storage
+    return _storage
 
 
 def is_kill_switch_active() -> bool:
     """True if operator has engaged emergency panic lockdown."""
-    global _KILL_SWITCH_ACTIVE
-    if _KILL_SWITCH_ACTIVE:
-        return True
-    if os.getenv("SAFEGUARD_KILL_SWITCH", "").strip().lower() in ("true", "1", "yes", "active"):
-        return True
-    for p in _get_kill_switch_files():
-        if p.is_file():
-            return True
     try:
-        try:
-            from .storage import read_state_file
-        except (ImportError, ValueError):
-            from storage import read_state_file
-        if read_state_file(".safeguard_kill_switch") is not None:
-            return True
+        return bool(_storage_helpers().kill_switch_engaged())
     except Exception:
-        pass
-    return False
+        # Fail closed: if the state cannot be read, assume lockdown.
+        return True
 
 
 def set_kill_switch(active: bool) -> None:
-    """Engage or release the emergency kill-switch."""
-    global _KILL_SWITCH_ACTIVE
-    _KILL_SWITCH_ACTIVE = active
+    """Engage or release the emergency kill-switch in the plugin data root."""
+    storage = _storage_helpers()
     if active:
-        os.environ["SAFEGUARD_KILL_SWITCH"] = "true"
-        for p in _get_kill_switch_files():
-            try:
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.touch()
-            except Exception:
-                pass
-        try:
-            try:
-                from .storage import write_state_file
-            except (ImportError, ValueError):
-                from storage import write_state_file
-            write_state_file(".safeguard_kill_switch", "LOCKED")
-        except Exception:
-            pass
+        storage.engage_kill_switch()
     else:
-        if "SAFEGUARD_KILL_SWITCH" in os.environ:
-            del os.environ["SAFEGUARD_KILL_SWITCH"]
-        for p in _get_kill_switch_files():
-            try:
-                if p.is_file():
-                    p.unlink()
-            except Exception:
-                pass
-        try:
-            try:
-                from .storage import unlink_state_file
-            except (ImportError, ValueError):
-                from storage import unlink_state_file
-            unlink_state_file(".safeguard_kill_switch")
-        except Exception:
-            pass
+        storage.release_kill_switch()
 
 
 # ==============================================================================
@@ -1049,7 +1003,6 @@ class AddressMemoryStore:
             pass
 
 
-DEFAULT_MEMORY_STORE_PATH = Path(__file__).resolve().parent / ".safeguard_memory.json"
 _DEFAULT_MEMORY_STORE: AddressMemoryStore | None = None
 
 
@@ -1059,11 +1012,13 @@ def get_default_memory_store() -> AddressMemoryStore:
         if "SAFEGUARD_MEMORY_PATH" in os.environ:
             mem_path = os.environ["SAFEGUARD_MEMORY_PATH"]
         else:
+            # Sanctioned per-plugin data root only (PR review — Issue 6); no
+            # install-directory fallback, so a storage failure propagates.
             try:
+                from .storage import resolve_state_path
+            except (ImportError, ValueError):
                 from storage import resolve_state_path
-                mem_path = str(resolve_state_path(".safeguard_memory.json"))
-            except Exception:
-                mem_path = str(DEFAULT_MEMORY_STORE_PATH)
+            mem_path = str(resolve_state_path(".safeguard_memory.json"))
         _DEFAULT_MEMORY_STORE = AddressMemoryStore(filepath=mem_path)
     return _DEFAULT_MEMORY_STORE
 
@@ -1168,23 +1123,15 @@ class PendingConfirmation:
         }
 
 
-DEFAULT_CONFIRMATION_STORE_PATH = Path.home() / ".hermes" / "safeguard_confirmations.json"
-LOCAL_CONFIRMATION_STORE_PATH = Path(__file__).resolve().parent / ".safeguard_confirmations.json"
-
-
 def _resolve_confirmation_store_path() -> Path:
+    """Confirmation state lives only in the sanctioned per-plugin data root."""
     try:
+        from .storage import resolve_state_path
+    except (ImportError, ValueError):
         from storage import resolve_state_path
-        p = resolve_state_path(".safeguard_confirmations.json")
-        p.parent.mkdir(parents=True, exist_ok=True)
-        return p
-    except Exception:
-        pass
-    try:
-        DEFAULT_CONFIRMATION_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        return DEFAULT_CONFIRMATION_STORE_PATH
-    except Exception:
-        return LOCAL_CONFIRMATION_STORE_PATH
+    p = resolve_state_path(".safeguard_confirmations.json")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 class ConfirmationStore:
@@ -2138,8 +2085,6 @@ class ThreatFeed:
             Path(__file__).parent / "blocklist.json",
             Path("policies/blocklist.json"),
             Path(__file__).parent / "policies/blocklist.json",
-            Path.home() / ".hermes/plugins/hermes-safeguard/blocklist.json",
-            Path.home() / ".hermes/blocklist.json",
             Path("blocklist.yaml"),
             Path(__file__).parent / "blocklist.yaml",
         ])
@@ -3351,30 +3296,8 @@ class PolicyEngine:
         threat_feed: ThreatFeed | None = None,
     ) -> None:
         if config is None:
-            env_var = os.getenv("SAFEGUARD_MODE")
-            if env_var and env_var.strip():
-                active_m = env_var.strip().lower()
-            else:
-                active_m = None
-                try:
-                    from storage import read_state_file
-                    content = read_state_file(".safeguard_mode")
-                    if content and content.strip().lower() in ("strict", "balanced", "degen"):
-                        active_m = content.strip().lower()
-                except Exception:
-                    pass
-                if not active_m:
-                    for p in [Path(".safeguard_mode"), Path(__file__).resolve().parent / ".safeguard_mode"]:
-                        if p.is_file():
-                            try:
-                                content = p.read_text(encoding="utf-8").strip().lower()
-                                if content in ("strict", "balanced", "degen"):
-                                    active_m = content
-                                    break
-                            except Exception:
-                                pass
-                if not active_m:
-                    active_m = "degen"
+            # Mode lives only in the sanctioned plugin data root (PR review — Issue 6)
+            active_m = _storage_helpers().get_mode()
             if active_m == "degen":
                 self.config = PolicyConfig.degen()
             elif active_m == "balanced":

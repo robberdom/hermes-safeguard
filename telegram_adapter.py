@@ -58,9 +58,18 @@ logger = logging.getLogger("SafeGuardTelegram")
 # Persistent Multi-User Pairing Store (Profile-Aware)
 # ==============================================================================
 
-from storage import get_plugin_data_dir, get_secret, read_state_file, write_state_file
+from storage import (
+    get_chat_id,
+    get_mode,
+    get_plugin_data_dir,
+    get_secret,
+    read_state_file,
+    set_chat_id,
+    set_mode,
+    write_state_file,
+)
 
-CANONICAL_PAIRING_FILE = get_plugin_data_dir() / "safeguard_pairing.json"
+PAIRING_FILE_NAME = "safeguard_pairing.json"
 
 _ACTIVE_OTP_CODES: Dict[str, Dict[str, Any]] = {}
 _LIVE_FEED_ENABLED: bool = os.getenv("SAFEGUARD_TG_LIVE_FEED", "0").lower() in ("1", "true", "yes")
@@ -78,13 +87,15 @@ def set_live_feed_enabled(enabled: bool) -> None:
 
 
 def _get_pairing_file_path() -> Path:
-    return CANONICAL_PAIRING_FILE
+    """Resolve the pairing store through Hermes' plugin storage API on every access."""
+    return get_plugin_data_dir() / PAIRING_FILE_NAME
 
 
 def load_pairings() -> Dict[str, Any]:
-    if CANONICAL_PAIRING_FILE.is_file():
+    pairing_file = _get_pairing_file_path()
+    if pairing_file.is_file():
         try:
-            with open(CANONICAL_PAIRING_FILE, "r", encoding="utf-8") as f:
+            with open(pairing_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict) and data:
                     return data
@@ -94,12 +105,13 @@ def load_pairings() -> Dict[str, Any]:
 
 
 def save_pairings(data: Dict[str, Any]) -> None:
+    pairing_file = _get_pairing_file_path()
     try:
-        CANONICAL_PAIRING_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(CANONICAL_PAIRING_FILE, "w", encoding="utf-8") as f:
+        pairing_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(pairing_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
-        logger.debug("Could not persist pairing to %s: %s", CANONICAL_PAIRING_FILE, e)
+        logger.debug("Could not persist pairing to %s: %s", pairing_file, e)
 
 
 def create_pairing_code(instance_id: str = "default") -> Tuple[str, str]:
@@ -140,20 +152,29 @@ def consume_pairing_code(code: str, chat_id: str, username: str = "") -> bool:
         "paired_at": time.time(),
     }
     save_pairings(pairings)
-    _ACTIVE_OTP_CODES.pop(norm_code, None)
 
-    # Also update environment for current process
-    os.environ["TELEGRAM_OPERATOR_CHAT_ID"] = str(chat_id)
+    # Mirror the active operator into the sanctioned state root (never the environment)
+    try:
+        set_chat_id(str(chat_id), key=str(instance_id))
+    except Exception:
+        pass
+    _ACTIVE_OTP_CODES.pop(norm_code, None)
     return True
 
 
 def get_operator_chat_id(instance_id: str = "default") -> Optional[str]:
-    """Retrieve paired chat_id for this instance, falling back to environment."""
+    """Retrieve paired chat_id for this instance, then the persisted state root, then the secret scope."""
     pairings = load_pairings()
     inst = pairings.get(instance_id)
     if inst and inst.get("chat_id"):
         return str(inst["chat_id"])
-    return get_secret("SAFEGUARD_TELEGRAM_CHAT_ID", get_secret("TELEGRAM_OPERATOR_CHAT_ID", get_secret("TELEGRAM_CHAT_ID", "")))
+    try:
+        persisted = get_chat_id(key=str(instance_id))
+        if persisted:
+            return persisted
+    except Exception:
+        pass
+    return get_secret("SAFEGUARD_TELEGRAM_CHAT_ID")
 
 
 _CACHED_BOT_USERNAME = ""
@@ -161,7 +182,7 @@ _CACHED_BOT_USERNAME = ""
 
 def get_telegram_token() -> str:
     """Retrieve Telegram Bot Token using Hermes secret scope."""
-    return get_secret("SAFEGUARD_TELEGRAM_BOT_TOKEN", get_secret("TELEGRAM_BOT_TOKEN", ""))
+    return get_secret("SAFEGUARD_TELEGRAM_BOT_TOKEN")
 
 
 def get_bot_username() -> str:
@@ -576,7 +597,7 @@ class SafeGuardTelegramBridge:
                 return
 
         if cmd in ("/start", "/help"):
-            mode = os.getenv("SAFEGUARD_MODE", "balanced").upper()
+            mode = get_mode().upper()
             feed_badge = "ON 🟢" if is_live_feed_enabled() else "OFF ⚪"
             help_text = (
                 f"🛡️ <b>Hermes SafeGuard — Telegram Operator Console</b>\n"
@@ -737,7 +758,7 @@ class SafeGuardTelegramBridge:
         elif action == "set_mode":
             target_mode = conf_id.lower()
             if target_mode in ("strict", "balanced", "degen"):
-                os.environ["SAFEGUARD_MODE"] = target_mode
+                set_mode(target_mode)
                 if "SAFEGUARD_POLICY_PATH" in os.environ:
                     del os.environ["SAFEGUARD_POLICY_PATH"]
                 self.bot.answer_callback_query(query_id, f"Policy switched to {target_mode.upper()}!", show_alert=False)
@@ -826,7 +847,7 @@ class SafeGuardTelegramBridge:
         """View or switch policy mode with interactive inline buttons."""
         target_mode = arg.strip().lower()
         if target_mode in ("strict", "balanced", "degen"):
-            os.environ["SAFEGUARD_MODE"] = target_mode
+            set_mode(target_mode)
             if "SAFEGUARD_POLICY_PATH" in os.environ:
                 del os.environ["SAFEGUARD_POLICY_PATH"]
             config, mode = safeguard._get_policy_config()
@@ -870,7 +891,7 @@ class SafeGuardTelegramBridge:
 
     def handle_live_command(self, chat_id: str | int) -> None:
         """Query real-time network status across Base and Ethereum mainnets."""
-        mode = os.getenv("SAFEGUARD_MODE", "balanced").upper()
+        mode = get_mode().upper()
         base_block_num = 0
         base_gas_gwei = 0.0
         for rpc in SUPPORTED_CHAINS["base"]["rpcs"]:

@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import __init__ as safeguard
+import storage
 import verifier
 from policy_engine import (
     ActionAuditLogger,
@@ -49,14 +50,15 @@ class SecurityPatchTestBase(unittest.TestCase):
         reset_default_memory_store()
         reset_default_velocity_tracker()
         ensure_test_rpc_server()
+        self._mode_backup = storage.get_mode()
         self._env_backup = {k: os.environ.get(k) for k in (
-            "SAFEGUARD_MODE",
             "SAFEGUARD_WALLET_ADDRESS",
             "SAFEGUARD_AUDIT_LOG_PATH",
         )}
 
     def tearDown(self):
         reset_default_velocity_tracker()
+        storage.set_mode(self._mode_backup)
         for key, value in self._env_backup.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -191,7 +193,7 @@ class TestModeIsOperatorControlled(SecurityPatchTestBase):
     """Patch 3: policy tier cannot be selected through tool arguments."""
 
     def test_check_policy_ignores_agent_mode(self):
-        os.environ["SAFEGUARD_MODE"] = "strict"
+        storage.set_mode("strict")
         res = json.loads(
             safeguard.safeguard_check_policy_handler(
                 to="0x9999999999999999999999999999999999999999",
@@ -203,7 +205,7 @@ class TestModeIsOperatorControlled(SecurityPatchTestBase):
         self.assertEqual(res["mode"], "strict")
 
     def test_execute_tx_ignores_agent_mode(self):
-        os.environ["SAFEGUARD_MODE"] = "strict"
+        storage.set_mode("strict")
         res = json.loads(
             safeguard.safeguard_execute_tx_handler(
                 to="0x9999999999999999999999999999999999999999",
@@ -215,7 +217,7 @@ class TestModeIsOperatorControlled(SecurityPatchTestBase):
         self.assertEqual(res["mode"], "strict")
 
     def test_tool_argument_mode_does_not_lower_policy_in_hook(self):
-        os.environ["SAFEGUARD_MODE"] = "strict"
+        storage.set_mode("strict")
         res = safeguard.on_pre_tool_call(
             "transfer_eth",
             {"to": "0x9999999999999999999999999999999999999999", "value": "10 ether", "mode": "degen"},
@@ -267,7 +269,9 @@ class TestTamperingGuardPrecision(SecurityPatchTestBase):
         ("write_file", {"path": "./tests/test_policies_engine.py"}),
     ]
     ATTACKS = [
-        ("write_file", {"path": "/opt/hermes-safeguard/__init__.py"}),
+        # Absolute paths are matched against the *resolved* install and data
+        # directories (no more bare "hermes-safeguard" substring match), so the
+        # absolute-path attacks are built in test_attacks_are_blocked from the real roots.
         ("python", {"code": "open('policy_engine.py','w').write('')"}),
         ("bash", {"command": "sed -i s/a/b/ verifier.py"}),
         ("create_file", {"file_path": "blocklist.json"}),
@@ -277,22 +281,101 @@ class TestTamperingGuardPrecision(SecurityPatchTestBase):
         ("bash", {"command": "cd policies && echo x > degen.yaml"}),
     ]
 
+    @staticmethod
+    def _absolute_attacks():
+        import hooks
+        import storage
+        install = hooks._INSTALL_DIR
+        data = storage.get_plugin_data_dir().resolve()
+        return [
+            ("write_file", {"path": str(install / "__init__.py")}),
+            ("write_file", {"path": str(install / "policy_engine.py")}),
+            ("edit_file", {"path": str(data / ".safeguard_mode"), "content": "degen"}),
+            ("delete_file", {"path": str(data / ".safeguard_kill_switch")}),
+            ("bash", {"command": f"rm -f {data / '.safeguard_kill_switch'}"}),
+        ]
+
     def test_benign_tools_are_not_blocked(self):
         for tool_name, args in self.BENIGN:
             with self.subTest(tool=tool_name, args=args):
                 self.assertFalse(safeguard._is_policy_tampering_attempt(tool_name, args))
 
     def test_attacks_are_blocked(self):
-        for tool_name, args in self.ATTACKS:
+        for tool_name, args in self.ATTACKS + self._absolute_attacks():
             with self.subTest(tool=tool_name, args=args):
                 self.assertTrue(safeguard._is_policy_tampering_attempt(tool_name, args))
 
+    def test_unrelated_absolute_path_named_like_plugin_is_not_flagged(self):
+        # A foreign checkout that merely shares the plugin's name is not our install tree
+        self.assertFalse(
+            safeguard._is_policy_tampering_attempt("write_file", {"path": "/opt/hermes-safeguard/__init__.py"})
+        )
+
     def test_hook_blocks_tampering_attempt(self):
+        import hooks
         res = safeguard.on_pre_tool_call(
-            "write_file", {"path": "/opt/hermes-safeguard/__init__.py", "content": "x"}
+            "write_file", {"path": str(hooks._INSTALL_DIR / "__init__.py"), "content": "x"}
         )
         self.assertEqual(res["action"], "block")
         self.assertEqual(res["risk_score"], "critical")
+
+
+class TestTokenAmountNotNativeValue(SecurityPatchTestBase):
+    """For approve/mint/token-transfer tools, 'amount' is a token quantity, never ETH value."""
+
+    TOKEN = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+    SPENDER = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
+
+    def test_unlimited_approve_is_parsed_not_rejected(self):
+        _, value, data = safeguard._extract_tx_params(
+            {"to": self.TOKEN, "spender": self.SPENDER, "amount": "unlimited"}, "approve"
+        )
+        self.assertEqual(value, 0)
+        self.assertTrue(data.lower().endswith("f" * 64))
+
+    def test_approve_amount_does_not_become_eth_value(self):
+        value, _ = safeguard._extract_tx_params(
+            {"to": self.TOKEN, "spender": self.SPENDER, "amount": "5 ether"}, "approve"
+        )[1:]
+        self.assertEqual(value, 0)
+
+    def test_mint_amount_is_quantity_not_wei(self):
+        _, value, data = safeguard._extract_tx_params({"to": self.TOKEN, "amount": 3}, "mint_nft")
+        self.assertEqual(value, 0)
+        self.assertTrue(data.endswith("3"))
+
+    def test_explicit_value_still_honoured(self):
+        _, value, _ = safeguard._extract_tx_params(
+            {"to": self.TOKEN, "quantity": 2, "value": "0.05 ether"}, "mint_nft"
+        )
+        self.assertEqual(value, 5 * 10**16)
+
+    def test_generic_send_still_uses_amount_as_eth(self):
+        _, value, _ = safeguard._extract_tx_params({"to": self.SPENDER, "amount": "2 ether"}, "send_eth")
+        self.assertEqual(value, 2 * 10**18)
+
+    def test_unlimited_approve_blocked_by_policy_not_parser(self):
+        for mode in ("strict", "balanced"):
+            with self.subTest(mode=mode):
+                storage.set_mode(mode)
+                res = safeguard.on_pre_tool_call(
+                    "approve", {"to": self.TOKEN, "spender": self.SPENDER, "amount": "unlimited"}
+                )
+                self.assertEqual(res["action"], "block")
+                self.assertNotIn("Malformed", res["reason"])
+                self.assertIn("unbounded approve", res["reason"])
+
+    def test_unlimited_approve_reaches_operator_with_degen_preset(self):
+        # degen is not an operator mode; use the explicit library preset
+        from policy_engine import PolicyConfig
+        res = safeguard.on_pre_tool_call(
+            "approve",
+            {"to": self.TOKEN, "spender": self.SPENDER, "amount": "unlimited"},
+            config=PolicyConfig.degen(),
+        )
+        self.assertNotIn("Malformed", res.get("reason") or res["message"])
+        self.assertIn("UNLIMITED", res["message"])
+        self.assertIn(self.SPENDER.lower(), res["message"])
 
 
 class TestCalldataSynthesisFailsClosed(SecurityPatchTestBase):
@@ -446,7 +529,7 @@ class TestNoNewBypasses(SecurityPatchTestBase):
         self.assertIn("safeguard-confirm", ctx.commands)
 
     def test_cross_mode_escalation_via_tool_args(self):
-        os.environ["SAFEGUARD_MODE"] = "strict"
+        storage.set_mode("strict")
         for handler in (safeguard.safeguard_check_policy_handler, safeguard.safeguard_execute_tx_handler):
             res = json.loads(
                 handler(to="0x9999999999999999999999999999999999999999", value="50 ether", mode="degen")

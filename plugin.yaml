@@ -12,7 +12,7 @@ tags:
   - guardrails
   - onchain
 requires_hermes: ">=0.22.0"
-dependencies:
+python_dependencies:
   - pyyaml>=6.0
 requires_env:
   - name: SAFEGUARD_RPC_URL
@@ -23,10 +23,6 @@ requires_env:
     required: false
   - name: SAFEGUARD_TELEGRAM_BOT_TOKEN
     description: "Telegram Bot API token for operator alerts and interactive approvals"
-    secret: true
-    required: false
-  - name: TELEGRAM_BOT_TOKEN
-    description: "Telegram Bot API token fallback"
     secret: true
     required: false
   - name: PECKSHIELD_API_URL

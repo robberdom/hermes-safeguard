@@ -49,7 +49,15 @@ try:
         format_layer0_alert_banner,
         InjectionSignal,
     )
-    from .storage import get_plugin_data_dir, read_state_file, write_state_file, resolve_state_path
+    from .storage import (
+        get_chat_id,
+        get_mode,
+        get_plugin_data_dir,
+        get_secret,
+        read_state_file,
+        resolve_state_path,
+        write_state_file,
+    )
     from .verifier import (
         DEFAULT_RPC_URL,
         ERC20_TRANSFER_SELECTOR,
@@ -89,7 +97,15 @@ except (ImportError, ValueError):
         format_layer0_alert_banner,
         InjectionSignal,
     )
-    from storage import get_plugin_data_dir, read_state_file, write_state_file, resolve_state_path
+    from storage import (
+        get_chat_id,
+        get_mode,
+        get_plugin_data_dir,
+        get_secret,
+        read_state_file,
+        resolve_state_path,
+        write_state_file,
+    )
     from verifier import (
         DEFAULT_RPC_URL,
         ERC20_TRANSFER_SELECTOR,
@@ -114,8 +130,8 @@ def _get_policy_config(mode: str | None = None, config: PolicyConfig | None = No
       1. Explicit config instance (if provided via host/kwargs)
       2. Explicit mode argument ('strict', 'balanced', 'degen')
       3. SAFEGUARD_POLICY_PATH environment variable (if mode not explicit)
-      4. SAFEGUARD_MODE environment variable
-      5. Persistent storage state file (.safeguard_mode)
+      4. Persisted mode in the plugin data root (storage.get_mode)
+      5. Default: balanced
     """
     if config is not None:
         mode_str = config.mode.value if isinstance(config.mode, PolicyMode) else str(config.mode).lower()
@@ -139,14 +155,7 @@ def _get_policy_config(mode: str | None = None, config: PolicyConfig | None = No
         except Exception as e:
             logger.warning("SafeGuard Warning: Failed to load policy from %s: %s", policy_path, e)
 
-    env_var = os.getenv("SAFEGUARD_MODE")
-    if env_var and env_var.strip():
-        env_mode = env_var.strip().lower()
-    else:
-        file_mode = read_state_file(".safeguard_mode")
-        if file_mode:
-            file_mode = file_mode.strip().lower()
-        env_mode = file_mode if file_mode in ("strict", "balanced") else "balanced"
+    env_mode = get_mode()
 
     if env_mode == "strict":
         return PolicyConfig.strict(), "strict"
@@ -167,8 +176,8 @@ def _notify_telegram_operator(
     if os.getenv("SAFEGUARD_TESTING", "").strip().lower() in ("true", "1", "yes"):
         return False
 
-    token = get_secret("SAFEGUARD_TELEGRAM_BOT_TOKEN", get_secret("TELEGRAM_BOT_TOKEN", ""))
-    chat_id = get_secret("SAFEGUARD_TELEGRAM_CHAT_ID", get_secret("TELEGRAM_OPERATOR_CHAT_ID", get_secret("TELEGRAM_CHAT_ID", "")))
+    token = get_secret("SAFEGUARD_TELEGRAM_BOT_TOKEN")
+    chat_id = get_secret("SAFEGUARD_TELEGRAM_CHAT_ID")
     if not chat_id:
         try:
             from telegram_adapter import get_operator_chat_id

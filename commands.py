@@ -41,6 +41,8 @@ try:
         InjectionSignal,
     )
     from .storage import (
+        get_mode,
+        set_mode,
         get_plugin_data_dir,
         get_secret,
         read_state_file,
@@ -84,6 +86,8 @@ except (ImportError, ValueError):
         InjectionSignal,
     )
     from storage import (
+        get_mode,
+        set_mode,
         get_plugin_data_dir,
         get_secret,
         read_state_file,
@@ -149,7 +153,7 @@ def safeguard_mode_command_handler(*args: Any, **kwargs: Any) -> str:
     """
     raw_arg = _parse_command_args(*args, **kwargs).strip().lower()
 
-    current_mode = os.getenv("SAFEGUARD_MODE", "balanced").strip().lower()
+    current_mode = get_mode().strip().lower()
     if current_mode not in ("strict", "balanced"):
         current_mode = "balanced"
 
@@ -184,12 +188,8 @@ def safeguard_mode_command_handler(*args: Any, **kwargs: Any) -> str:
             f"  /safeguard-balanced          - Shortcut for balanced mode"
         )
 
-    # Set active mode in environment and persistent state file
-    os.environ["SAFEGUARD_MODE"] = target_mode
-    try:
-        write_state_file(".safeguard_mode", target_mode)
-    except Exception:
-        pass
+    # Persist active mode in the sanctioned plugin data root only (never os.environ)
+    set_mode(target_mode)
     if "SAFEGUARD_POLICY_PATH" in os.environ:
         del os.environ["SAFEGUARD_POLICY_PATH"]
 
@@ -256,7 +256,7 @@ def safeguard_status_handler(*args: Any, **kwargs: Any) -> str:
     tokens = [t for t in arg_text.split() if t in ("strict", "balanced", "degen")]
     if tokens:
         target_mode = tokens[-1]
-        os.environ["SAFEGUARD_MODE"] = target_mode
+        set_mode(target_mode)
         if "SAFEGUARD_POLICY_PATH" in os.environ:
             del os.environ["SAFEGUARD_POLICY_PATH"]
         mode_switched = True
@@ -706,8 +706,8 @@ def send_safeguard_alert(message: str, title: str = "SafeGuard Alert") -> dict[s
     Dispatch an alert to configured Telegram bot or webhook URL.
     Returns status dict indicating delivery or configuration status.
     """
-    telegram_token = get_secret("SAFEGUARD_TELEGRAM_BOT_TOKEN", get_secret("TELEGRAM_BOT_TOKEN", ""))
-    telegram_chat = get_secret("SAFEGUARD_TELEGRAM_CHAT_ID", get_secret("TELEGRAM_OPERATOR_CHAT_ID", get_secret("TELEGRAM_CHAT_ID", "")))
+    telegram_token = get_secret("SAFEGUARD_TELEGRAM_BOT_TOKEN")
+    telegram_chat = get_secret("SAFEGUARD_TELEGRAM_CHAT_ID")
     webhook_url = os.getenv("SAFEGUARD_WEBHOOK_URL", os.getenv("WEBHOOK_URL", "")).strip()
 
     if telegram_token and telegram_chat:
@@ -734,7 +734,7 @@ def send_safeguard_alert(message: str, title: str = "SafeGuard Alert") -> dict[s
             "event": "safeguard_alert",
             "title": title,
             "message": message,
-            "mode": os.getenv("SAFEGUARD_MODE", "balanced"),
+            "mode": get_mode(),
         }).encode("utf-8")
         try:
             req = urllib.request.Request(
@@ -759,7 +759,7 @@ def safeguard_test_alert_command_handler(*args: Any, **kwargs: Any) -> str:
     Send a test ping to configured Telegram chat or webhook to verify alert connectivity.
     Usage: /safeguard-test-alert
     """
-    mode = os.getenv("SAFEGUARD_MODE", "balanced").upper()
+    mode = get_mode().upper()
     test_msg = (
         f"<b>Status</b>: Operational\n"
         f"<b>Policy Mode</b>: {mode}\n"
@@ -810,7 +810,7 @@ def safeguard_panic_command_handler(*args: Any, **kwargs: Any) -> str:
     Usage: /safeguard-panic
     """
     set_kill_switch(True)
-    mode = os.getenv("SAFEGUARD_MODE", "balanced")
+    mode = get_mode()
     log_financial_action(
         action="emergency_panic",
         status="blocked",
@@ -855,7 +855,7 @@ def safeguard_resume_command_handler(*args: Any, **kwargs: Any) -> str:
         ])
 
     set_kill_switch(False)
-    current_mode = os.getenv("SAFEGUARD_MODE", "balanced").upper()
+    current_mode = get_mode().upper()
     log_financial_action(
         action="emergency_resume",
         status="allowed",
@@ -930,7 +930,7 @@ def safeguard_help_command_handler(*args: Any, **kwargs: Any) -> str:
     Display complete help guide for all SafeGuard slash commands.
     Usage: /safeguard-help (alias: /safeguard)
     """
-    current_mode = os.getenv("SAFEGUARD_MODE", "balanced").upper()
+    current_mode = get_mode().upper()
     return "\n".join([
         "🛡️ Hermes SafeGuard Slash Commands Reference",
         f"Current Active Mode: {current_mode}",
@@ -1002,7 +1002,7 @@ def safeguard_mint_command_handler(*args: Any, **kwargs: Any) -> str:
         log_financial_action(
             action="safeguard_mint",
             status="blocked",
-            mode=os.getenv("SAFEGUARD_MODE", "balanced"),
+            mode=get_mode(),
             target=contract_addr,
             value_wei=total_wei,
             data_hex=calldata,
@@ -1125,7 +1125,7 @@ def safeguard_exec_command_handler(*args: Any, **kwargs: Any) -> str:
         log_financial_action(
             action="safeguard_exec",
             status="blocked",
-            mode=os.getenv("SAFEGUARD_MODE", "balanced"),
+            mode=get_mode(),
             target=to_addr,
             value_wei=_parse_wei_value(val_eth, 0),
             data_hex=calldata,
@@ -1194,7 +1194,7 @@ def safeguard_tx_command_handler(*args: Any, **kwargs: Any) -> str:
         log_financial_action(
             action="safeguard_tx",
             status="blocked",
-            mode=os.getenv("SAFEGUARD_MODE", "balanced"),
+            mode=get_mode(),
             target=to_addr,
             value_wei=_parse_wei_value(val_eth, 0),
             data_hex=calldata,

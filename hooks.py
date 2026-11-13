@@ -16,11 +16,17 @@ from typing import Any
 try:
     from .policy_engine import (
         APPROVE_SELECTOR,
+        MULTICALL_SELECTOR,
+        PERMIT2_APPROVE_SELECTOR,
+        SET_APPROVAL_FOR_ALL_SELECTOR,
+        TRANSFER_FROM_SELECTOR,
         UINT256_MAX,
         PolicyConfig,
         PolicyMode,
+        decode_bytes_array,
         is_financial_tool,
         log_financial_action,
+        normalize_address,
         PromptInjectionDetector,
         format_layer0_alert_banner,
         InjectionSignal,
@@ -32,21 +38,29 @@ try:
         is_kill_switch_active,
     )
     from .verifier import (
+        DEFAULT_FROM_ADDRESS,
         DEFAULT_RPC_URL,
         ERC20_TRANSFER_SELECTOR,
         encode_address_word,
         encode_nft_mint_calldata,
         encode_uint256_word,
+        resolve_from_address,
         verify_transaction,
     )
 except (ImportError, ValueError):
     from policy_engine import (
         APPROVE_SELECTOR,
+        MULTICALL_SELECTOR,
+        PERMIT2_APPROVE_SELECTOR,
+        SET_APPROVAL_FOR_ALL_SELECTOR,
+        TRANSFER_FROM_SELECTOR,
         UINT256_MAX,
         PolicyConfig,
         PolicyMode,
+        decode_bytes_array,
         is_financial_tool,
         log_financial_action,
+        normalize_address,
         PromptInjectionDetector,
         format_layer0_alert_banner,
         InjectionSignal,
@@ -58,11 +72,13 @@ except (ImportError, ValueError):
         is_kill_switch_active,
     )
     from verifier import (
+        DEFAULT_FROM_ADDRESS,
         DEFAULT_RPC_URL,
         ERC20_TRANSFER_SELECTOR,
         encode_address_word,
         encode_nft_mint_calldata,
         encode_uint256_word,
+        resolve_from_address,
         verify_transaction,
     )
 
@@ -80,11 +96,25 @@ SAFEGUARD_INTERNAL_TOOLS: set[str] = {
 
 # Resolved paths for tamper protection
 _INSTALL_DIR = Path(__file__).resolve().parent
-try:
-    from storage import get_plugin_data_dir
-    _DATA_DIR = get_plugin_data_dir().resolve()
-except Exception:
-    _DATA_DIR = _INSTALL_DIR
+
+
+def _protected_dirs() -> tuple[Path, ...]:
+    """
+    Directories whose contents the agent must never touch.
+
+    The data root is resolved through Hermes' plugin_storage API on every call
+    (PR review — Issue 6), so a profile switch is honoured immediately. If it
+    cannot be resolved, only the install tree is protected here; state access
+    itself fails closed inside storage.py.
+    """
+    try:
+        try:
+            from .storage import get_plugin_data_dir
+        except (ImportError, ValueError):
+            from storage import get_plugin_data_dir
+        return (_INSTALL_DIR, get_plugin_data_dir().resolve())
+    except Exception:
+        return (_INSTALL_DIR,)
 
 # Deprecated bare names preserved for backward-compatibility with external imports
 PROTECTED_BASENAMES: frozenset[str] = frozenset()
@@ -302,7 +332,13 @@ def _iter_strings(obj: Any, depth: int = 0):
 def _references_protected_path(value: str) -> bool:
     """
     Check if a string references a path inside the plugin install or data directories.
-    Strictly scoped to resolved absolute paths under this plugin's own install and data directories.
+
+    Rules (per PR review – Issue 2):
+      * Only flag strings that are themselves **absolute** paths resolving under the
+        install dir or data dir.  Relative paths are resolved against the process CWD;
+        if the result does not land under those dirs they are ignored – not flagged.
+      * The bare "hermes-safeguard" substring match is removed: it is too broad and
+        flags legitimate log / conversation text that merely mentions the plugin name.
     """
     raw = value.strip()
     if not raw or len(raw) > 4096:
@@ -312,18 +348,30 @@ def _references_protected_path(value: str) -> bool:
     if "tests/" in raw or "test_" in raw:
         return False
 
-    # Check if string contains an absolute or relative path belonging to this plugin
+    protected_dirs = _protected_dirs()
+
+    # Check if string contains a path belonging to this plugin
     try:
         p = Path(raw)
-        resolved_p = p.resolve() if p.is_absolute() else (_INSTALL_DIR / p).resolve()
-        if (str(resolved_p).startswith(str(_INSTALL_DIR)) or str(resolved_p).startswith(str(_DATA_DIR))) and ("tests" not in resolved_p.parts):
+        if p.is_absolute():
+            # Only flag absolute paths that fall under our own directories.
+            resolved_p = p.resolve()
+        else:
+            # For relative paths: resolve against CWD (not _INSTALL_DIR).
+            # Flag only if the CWD-resolved path happens to land under our dirs.
+            resolved_p = (Path.cwd() / p).resolve()
+        if (
+            any(str(resolved_p).startswith(str(d)) for d in protected_dirs)
+            and "tests" not in resolved_p.parts
+        ):
             return True
     except Exception:
         pass
 
-    # Check for embedded references in commands/scripts to protected files within this plugin
-    for protected in (_INSTALL_DIR, _DATA_DIR):
-        if str(protected) in raw or "hermes-safeguard" in raw:
+    # Check for the literal resolved directory paths embedded in commands/scripts.
+    # NOTE: "hermes-safeguard" substring match removed – too broad (Issue 2b).
+    for protected in protected_dirs:
+        if str(protected) in raw:
             return True
 
     return False
@@ -534,7 +582,21 @@ def _extract_tx_params(args: dict[str, Any], tool_name: str = "") -> tuple[str, 
         or ""
     ).strip().lower()
 
-    val_raw = target.get("value", target.get("value_wei", target.get("amount")))
+    # Native ETH value. For approve, mint, and ERC-20 token transfers, "amount" is a
+    # token quantity, not ETH, so it must not be read as the transaction value: doing
+    # so blocked `amount: "unlimited"` as unparseable and simulated `approve(..., 5 ether)`
+    # as a 5 ETH send. The tool handlers in tools.py likewise take native value only
+    # from value/value_wei. For other tools (e.g. a generic send_eth), "amount" still
+    # serves as the ETH value fallback.
+    _tl = str(tool_name or "").lower()
+    _amount_is_token_qty = (
+        "approve" in _tl
+        or "mint" in _tl
+        or ("transfer" in _tl and bool(target.get("token") or target.get("token_address")))
+    )
+    val_raw = target.get("value", target.get("value_wei"))
+    if val_raw is None and not _amount_is_token_qty:
+        val_raw = target.get("amount")
     if val_raw is not None and val_raw != "":
         try:
             val_wei = _parse_wei_value(val_raw, 0)
@@ -690,6 +752,130 @@ def _resolve_effective_mode(operator_mode: str, arg_mode: str | None) -> str:
     return max(op_m, arg_m, key=lambda m: _MODE_RANK[m])
 
 
+def _full_addr(addr: str) -> str:
+    """
+    Render an address in full (0x + 40 hex) for operator-facing messages.
+
+    Deliberately NOT abbreviated: address-poisoning attacks generate vanity
+    addresses matching the first and last few characters of a trusted one, so
+    a truncated 0xabcd…1234 is exactly what an attacker wants the operator to see.
+    """
+    a = str(addr or "").strip().lower()
+    if a.startswith("0x"):
+        a = a[2:]
+    if len(a) != 40:
+        return str(addr or "")
+    return f"0x{a}"
+
+
+def _fmt_token_amount(amt: int) -> str:
+    """Render a raw token amount, spelling out the unlimited case."""
+    if amt == UINT256_MAX:
+        return "UNLIMITED (type(uint256).max)"
+    return f"{amt / 10**18:.4f} tokens ({amt} raw)"
+
+
+def _describe_calldata(data_hex: str) -> str:
+    """
+    Decode calldata into a plain-language description for the operator (PR review — Issue 7).
+
+    Covers the value-moving calls an agent can propose: ERC-20 approve/transfer,
+    NFT setApprovalForAll, Permit2 approve, transferFrom, and multicall batches
+    (whose sub-calls are decoded one level deep). Anything else reports the raw
+    selector, which is still more useful than a truncated blob.
+    """
+    raw = str(data_hex or "").strip()
+    if raw.lower().startswith("0x"):
+        raw = raw[2:]
+    if not raw:
+        return "plain value transfer (no calldata)"
+    if len(raw) < 8:
+        return f"malformed calldata ({raw[:8]})"
+
+    sel = raw[:8].lower()
+    args_hex = raw[8:]
+
+    def word(i: int) -> int:
+        seg = args_hex[i * 64 : (i + 1) * 64]
+        return int(seg, 16) if len(seg) == 64 else -1
+
+    try:
+        if sel == APPROVE_SELECTOR and len(args_hex) >= 128:
+            spender = normalize_address(args_hex[0:64])
+            amount = word(1)
+            return (
+                f"approve: grant spender {_full_addr(spender)} allowance "
+                f"{_fmt_token_amount(amount)} of this token"
+            )
+
+        if sel == ERC20_TRANSFER_SELECTOR and len(args_hex) >= 128:
+            recipient = normalize_address(args_hex[0:64])
+            amount = word(1)
+            return f"transfer: send {_fmt_token_amount(amount)} of this token to {_full_addr(recipient)}"
+
+        if sel == TRANSFER_FROM_SELECTOR and len(args_hex) >= 192:
+            from_addr = normalize_address(args_hex[0:64])
+            to_addr = normalize_address(args_hex[64:128])
+            amount = word(2)
+            return (
+                f"transferFrom: move {_fmt_token_amount(amount)} of this token "
+                f"FROM {_full_addr(from_addr)} TO {_full_addr(to_addr)}"
+            )
+
+        if sel == SET_APPROVAL_FOR_ALL_SELECTOR and len(args_hex) >= 128:
+            operator = normalize_address(args_hex[0:64])
+            approved = word(1) != 0
+            if approved:
+                return (
+                    f"setApprovalForAll: grant operator {_full_addr(operator)} control of "
+                    f"EVERY NFT in this collection"
+                )
+            return f"setApprovalForAll: REVOKE operator {_full_addr(operator)} access to this collection"
+
+        if sel == PERMIT2_APPROVE_SELECTOR and len(args_hex) >= 192:
+            token = normalize_address(args_hex[0:64])
+            spender = normalize_address(args_hex[64:128])
+            amount = word(2)
+            return (
+                f"permit2 approve: token {_full_addr(token)}, spender {_full_addr(spender)}, "
+                f"amount {_fmt_token_amount(amount)}"
+            )
+
+        if sel == MULTICALL_SELECTOR:
+            try:
+                sub_calls = decode_bytes_array(bytes.fromhex(args_hex))
+            except Exception:
+                return "multicall: batch transaction (sub-calls could not be decoded)"
+            descs = []
+            for sub in sub_calls[:4]:
+                sub_hex = sub.hex()
+                descs.append(f"[{_describe_calldata(sub_hex)}]")
+            if len(sub_calls) > 4:
+                descs.append(f"+{len(sub_calls) - 4} more")
+            return f"multicall: {len(sub_calls)} batched calls → " + " ".join(descs)
+    except Exception:
+        return f"calls selector 0x{sel} (arguments could not be decoded)"
+
+    size = f"{len(args_hex) // 2} bytes of args" if args_hex else "no args"
+    return f"calls selector 0x{sel} ({size}; not a recognised transfer/approval)"
+
+
+def _describe_sender() -> str:
+    """
+    Describe the wallet whose funds the transaction spends — the same address
+    verify_transaction simulates against (resolve_from_address with no override).
+
+    When SAFEGUARD_WALLET_ADDRESS is unset, verifier falls back to the public
+    Anvil dev account — a simulation placeholder that holds nothing — and the
+    operator must not read that as their own wallet.
+    """
+    resolved = resolve_from_address(None)
+    label = _full_addr(resolved)
+    if resolved.lower() == DEFAULT_FROM_ADDRESS.lower():
+        return f"{label} (unconfigured — simulation placeholder, not a funded wallet)"
+    return label
+
+
 def on_pre_tool_call(*args: Any, **kwargs: Any) -> HookVerdict:
     """
     Hook evaluator for pre_tool_call events in Hermes Agent.
@@ -841,29 +1027,17 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> HookVerdict:
             print(f"SafeGuard [PANIC]: Intercepted '{tool_name}' -> BLOCKED: {err_msg}")
             return _make_block_verdict(err_msg, risk_score="critical", mode=mode)
 
-        # Fast-path middleware interception: Block unnecessary filesystem/grep tool calls on onchain intent
-        if _is_filesystem_search_tool_call(tool_name, tool_args) and _is_onchain_intent(tool_args, context=context_msgs, kwargs=kwargs):
-            redirect_msg = "SAFEGUARD MIDDLEWARE: File search blocked for onchain intent. Invoke safeguard_execute_tx immediately."
-            log_financial_action(
-                action=tool_name, status="blocked", mode=mode,
-                target="filesystem_search_interception", value_wei=0, data_hex="",
-                risk_score="low", reason=redirect_msg
-            )
-            print(f"SafeGuard [{mode.upper()}]: Intercepted '{tool_name}' -> REDIRECTED: {redirect_msg}")
-            return _make_block_verdict(
-                redirect_msg,
-                risk_score="low",
-                mode=mode,
-                extra={"redirect": "safeguard_execute_tx"},
-            )
+        # NOTE (PR review – Issue 3): The block that prevented reading files when the
+        # conversation mentioned send/tx/eth/approve/hex has been removed.  Reads must
+        # stay allowed regardless of conversation context.  The _is_onchain_intent helper
+        # is kept for use by financial-tool detection only; it no longer gates file reads.
 
         # Check if agent is attempting to grep or search files for on-chain contract addresses
         is_search, contract_addr = _is_contract_search_attempt(tool_name, tool_args)
         if is_search:
             err_msg = (
                 f"SafeGuard Directive: '{contract_addr}' is an on-chain smart contract on Ethereum, NOT a local codebase file. "
-                f"Stop searching or reading workspace files. "
-                f"Immediately invoke `safeguard_execute_tx(to='{contract_addr}', value=..., data=...)` to interact with this contract."
+                "Stop searching or reading workspace files and use the appropriate on-chain tool."
             )
             print(f"SafeGuard [{mode.upper()}]: Intercepted '{tool_name}' -> REDIRECTED: On-chain address search blocked; direct transaction required.")
             return _make_block_verdict(err_msg, risk_score="low", mode=mode)
@@ -959,7 +1133,12 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> HookVerdict:
         val_eth_display = f"{val_wei / 10**18:.4f}".rstrip("0").rstrip(".") + " ETH" if val_wei > 0 else "0 ETH"
         if val_eth_display == " ETH":
             val_eth_display = "0 ETH"
-        send_summary = f"Send {val_eth_display} to {to_addr} (data: {data_hex[:10]}...)"
+        # Sender is the wallet verify_transaction actually simulated, never an
+        # agent-supplied "from" argument (which the agent could set to anything).
+        send_summary = (
+            f"Send {val_eth_display} to {_full_addr(to_addr)} "
+            f"from {_describe_sender()} — {_describe_calldata(data_hex)}"
+        )
 
         if not res.allowed or risk_str == "critical":
             reason_txt = res.reason or "Transaction blocked by SafeGuard policy"
@@ -974,7 +1153,14 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> HookVerdict:
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as e:
-        env_mode = os.getenv("SAFEGUARD_MODE", "balanced").strip().lower()
+        try:
+            try:
+                from .storage import get_mode as _get_mode
+            except (ImportError, ValueError):
+                from storage import get_mode as _get_mode
+            env_mode = _get_mode()
+        except BaseException:
+            env_mode = "balanced"
         err_msg = f"SafeGuard [{env_mode}] BLOCKED (fail-closed internal error): {str(e)}"
         print(err_msg)
         try:

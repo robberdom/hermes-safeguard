@@ -139,11 +139,11 @@ class TestPluginRegistration(unittest.TestCase):
             {"query": "0x5FbDB2315678afecb367f032d93F642f64180aa3", "path": "."},
         )
         self.assertEqual(res.get("action"), "block")
-        self.assertTrue(
-            "SAFEGUARD MIDDLEWARE: File search blocked for onchain intent" in res.get("message", "")
-            or "on-chain smart contract" in res.get("message", "")
-        )
-        self.assertIn("safeguard_execute_tx", res.get("message", ""))
+        msg = res.get("message", "")
+        # The redirect directive replaced the old "File search blocked ... safeguard_execute_tx" text
+        self.assertIn("on-chain smart contract", msg)
+        self.assertIn("0x5FbDB2315678afecb367f032d93F642f64180aa3", msg)
+        self.assertIn("use the appropriate on-chain tool", msg)
 
     def test_auto_encode_mint_calldata(self):
         """Ensure safeguard_execute_tx automatically encodes mint calldata for NFT contracts when data is 0x."""
